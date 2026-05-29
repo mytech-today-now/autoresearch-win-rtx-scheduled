@@ -1,0 +1,39 @@
+{
+  "name": "autoresearch",
+  "schema": "spec-driven",
+  "sourceDocument": "refactor-autoresearch.md",
+  "created": "2026-05-23",
+  "status": "draft",
+  "capabilities": [
+    "autoresearch"
+  ],
+  "requiredArtifacts": [
+    "proposal.md",
+    "design.md",
+    "deltas.md",
+    "specs/autoresearch/spec.md",
+    "tasks.md",
+    "examples/powershell-usage.md",
+    "tests/acceptance-tests.md",
+    "README.md"
+  ],
+  "targetPlatform": "Windows 10/11 with PowerShell 5.1 or later",
+  "exclusiveAiPackage": "ai-powered",
+  "scheduledTask": {
+    "name": "autoresearch-karpathy",
+    "folder": "\\myTech.Today",
+    "author": "myTech.Today (sales@mytech.today)"
+  },
+  "paths": {
+    "wrapperInstallRoot": "%LOCALAPPDATA%\\Programs\\myTech.Today\\autoresearch-karpathy",
+    "upstreamCloneRoot": "%LOCALAPPDATA%\\Programs\\myTech.Today\\autoresearch",
+    "stateFile": "%LOCALAPPDATA%\\myTech.Today\\autoresearch-karpathy\\state.json",
+    "configFile": "%LOCALAPPDATA%\\myTech.Today\\autoresearch-karpathy\\config.json",
+    "debugLog": "%HOMEDRIVE%\\myTech.Today\\logs\\autoresearch-karpathy.jsonl",
+    "shortcut": "%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\myTech.Today\\autoresearch.lnk"
+  },
+  "runtimeDefaults": {
+    "maxRuntimeMinutes": 5,
+    "maxRuntimePerHourMinutes": 5
+  }
+}

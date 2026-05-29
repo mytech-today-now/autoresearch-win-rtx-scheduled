@@ -1,0 +1,59 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+worktrees/
+results/
+queue/
+
+# Local secrets and runtime state
+.env
+.env.*
+!.env.example
+logs/
+*.log
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+
+# Experimental code/artifacts
+dev/
+
+# Node dependencies
+node_modules/
+
+# Model checkpoints
+*.pt
+
+# Results file
+results.tsv
+
+# ai-powered local config and logs
+.ai-powered/
+
+# Augment Extensions
+.augment/extensions.json
+
+# Extra files
+.augment
+.beads
+scripts/beads-helpers.ps1
+scripts/beads-query.ps1
+scripts/bump-and-push.ps1
+scripts/completed.jsonl
+scripts/proc-beads.ps1
+scripts/proc-beads-01.ps1
+scripts/process-beads.ps1
+scripts/make-beads.ps1
+scripts/test-autoresearch-acceptance.ps1
+scripts/test-autoresearch-wrapper.ps1
+scripts/verify-ai-provider.mjs
+
+.agents

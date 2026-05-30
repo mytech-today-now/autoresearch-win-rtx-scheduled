@@ -244,7 +244,7 @@ $Script:TaskPath = '\myTech.Today\'
 $Script:InstallRoot = Join-Path $env:HOMEDRIVE 'myTech.Today'
 $Script:CanonicalRepo = Join-Path $Script:InstallRoot 'autoresearch-win-rtx-scheduled'
 $Script:CanonicalScript = Join-Path $Script:CanonicalRepo 'scripts\launch.ps1'
-$Script:DefaultsPath = Join-Path $Script:CanonicalRepo '.launch-defaults.json'
+$Script:DefaultsPath = Join-Path (Split-Path -Parent $Script:CanonicalScript) 'launch.json'
 $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
@@ -679,6 +679,26 @@ function Save-LaunchDefaults {
     ($Values | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Script:DefaultsPath -Encoding UTF8
 }
 
+function Initialize-LaunchConfig {
+    param([System.Collections.IDictionary]$Bound)
+    if (Test-Path -LiteralPath $Script:DefaultsPath) {
+        $d = Read-LaunchDefaults
+        if ($d) {
+            foreach ($k in 'Provider','Model','OllamaHost','AzureEndpoint','AzureDeployment','LogDir','ScheduleFrequency','ScheduleTime') {
+                if (-not $Bound.ContainsKey($k) -and $d.PSObject.Properties[$k] -and $d.$k) {
+                    Set-Variable -Name $k -Value $d.$k -Scope 1
+                }
+            }
+        }
+    } else {
+        Save-LaunchDefaults -Values @{
+            Provider=$Provider; Model=$Model; OllamaHost=$OllamaHost
+            AzureEndpoint=$AzureEndpoint; AzureDeployment=$AzureDeployment
+            LogDir=$LogDir; ScheduleFrequency=$ScheduleFrequency; ScheduleTime=$ScheduleTime
+        }
+    }
+}
+
 function Show-LaunchGui {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
     $d = Read-LaunchDefaults
@@ -860,6 +880,7 @@ function Invoke-FromGui {
 
 try {
     New-Dir $LogDir
+    Initialize-LaunchConfig -Bound $PSBoundParameters
     $actionGiven = ($RegisterTask -or $RunNow -or $Unregister -or $Update)
     if (-not $NoGui -and -not $actionGiven) {
         $gui = Show-LaunchGui

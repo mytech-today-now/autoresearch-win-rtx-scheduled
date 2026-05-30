@@ -2,7 +2,7 @@
 
 > Convert your gaming PC into an autonomous AI researcher.
 
-> This repository is a fork of [karpathy/autoresearch](https://github.com/karpathy/autoresearch). The purpose of this fork is native support for desktop consumer NVIDIA GPUs on Windows, with tiered VRAM floors by architecture.
+> This repository is a fork of [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows), which is itself a Windows fork of the original [karpathy/autoresearch](https://github.com/karpathy/autoresearch). On top of the Windows port, this fork adds a self-installing WPF GUI launcher (`scripts\launch.ps1`), Windows Task Scheduler integration, multi-provider AI routing via `ai-powered`, and tiered VRAM floors by architecture.
 
 ![teaser](progress.png)
 
@@ -12,15 +12,15 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 
 ## Fork scope
 
-- Upstream source: [karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+- Upstream source: [karpathy/autoresearch](https://github.com/karpathy/autoresearch) (original); [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (direct Windows upstream).
 - Primary objective: run natively on Windows with desktop consumer NVIDIA GPUs (Turing with >=8 GB VRAM, Ampere/Ada/Blackwell with >=10 GB VRAM), without unofficial Triton-on-Windows stacks.
 - Scope of changes: compatibility and stability updates required for that target platform.
 - The original Linux/H100-oriented path from upstream is removed in this fork and is not supported here.
 - If you need the upstream Linux/H100 path, use [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
-## Quick Start: `launch.ps1` (remote one-liner)
+## Quick Start: `launch.ps1` GUI (remote one-liner)
 
-Either command below installs this repo to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\` and immediately runs `scripts\launch.ps1` from that location. Any extra CLI arguments are forwarded verbatim to the relaunched script.
+Either command below installs this repo to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\` and immediately runs `scripts\launch.ps1` from that location, **opening the WPF GUI launcher** (the easiest way to pick a provider, model, schedule, and action). Any extra CLI arguments are forwarded verbatim to the relaunched script; pass `-NoGui` with explicit action switches to run unattended (see [How `launch.ps1` Works](#how-launchps1-works)).
 
 - **PowerShell:**
 
@@ -39,7 +39,7 @@ See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-
 ## How `launch.ps1` Works
 
 - **Self-installing.** On every invocation, `launch.ps1` checks whether it is running from the canonical install path `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.ps1`. If not (including when sourced via `iwr ... | iex`), it ensures `git` is on PATH (installing via `winget install --id Git.Git` if missing), clones (or `git pull --ff-only` updates) the repo into the canonical path, then re-launches itself from there forwarding all CLI arguments.
-- **Interactive WPF GUI (default).** With no action switch and without `-NoGui`, a WPF launcher window appears with radio buttons for the action (Preflight only, Run training now, Register scheduled task, Register task and run now, Unregister scheduled task, Update toolchain), an [AI Provider](#ai-powered-features) group (Ollama, OpenAI, Anthropic, Azure OpenAI) and a dependent model dropdown, an editable Ollama-host combo (enabled only for Ollama), Azure endpoint/deployment fields (shown only for Azure), schedule frequency/time dropdowns (Weekly switches the time dropdown to weekday names), a masked `PasswordBox` for API keys, an "Enable Task Scheduler history" checkbox, and **OK / Cancel / Save as Defaults** buttons. Save-as-Defaults persists selections (excluding the API key) to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\.launch-defaults.json`.
+- **Interactive WPF GUI (default).** With no action switch and without `-NoGui`, a WPF launcher window appears with radio buttons for the action (Preflight only, Run training now, Register scheduled task, Register task and run now, Unregister scheduled task, Update toolchain), an [AI Provider](#ai-powered-features) group (Ollama, OpenAI, Anthropic, Azure OpenAI) and a dependent model dropdown, an editable Ollama-host combo (enabled only for Ollama), Azure endpoint/deployment fields (shown only for Azure), schedule frequency/time dropdowns (Weekly switches the time dropdown to weekday names), a masked `PasswordBox` for API keys, an "Enable Task Scheduler history" checkbox, and **OK / Cancel / Save as Defaults** buttons. Save-as-Defaults persists selections (excluding the API key) to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.json`. This file is human-readable JSON and is auto-created with current values on first run if missing; both the GUI and `-NoGui` CLI read it so the two surfaces behave identically (explicit CLI parameters always override stored values).
 - **Headless / preflight modes.** Pass `-NoGui` with explicit action switches (`-RunNow`, `-RegisterTask`, `-Unregister`, `-Update`) plus provider/model/schedule parameters to run fully unattended. `-NoGui` with **no** action switch performs preflight only (verify tools, install if missing, ensure `.venv` via `uv sync`, start Ollama and pull the model when Ollama is selected), prints next-step hints, and exits 0. `-RegisterTask` and `-RunNow` can be combined to both schedule and run immediately. `-Unregister` removes the task and exits before preflight. The scheduled task always invokes the script in `-NoGui -RunNow` form with the chosen `-Provider`/`-Model` (and `-OllamaHost` for Ollama).
 - **`-Update` action.** Runs `uv self update`, `winget upgrade --id Ollama.Ollama` (Ollama provider only), and `npm install -g ai-powered@latest`, refreshes the session `PATH`, then restarts the Ollama daemon and re-pulls `-Model` when Ollama is selected. Combinable with `-RegisterTask` and/or `-RunNow`.
 - **Per-run logs with pruning.** Each Python run writes to `%HOMEDRIVE%\myTech.Today\logs\autoresearch-run-<yyyyMMdd-HHmmss>.jsonl` (local time). After each run, only the **10 newest** `autoresearch-run-*.jsonl` files are retained; older ones are deleted. The aggregate append-only log `%HOMEDRIVE%\myTech.Today\logs\autoresearch.jsonl` is never rotated. Both surfaces capture timestamped `info`/`warn`/`error`/`stdout`/`stderr` JSON lines (UTC `ts`).
@@ -76,7 +76,7 @@ Supported providers and the GUI/CLI surface:
 
 The selected provider/model is exported to the child process as `AI_PROVIDER`, `AI_POWERED_MODEL`, and `AI_MODEL`. For Ollama, `OLLAMA_HOST` is also exported and the script will install/start the local `ollama` daemon and `ollama pull` the requested model during preflight. For non-Ollama providers the Ollama preflight steps are skipped.
 
-API keys are **never persisted** to `.launch-defaults.json`; only the provider, model, host, schedule, and Azure endpoint/deployment selections are saved. Supply the API key via the masked GUI field or the `-ApiKey` parameter at invocation time. See [How `launch.ps1` Works](#how-launchps1-works) for full launcher behavior.
+API keys are **never persisted** to `launch.json`; only the provider, model, host, schedule, log directory, and Azure endpoint/deployment selections are saved. Supply the API key via the masked GUI field or the `-ApiKey` parameter at invocation time. See [How `launch.ps1` Works](#how-launchps1-works) for full launcher behavior.
 
 ## How it works
 

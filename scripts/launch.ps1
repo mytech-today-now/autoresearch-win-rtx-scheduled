@@ -82,26 +82,31 @@
         pwsh -File .\scripts\launch.ps1 -RunNow -LogDir 'D:\logs\autoresearch'
 
 .PARAMETER ScheduleTime
-    Time-of-day to start the scheduled task, formatted 'HH:mm' (24-hour,
-    local time). Only consulted when -RegisterTask is supplied. The task is
-    anchored to today's date at this time; the trigger then repeats per
-    -ScheduleFrequency.
-    Default: '03:00'.
+    Polymorphic schedule slot whose meaning depends on -ScheduleFrequency:
+      * Hourly  - minute-of-hour offset: ':00', ':10', ':20', ':30', ':40',
+                  ':50'. Default ':00'.
+      * Daily   - local 24-hour time-of-day '00:00'..'23:45' in 15-minute
+                  steps (96 values). Default '18:00'.
+      * Weekly  - weekday name 'Sunday'..'Saturday'. Default 'Sunday'.
+    Only consulted when -RegisterTask is supplied. Validated at runtime by
+    Test-ScheduleTime; invalid values raise an error listing the allowed
+    set for the active frequency.
 
-    Example (schedule for 11:30 PM local):
-        pwsh -File .\scripts\launch.ps1 -RegisterTask -ScheduleTime '23:30'
+    Example (every hour at HH:30 local):
+        pwsh -File .\scripts\launch.ps1 -RegisterTask `
+             -ScheduleFrequency Hourly -ScheduleTime ':30'
 
 .PARAMETER ScheduleFrequency
     Trigger cadence for the scheduled task. Only consulted when
     -RegisterTask is supplied. Allowed values:
-      * Hourly  - Fires at -ScheduleTime then repeats every 1 hour.
-      * Daily   - Fires once a day at -ScheduleTime.
-      * Weekly  - Fires every Sunday at -ScheduleTime.
+      * Hourly  - Fires at HH:<minute> every hour (minute from -ScheduleTime).
+      * Daily   - Fires once a day at -ScheduleTime ('HH:mm').
+      * Weekly  - Fires on -ScheduleTime (weekday name) at 03:00 local.
     Default: 'Daily'.
 
-    Example (every hour starting at the top of the hour):
+    Example (every hour at the top of the hour):
         pwsh -File .\scripts\launch.ps1 -RegisterTask `
-             -ScheduleFrequency Hourly -ScheduleTime '00:00'
+             -ScheduleFrequency Hourly -ScheduleTime ':00'
 
 .PARAMETER RegisterTask
     Switch. When set, creates (or replaces) a Windows scheduled task named
@@ -164,13 +169,13 @@
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RegisterTask `
-         -ScheduleFrequency Hourly -ScheduleTime '00:15'
-    # Run every hour starting at 00:15 local.
+         -ScheduleFrequency Hourly -ScheduleTime ':30'
+    # Run every hour at HH:30 local.
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RegisterTask `
-         -ScheduleFrequency Weekly -ScheduleTime '02:00'
-    # Run weekly on Sundays at 02:00 local.
+         -ScheduleFrequency Weekly -ScheduleTime 'Wednesday'
+    # Run weekly on Wednesdays at 03:00 local.
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RunNow `
@@ -198,7 +203,7 @@
     Logs:
       Aggregate JSONL: <LogDir>\autoresearch.jsonl
       Per-run JSONL:   <LogDir>\autoresearch-run-<UTC-stamp>.jsonl
-      Per-run files are pruned to the newest 190 automatically.
+      Per-run files are pruned to the newest 10 automatically.
 
     Scheduled task:
       Name:        Autoresearch-Train
@@ -224,7 +229,7 @@ param(
     [string]$AzureDeployment,
     [string]$RepoRoot,
     [string]$LogDir = "$env:HOMEDRIVE\myTech.Today\logs",
-    [string]$ScheduleTime = '03:00',
+    [string]$ScheduleTime,
     [ValidateSet('Hourly', 'Daily', 'Weekly')]
     [string]$ScheduleFrequency = 'Daily',
     [switch]$RegisterTask,
@@ -587,18 +592,57 @@ function Get-PwshExePath {
     throw 'pwsh.exe is required for the scheduled task action but was not found on PATH.'
 }
 
-function Get-TaskTrigger {
-    $weekDays = 'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
-    if ($ScheduleFrequency -eq 'Weekly') {
-        $day = if ($weekDays -contains $ScheduleTime) { $ScheduleTime } else { 'Sunday' }
-        $startAt = ([DateTime]::Today).AddHours(3)
-        return New-ScheduledTaskTrigger -Weekly -DaysOfWeek $day -At $startAt
+function Get-ScheduleTimeOptions {
+    param([Parameter(Mandatory)][string]$Frequency)
+    switch ($Frequency) {
+        'Hourly' { return ,@(':00',':10',':20',':30',':40',':50') }
+        'Weekly' { return ,@('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday') }
+        default  {
+            $list = New-Object System.Collections.Generic.List[string]
+            for ($h = 0; $h -lt 24; $h++) {
+                foreach ($m in 0,15,30,45) { $list.Add(('{0:D2}:{1:D2}' -f $h, $m)) }
+            }
+            return ,$list.ToArray()
+        }
     }
-    $timeSpan = [TimeSpan]::Parse($ScheduleTime)
-    $startAt = ([DateTime]::Today).Add($timeSpan)
+}
+
+function Get-ScheduleTimeDefault {
+    param([Parameter(Mandatory)][string]$Frequency)
+    switch ($Frequency) {
+        'Hourly' { return ':00' }
+        'Weekly' { return 'Sunday' }
+        default  { return '18:00' }
+    }
+}
+
+function Test-ScheduleTime {
+    param(
+        [Parameter(Mandatory)][string]$Frequency,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    $allowed = Get-ScheduleTimeOptions -Frequency $Frequency
+    if ($allowed -notcontains $Value) {
+        throw "ScheduleTime '$Value' is not valid for ScheduleFrequency '$Frequency'. Expected one of: $($allowed -join ', ')."
+    }
+}
+
+function Get-TaskTrigger {
+    Test-ScheduleTime -Frequency $ScheduleFrequency -Value $ScheduleTime
     switch ($ScheduleFrequency) {
-        'Hourly' { return New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1) }
-        'Daily'  { return New-ScheduledTaskTrigger -Daily -At $startAt }
+        'Hourly' {
+            $minute = [int]($ScheduleTime.TrimStart(':'))
+            $startAt = ([DateTime]::Today).AddMinutes($minute)
+            return New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1)
+        }
+        'Daily' {
+            $startAt = ([DateTime]::Today).Add([TimeSpan]::Parse($ScheduleTime))
+            return New-ScheduledTaskTrigger -Daily -At $startAt
+        }
+        'Weekly' {
+            $startAt = ([DateTime]::Today).AddHours(3)
+            return New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ScheduleTime -At $startAt
+        }
     }
 }
 
@@ -749,7 +793,7 @@ function Show-LaunchGui {
           <ComboBoxItem Content="Daily" IsSelected="True"/>
           <ComboBoxItem Content="Weekly"/>
         </ComboBox>
-        <Label Content="Time (HH:mm, local)"/>
+        <Label x:Name="LblTime" Content="Time (HH:mm, local)"/>
         <ComboBox x:Name="CbTime"/>
         <CheckBox x:Name="ChkHistory" Content="Enable Task Scheduler history (requires elevation)" IsChecked="True" Margin="0,6,0,0"/>
       </StackPanel>
@@ -767,9 +811,11 @@ function Show-LaunchGui {
     $C = @{}
     foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',
         'PrvOllama','PrvOpenAI','PrvAnthropic','PrvAzure','CbModel','CbHost','PbApiKey',
-        'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
+        'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','LblTime','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
         $C[$n] = $window.FindName($n)
     }
+    $hourOptions = [System.Collections.Generic.List[string]]::new()
+    foreach ($v in ':00',':10',':20',':30',':40',':50') { $hourOptions.Add($v) }
     $timeOptions = [System.Collections.Generic.List[string]]::new()
     for ($h = 0; $h -lt 24; $h++) {
         foreach ($m in 0,15,30,45) { $timeOptions.Add(('{0:D2}:{1:D2}' -f $h, $m)) }
@@ -778,12 +824,15 @@ function Show-LaunchGui {
     foreach ($n in 'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday') { $dayOptions.Add($n) }
     $applyFreqItems = {
         $freq = if ($C.CbFreq.SelectedItem) { [string]$C.CbFreq.SelectedItem.Content } else { 'Daily' }
-        if ($freq -eq 'Weekly') {
-            $C.CbTime.ItemsSource = $dayOptions
-            if ($C.CbTime.SelectedIndex -lt 0) { $C.CbTime.SelectedIndex = 0 }
-        } else {
-            $C.CbTime.ItemsSource = $timeOptions
-            if ($C.CbTime.SelectedIndex -lt 0) { $C.CbTime.SelectedIndex = $timeOptions.IndexOf('03:00') }
+        switch ($freq) {
+            'Hourly' { $C.CbTime.ItemsSource = $hourOptions; $C.LblTime.Content = 'Minute of hour';            $defVal = ':00' }
+            'Weekly' { $C.CbTime.ItemsSource = $dayOptions;  $C.LblTime.Content = 'Day of week';               $defVal = 'Sunday' }
+            default  { $C.CbTime.ItemsSource = $timeOptions; $C.LblTime.Content = 'Time of day (HH:mm, local)'; $defVal = '18:00' }
+        }
+        if ($C.CbTime.SelectedIndex -lt 0) {
+            $src = @($C.CbTime.ItemsSource)
+            $idx = $src.IndexOf($defVal)
+            if ($idx -ge 0) { $C.CbTime.SelectedIndex = $idx }
         }
     }
     $C.CbFreq.add_SelectionChanged({ $C.CbTime.SelectedIndex = -1; & $applyFreqItems })
@@ -880,7 +929,18 @@ function Invoke-FromGui {
 
 try {
     New-Dir $LogDir
+    if ([string]::IsNullOrWhiteSpace($ScheduleTime)) {
+        $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
+    }
     Initialize-LaunchConfig -Bound $PSBoundParameters
+    $scheduleOpts = Get-ScheduleTimeOptions -Frequency $ScheduleFrequency
+    if ($scheduleOpts -notcontains $ScheduleTime) {
+        if ($PSBoundParameters.ContainsKey('ScheduleTime')) {
+            Test-ScheduleTime -Frequency $ScheduleFrequency -Value $ScheduleTime
+        } else {
+            $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
+        }
+    }
     $actionGiven = ($RegisterTask -or $RunNow -or $Unregister -or $Update)
     if (-not $NoGui -and -not $actionGiven) {
         $gui = Show-LaunchGui

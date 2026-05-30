@@ -43,7 +43,7 @@ See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-
 - **Headless / preflight modes.** Pass `-NoGui` with explicit action switches (`-RunNow`, `-RegisterTask`, `-Unregister`, `-Update`) plus provider/model/schedule parameters to run fully unattended. `-NoGui` with **no** action switch performs preflight only (verify tools, install if missing, ensure `.venv` via `uv sync`, start Ollama and pull the model when Ollama is selected), prints next-step hints, and exits 0. `-RegisterTask` and `-RunNow` can be combined to both schedule and run immediately. `-Unregister` removes the task and exits before preflight. The scheduled task always invokes the script in `-NoGui -RunNow` form with the chosen `-Provider`/`-Model` (and `-OllamaHost` for Ollama).
 - **`-Update` action.** Runs `uv self update`, `winget upgrade --id Ollama.Ollama` (Ollama provider only), and `npm install -g ai-powered@latest`, refreshes the session `PATH`, then restarts the Ollama daemon and re-pulls `-Model` when Ollama is selected. Combinable with `-RegisterTask` and/or `-RunNow`.
 - **Per-run logs with pruning.** Each Python run writes to `%HOMEDRIVE%\myTech.Today\logs\autoresearch-run-<yyyyMMdd-HHmmss>.jsonl` (local time). After each run, only the **10 newest** `autoresearch-run-*.jsonl` files are retained; older ones are deleted. The aggregate append-only log `%HOMEDRIVE%\myTech.Today\logs\autoresearch.jsonl` is never rotated. Both surfaces capture timestamped `info`/`warn`/`error`/`stdout`/`stderr` JSON lines (UTC `ts`).
-- **Scheduled task is a first-class object.** The task is registered via `Register-ScheduledTask` into the visible `\myTech.Today\` folder as `Autoresearch-Train`, using `New-ScheduledTaskPrincipal -LogonType Interactive -RunLevel Highest` and only GUI-roundtrippable `New-ScheduledTaskSettingsSet` options: `-StartWhenAvailable`, `-AllowStartIfOnBatteries`, `-DontStopIfGoingOnBatteries`, `-RestartCount 3`, `-RestartInterval 5m`, `-MultipleInstances IgnoreNew`. Triggers: `Hourly` (once at `-ScheduleTime`, repeating every hour), `Daily` (at `-ScheduleTime`), or `Weekly` (Sunday at `-ScheduleTime`). The task is not hidden, is fully editable in `taskschd.msc` (no greyed-out controls), and the trigger/action/principal reflect the GUI/CLI selections. Task history is enabled by default via `wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true` (requires elevation; a warning is logged if elevation is unavailable).
+- **Scheduled task is a first-class object.** The task is registered via `Register-ScheduledTask` into the visible `\myTech.Today\` folder as `Autoresearch-Train`, using `New-ScheduledTaskPrincipal -LogonType Interactive -RunLevel Highest` and only GUI-roundtrippable `New-ScheduledTaskSettingsSet` options: `-StartWhenAvailable`, `-AllowStartIfOnBatteries`, `-DontStopIfGoingOnBatteries`, `-RestartCount 3`, `-RestartInterval 5m`, `-MultipleInstances IgnoreNew`. `-ScheduleTime` is polymorphic: in `Hourly` mode it is a minute-of-hour offset (`':00'`..`':50'` in 10-minute steps, default `':00'`); in `Daily` mode it is a local 24-hour time-of-day (`'00:00'`..`'23:45'` in 15-minute steps, default `'18:00'`); in `Weekly` mode it is a weekday name (`'Sunday'`..`'Saturday'`, default `'Sunday'`) and the trigger fires that day at 03:00 local. The GUI repurposes the time dropdown and its label to match. The task is not hidden, is fully editable in `taskschd.msc` (no greyed-out controls), and the trigger/action/principal reflect the GUI/CLI selections. Task history is enabled by default via `wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true` (requires elevation; a warning is logged if elevation is unavailable).
 
 ### `launch.ps1` parameter reference
 
@@ -57,9 +57,27 @@ See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-
 | `-RepoRoot` | path | parent of `scripts\` | Repo containing `train.py`; `.venv` is auto-created via `uv sync` if missing. |
 | `-LogDir` | path | `%HOMEDRIVE%\myTech.Today\logs` | Destination for aggregate + per-run JSONL logs. |
 | `-ScheduleFrequency` | `Hourly` \| `Daily` \| `Weekly` | `Daily` | Trigger cadence for `-RegisterTask`. |
-| `-ScheduleTime` | `HH:mm` (24h, local) | `03:00` | Start time for the trigger. |
+| `-ScheduleTime` | depends on `-ScheduleFrequency` (see [Scheduling](#scheduling)) | frequency-specific (`':00'` / `'18:00'` / `'Sunday'`) | Polymorphic schedule slot; validated against the active frequency at runtime. |
 | `-RegisterTask` / `-RunNow` / `-Unregister` / `-Update` | switch | off | Action selectors; see above. |
 | `-NoGui` | switch | off | Skip the WPF launcher (required for unattended/scheduled use). |
+
+### Scheduling
+
+The meaning, allowed value set, and default of `-ScheduleTime` change with `-ScheduleFrequency`. The GUI's time dropdown and its label re-bind whenever the frequency selector changes; invalid CLI values raise an error listing the allowed set.
+
+| Frequency | `-ScheduleTime` meaning | Allowed values | Default |
+| --- | --- | --- | --- |
+| `Hourly` | Minute-of-the-hour offset | `':00'`, `':10'`, `':20'`, `':30'`, `':40'`, `':50'` (10-minute steps) | `':00'` |
+| `Daily`  | Local 24-hour time-of-day | `'00:00'`, `'00:15'`, `'00:30'`, ... `'23:45'` (15-minute steps; 96 values) | `'18:00'` |
+| `Weekly` | Weekday name | `'Sunday'`, `'Monday'`, `'Tuesday'`, `'Wednesday'`, `'Thursday'`, `'Friday'`, `'Saturday'` | `'Sunday'` |
+
+CLI examples:
+
+```powershell
+pwsh -File .\scripts\launch.ps1 -NoGui -RegisterTask -ScheduleFrequency Hourly -ScheduleTime ':30'
+pwsh -File .\scripts\launch.ps1 -NoGui -RegisterTask -ScheduleFrequency Daily  -ScheduleTime '18:00'
+pwsh -File .\scripts\launch.ps1 -NoGui -RegisterTask -ScheduleFrequency Weekly -ScheduleTime 'Wednesday'
+```
 
 ## AI-Powered Features
 

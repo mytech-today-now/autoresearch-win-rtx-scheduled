@@ -146,6 +146,21 @@
     Example (update everything, then run training once):
         pwsh -File .\scripts\launch.ps1 -Update -RunNow
 
+.PARAMETER Debug
+    Switch. When set, writes verbose 'debug'-level JSON records into the
+    aggregate and per-run log files capturing:
+      * Each preflight step (tool resolution, install attempts and outcomes,
+        Ollama probe results, model catalog inspection, repo layout checks).
+      * Every GUI state transition (XAML load, control resolution, frequency
+        selection, time list rebuilds, default application, snapshot collection).
+      * Any exception raised inside a WPF event handler (which WPF would
+        otherwise silently swallow), including stack trace.
+    Debug records are also echoed to the console in DarkCyan. Has no other
+    effect on script behaviour.
+
+    Example:
+        pwsh -File .\scripts\launch.ps1 -Debug
+
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1
     # Preflight only. Verifies uv, ollama, ai-powered, the model, and the
@@ -218,7 +233,6 @@
       Windows PowerShell 5.1 or PowerShell 7+, internet access for the
       first preflight (to install missing tools and pull the model).
 #>
-[CmdletBinding()]
 param(
     [ValidateSet('ollama', 'openai', 'anthropic', 'azure')]
     [string]$Provider = 'ollama',
@@ -236,7 +250,8 @@ param(
     [switch]$RunNow,
     [switch]$Unregister,
     [switch]$Update,
-    [switch]$NoGui
+    [switch]$NoGui,
+    [switch]$Debug
 )
 
 Set-StrictMode -Version Latest
@@ -254,6 +269,7 @@ $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-sche
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
 $Script:LogRetention = 10
+$Script:DebugEnabled = [bool]$Debug
 
 function ConvertTo-ForwardArgs {
     param([System.Collections.IDictionary]$Bound)
@@ -331,7 +347,7 @@ function New-Dir {
 
 function Write-Json {
     param(
-        [ValidateSet('info', 'warn', 'error', 'stdout', 'stderr')][string]$Level,
+        [ValidateSet('info', 'warn', 'error', 'stdout', 'stderr', 'debug')][string]$Level,
         [string]$Message,
         [hashtable]$Extra = $null
     )
@@ -352,6 +368,21 @@ function Write-Json {
     if ($Level -in @('info', 'warn', 'error')) {
         $color = switch ($Level) { 'info' { 'Gray' } 'warn' { 'Yellow' } 'error' { 'Red' } }
         Write-Host "[$Level] $Message" -ForegroundColor $color
+    } elseif ($Level -eq 'debug' -and $Script:DebugEnabled) {
+        Write-Host "[debug] $Message" -ForegroundColor DarkCyan
+    }
+}
+
+function Write-DebugLog {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [hashtable]$Extra = $null
+    )
+    if (-not $Script:DebugEnabled) { return }
+    try {
+        Write-Json -Level debug -Message $Message -Extra $Extra
+    } catch {
+        # Never let debug logging derail the script.
     }
 }
 
@@ -383,37 +414,52 @@ function Install-Tool {
         [string]$PipPackage,
         [string]$NpmPackage
     )
-    if (Test-CommandOnPath $Name) { return }
+    if (Test-CommandOnPath $Name) {
+        $resolved = (Get-Command $Name -ErrorAction SilentlyContinue).Source
+        Write-DebugLog "Install-Tool: '$Name' already on PATH at '$resolved'"
+        return
+    }
     Write-Json -Level info -Message "$Name not on PATH; attempting install"
+    Write-DebugLog "Install-Tool: trying providers for '$Name'" -Extra @{
+        winget = $WingetId; pipx = $PipxPackage; pip = $PipPackage; npm = $NpmPackage
+    }
     $ok = $false
     if ($WingetId) {
         $ok = Invoke-Winget @('install', '--id', $WingetId, '--source', 'winget',
             '--accept-package-agreements', '--accept-source-agreements',
             '--silent', '--disable-interactivity')
+        Write-DebugLog "Install-Tool: winget install '$WingetId' ok=$ok exit=$LASTEXITCODE"
     }
     if (-not $ok -and $PipxPackage -and (Test-CommandOnPath 'pipx')) {
         & pipx install $PipxPackage | Out-Null
         $ok = ($LASTEXITCODE -eq 0)
+        Write-DebugLog "Install-Tool: pipx install '$PipxPackage' ok=$ok exit=$LASTEXITCODE"
     }
     if (-not $ok -and $PipPackage -and (Test-CommandOnPath 'pip')) {
         & pip install --user $PipPackage | Out-Null
         $ok = ($LASTEXITCODE -eq 0)
+        Write-DebugLog "Install-Tool: pip install '$PipPackage' ok=$ok exit=$LASTEXITCODE"
     }
     if (-not $ok -and $NpmPackage -and (Test-CommandOnPath 'npm')) {
         & npm install -g $NpmPackage | Out-Null
         $ok = ($LASTEXITCODE -eq 0)
+        Write-DebugLog "Install-Tool: npm install -g '$NpmPackage' ok=$ok exit=$LASTEXITCODE"
     }
     Update-SessionPath
     if (-not (Test-CommandOnPath $Name)) {
         throw "$Name is required but could not be installed automatically. Install $Name manually and re-run."
     }
+    $resolved = (Get-Command $Name -ErrorAction SilentlyContinue).Source
+    Write-DebugLog "Install-Tool: '$Name' now resolvable at '$resolved'"
 }
 
 function Test-OllamaListening {
     try {
         Invoke-RestMethod -Uri ("$OllamaHost/api/tags") -Method Get -TimeoutSec 2 | Out-Null
+        Write-DebugLog "Test-OllamaListening: reachable at $OllamaHost"
         return $true
     } catch {
+        Write-DebugLog "Test-OllamaListening: not reachable at $OllamaHost ($($_.Exception.Message))"
         return $false
     }
 }
@@ -425,10 +471,14 @@ function Start-OllamaServer {
     $ollamaCmd = Get-Command ollama -ErrorAction Stop
     $hostPort = $OllamaHost -replace '^https?://', ''
     [Environment]::SetEnvironmentVariable('OLLAMA_HOST', $hostPort, 'Process')
+    Write-DebugLog "Start-OllamaServer: launching '$($ollamaCmd.Source) serve' (OLLAMA_HOST=$hostPort)"
     Start-Process -FilePath $ollamaCmd.Source -ArgumentList 'serve' -WindowStyle Hidden | Out-Null
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
-        if (Test-OllamaListening) { return }
+        if (Test-OllamaListening) {
+            Write-DebugLog "Start-OllamaServer: ready at $OllamaHost"
+            return
+        }
         Start-Sleep -Seconds 2
     }
     throw "ollama did not become ready at $OllamaHost within 60 seconds. Run 'ollama serve' manually to diagnose."
@@ -437,9 +487,15 @@ function Start-OllamaServer {
 function Test-OllamaModelPresent {
     try {
         $tags = Invoke-RestMethod -Uri ("$OllamaHost/api/tags") -Method Get -TimeoutSec 5
-        if ($null -eq $tags -or -not (Get-Member -InputObject $tags -Name 'models' -MemberType NoteProperty)) { return $false }
-        return [bool]($tags.models | Where-Object { $_.name -eq $Model })
+        if ($null -eq $tags -or -not (Get-Member -InputObject $tags -Name 'models' -MemberType NoteProperty)) {
+            Write-DebugLog "Test-OllamaModelPresent: no 'models' in /api/tags response"
+            return $false
+        }
+        $present = [bool]($tags.models | Where-Object { $_.name -eq $Model })
+        Write-DebugLog "Test-OllamaModelPresent: model '$Model' present=$present (catalog size=$($tags.models.Count))"
+        return $present
     } catch {
+        Write-DebugLog "Test-OllamaModelPresent: error querying /api/tags ($($_.Exception.Message))"
         return $false
     }
 }
@@ -451,9 +507,11 @@ function Sync-OllamaModel {
     if ($LASTEXITCODE -ne 0) {
         throw "ollama pull $Model failed (exit $LASTEXITCODE)"
     }
+    Write-DebugLog "Sync-OllamaModel: pulled '$Model' (exit $LASTEXITCODE)"
 }
 
 function Assert-RepoLayout {
+    Write-DebugLog "Assert-RepoLayout: RepoRoot=$RepoRoot"
     if (-not (Test-Path -LiteralPath $RepoRoot)) {
         throw "Repo root not found: $RepoRoot"
     }
@@ -462,6 +520,7 @@ function Assert-RepoLayout {
         throw "train.py not found at $trainPy"
     }
     $venv = Join-Path $RepoRoot '.venv'
+    Write-DebugLog "Assert-RepoLayout: train.py=$trainPy venv=$venv venvExists=$([bool](Test-Path -LiteralPath $venv))"
     if (-not (Test-Path -LiteralPath $venv)) {
         Write-Json -Level info -Message "Project virtualenv missing; running 'uv sync'"
         Push-Location $RepoRoot
@@ -470,6 +529,7 @@ function Assert-RepoLayout {
             if ($LASTEXITCODE -ne 0) {
                 throw "uv sync failed (exit $LASTEXITCODE)"
             }
+            Write-DebugLog "Assert-RepoLayout: 'uv sync' completed exit=$LASTEXITCODE"
         } finally {
             Pop-Location
         }
@@ -477,15 +537,23 @@ function Assert-RepoLayout {
 }
 
 function Invoke-Preflight {
+    Write-DebugLog "Invoke-Preflight: begin (Provider=$Provider Model=$Model LogDir=$LogDir)"
     New-Dir $LogDir
+    Write-DebugLog "Invoke-Preflight: ensuring 'uv' present"
     Install-Tool -Name 'uv' -WingetId 'astral-sh.uv' -PipxPackage 'uv' -PipPackage 'uv'
+    Write-DebugLog "Invoke-Preflight: ensuring 'ai-powered' present"
     Install-Tool -Name 'ai-powered' -NpmPackage 'ai-powered'
+    Write-DebugLog "Invoke-Preflight: asserting repo layout"
     Assert-RepoLayout
     if ($Provider -eq 'ollama') {
+        Write-DebugLog "Invoke-Preflight: ensuring 'ollama' present"
         Install-Tool -Name 'ollama' -WingetId 'Ollama.Ollama'
+        Write-DebugLog "Invoke-Preflight: starting/verifying ollama server"
         Start-OllamaServer
+        Write-DebugLog "Invoke-Preflight: ensuring model '$Model' is present"
         Sync-OllamaModel
     }
+    Write-DebugLog "Invoke-Preflight: complete"
 }
 
 function Invoke-Update {
@@ -743,9 +811,29 @@ function Initialize-LaunchConfig {
     }
 }
 
+function Invoke-GuiSafe {
+    param(
+        [Parameter(Mandatory)][string]$Context,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+    try {
+        & $Action
+    } catch {
+        $msg = "GUI error in $Context : $($_.Exception.Message)"
+        try { Write-Json -Level error -Message $msg } catch {}
+        Write-DebugLog $msg -Extra @{
+            context    = $Context
+            exception  = $_.Exception.GetType().FullName
+            stackTrace = $_.ScriptStackTrace
+        }
+    }
+}
+
 function Show-LaunchGui {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+    Write-DebugLog "Show-LaunchGui: begin"
     $d = Read-LaunchDefaults
+    Write-DebugLog "Show-LaunchGui: defaults loaded" -Extra @{ hasDefaults = [bool]$d }
     [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -808,18 +896,35 @@ function Show-LaunchGui {
 "@
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
+    Write-DebugLog "Show-LaunchGui: XAML loaded"
     $script:C = @{}
     foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',
         'PrvOllama','PrvOpenAI','PrvAnthropic','PrvAzure','CbModel','CbHost','PbApiKey',
         'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','LblTime','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
         $script:C[$n] = $window.FindName($n)
+        if ($null -eq $script:C[$n]) {
+            Write-DebugLog "Show-LaunchGui: FindName returned null for '$n'"
+        }
     }
-    $script:applyFreqItems = {
-        $freq = if ($script:C.CbFreq.SelectedItem) { [string]$script:C.CbFreq.SelectedItem.Content } else { 'Daily' }
+
+    # Apply Frequency -> Time dropdown rebuild. Defined as a script-scoped
+    # function so it can be invoked both directly and from event handlers
+    # without scope/marshaling surprises. Uses Items.Clear()/Items.Add()
+    # because mixing ItemsSource with later Items.Add throws InvalidOperation
+    # under WPF, and the previous null-then-rebind pattern intermittently
+    # left CbTime stale on SelectionChanged.
+    function script:Update-CbTimeForFrequency {
+        $freqItem = $script:C.CbFreq.SelectedItem
+        $freq = if ($null -ne $freqItem) {
+            if ($freqItem -is [System.Windows.Controls.ComboBoxItem]) { [string]$freqItem.Content }
+            else { [string]$freqItem }
+        } else { 'Daily' }
+        Write-DebugLog "Update-CbTimeForFrequency: freq='$freq' (selectedType=$(if ($null -ne $freqItem){$freqItem.GetType().Name}else{'<null>'}))"
+        $opts = @(Get-ScheduleTimeOptions -Frequency $freq)
+        Write-DebugLog "Update-CbTimeForFrequency: option count=$($opts.Count) first='$($opts[0])' last='$($opts[-1])'"
         $script:C.CbTime.SelectedIndex = -1
-        $script:C.CbTime.ItemsSource = $null
-        $opts = Get-ScheduleTimeOptions -Frequency $freq
-        $script:C.CbTime.ItemsSource = $opts
+        $script:C.CbTime.Items.Clear()
+        foreach ($o in $opts) { $null = $script:C.CbTime.Items.Add([string]$o) }
         $script:C.LblTime.Content = switch ($freq) {
             'Hourly' { 'Minute of hour' }
             'Weekly' { 'Day of week' }
@@ -828,49 +933,79 @@ function Show-LaunchGui {
         $defVal = Get-ScheduleTimeDefault -Frequency $freq
         $idx = [array]::IndexOf($opts, $defVal)
         if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
+        Write-DebugLog "Update-CbTimeForFrequency: applied label='$($script:C.LblTime.Content)' defaultVal='$defVal' selectedIndex=$($script:C.CbTime.SelectedIndex) itemsCount=$($script:C.CbTime.Items.Count)"
     }
-    $script:C.CbFreq.add_SelectionChanged({ & $script:applyFreqItems })
-    $script:populateModels = {
-        param($prv)
+
+    $script:C.CbFreq.add_SelectionChanged({
+        Invoke-GuiSafe -Context 'CbFreq.SelectionChanged' -Action {
+            Write-DebugLog "CbFreq.SelectionChanged fired"
+            script:Update-CbTimeForFrequency
+        }
+    })
+
+    function script:Update-ModelsForProvider {
+        param([string]$Prv)
+        Write-DebugLog "Update-ModelsForProvider: prv='$Prv'"
         $script:C.CbModel.Items.Clear()
-        foreach ($m in $Script:ProviderModels[$prv]) { $script:C.CbModel.Items.Add($m) | Out-Null }
+        foreach ($m in $Script:ProviderModels[$Prv]) { $null = $script:C.CbModel.Items.Add($m) }
         $script:C.CbModel.SelectedIndex = 0
-        $azVis = if ($prv -eq 'azure') { 'Visible' } else { 'Collapsed' }
+        $azVis = if ($Prv -eq 'azure') { 'Visible' } else { 'Collapsed' }
         foreach ($k in 'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp') { $script:C[$k].Visibility = $azVis }
-        $script:C.CbHost.IsEnabled = ($prv -eq 'ollama')
+        $script:C.CbHost.IsEnabled = ($Prv -eq 'ollama')
     }
-    $script:C.PrvOllama.Add_Checked({ & $script:populateModels 'ollama' })
-    $script:C.PrvOpenAI.Add_Checked({ & $script:populateModels 'openai' })
-    $script:C.PrvAnthropic.Add_Checked({ & $script:populateModels 'anthropic' })
-    $script:C.PrvAzure.Add_Checked({ & $script:populateModels 'azure' })
-    & $script:populateModels 'ollama'
+
+    $script:C.PrvOllama.Add_Checked({ Invoke-GuiSafe -Context 'PrvOllama.Checked' -Action { script:Update-ModelsForProvider 'ollama' } })
+    $script:C.PrvOpenAI.Add_Checked({ Invoke-GuiSafe -Context 'PrvOpenAI.Checked' -Action { script:Update-ModelsForProvider 'openai' } })
+    $script:C.PrvAnthropic.Add_Checked({ Invoke-GuiSafe -Context 'PrvAnthropic.Checked' -Action { script:Update-ModelsForProvider 'anthropic' } })
+    $script:C.PrvAzure.Add_Checked({ Invoke-GuiSafe -Context 'PrvAzure.Checked' -Action { script:Update-ModelsForProvider 'azure' } })
+
+    Invoke-GuiSafe -Context 'initial-populateModels' -Action { script:Update-ModelsForProvider 'ollama' }
+
     if ($d) {
-        switch ($d.Provider) {
-            'openai'    { $script:C.PrvOpenAI.IsChecked = $true }
-            'anthropic' { $script:C.PrvAnthropic.IsChecked = $true }
-            'azure'     { $script:C.PrvAzure.IsChecked = $true }
-            default     { $script:C.PrvOllama.IsChecked = $true }
+        Invoke-GuiSafe -Context 'apply-defaults' -Action {
+            switch ($d.Provider) {
+                'openai'    { $script:C.PrvOpenAI.IsChecked = $true }
+                'anthropic' { $script:C.PrvAnthropic.IsChecked = $true }
+                'azure'     { $script:C.PrvAzure.IsChecked = $true }
+                default     { $script:C.PrvOllama.IsChecked = $true }
+            }
+            if ($d.PSObject.Properties['Model']           -and $d.Model)           { $script:C.CbModel.SelectedItem = $d.Model }
+            if ($d.PSObject.Properties['OllamaHost']      -and $d.OllamaHost)      { $script:C.CbHost.Text = $d.OllamaHost }
+            if ($d.PSObject.Properties['ScheduleFrequency'] -and $d.ScheduleFrequency) {
+                $match = $script:C.CbFreq.Items | Where-Object { $_.Content -eq $d.ScheduleFrequency } | Select-Object -First 1
+                if ($match) { $script:C.CbFreq.SelectedItem = $match }
+            }
+            if ($d.PSObject.Properties['AzureEndpoint']   -and $d.AzureEndpoint)   { $script:C.TxtAzEp.Text = $d.AzureEndpoint }
+            if ($d.PSObject.Properties['AzureDeployment'] -and $d.AzureDeployment) { $script:C.TxtAzDp.Text = $d.AzureDeployment }
+            Write-DebugLog "apply-defaults: provider=$($d.Provider) freq=$($d.ScheduleFrequency) time=$($d.ScheduleTime)"
         }
-        if ($d.Model) { $script:C.CbModel.SelectedItem = $d.Model }
-        if ($d.OllamaHost) { $script:C.CbHost.Text = $d.OllamaHost }
-        if ($d.ScheduleFrequency) {
-            $script:C.CbFreq.SelectedItem = ($script:C.CbFreq.Items | Where-Object { $_.Content -eq $d.ScheduleFrequency } | Select-Object -First 1)
+    }
+
+    # Force the Time dropdown to align with whatever frequency is now selected
+    # (handles both the no-defaults path and any defaults that did not trigger
+    # SelectionChanged because the selection did not actually change).
+    Invoke-GuiSafe -Context 'initial-applyFreqItems' -Action { script:Update-CbTimeForFrequency }
+
+    if ($d -and $d.PSObject.Properties['ScheduleTime'] -and $d.ScheduleTime) {
+        Invoke-GuiSafe -Context 'apply-defaults-scheduleTime' -Action {
+            $items = @($script:C.CbTime.Items)
+            $idx = [array]::IndexOf($items, [string]$d.ScheduleTime)
+            if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
+            Write-DebugLog "apply-defaults-scheduleTime: target='$($d.ScheduleTime)' index=$idx"
         }
-        if ($d.AzureEndpoint) { $script:C.TxtAzEp.Text = $d.AzureEndpoint }
-        if ($d.AzureDeployment) { $script:C.TxtAzDp.Text = $d.AzureDeployment }
     }
-    & $script:applyFreqItems
-    if ($d -and $d.ScheduleTime) {
-        $src = @($script:C.CbTime.ItemsSource)
-        $idx = $src.IndexOf([string]$d.ScheduleTime)
-        if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
-    }
+
     $Script:GuiResult = $null
-    $script:collect = {
+    function script:Get-GuiSnapshot {
         $prv = if ($script:C.PrvOpenAI.IsChecked) { 'openai' }
                elseif ($script:C.PrvAnthropic.IsChecked) { 'anthropic' }
                elseif ($script:C.PrvAzure.IsChecked) { 'azure' }
                else { 'ollama' }
+        $freqItem = $script:C.CbFreq.SelectedItem
+        $freqStr = if ($null -ne $freqItem) {
+            if ($freqItem -is [System.Windows.Controls.ComboBoxItem]) { [string]$freqItem.Content }
+            else { [string]$freqItem }
+        } else { 'Daily' }
         @{
             Provider          = $prv
             Model             = [string]$script:C.CbModel.SelectedItem
@@ -878,7 +1013,7 @@ function Show-LaunchGui {
             ApiKey            = $script:C.PbApiKey.Password
             AzureEndpoint     = $script:C.TxtAzEp.Text
             AzureDeployment   = $script:C.TxtAzDp.Text
-            ScheduleFrequency = [string]$script:C.CbFreq.SelectedItem.Content
+            ScheduleFrequency = $freqStr
             ScheduleTime      = [string]$script:C.CbTime.SelectedItem
             EnableHistory     = [bool]$script:C.ChkHistory.IsChecked
             Action            = if ($script:C.ActPreflight.IsChecked) { 'Preflight' }
@@ -889,15 +1024,40 @@ function Show-LaunchGui {
                                 else { 'Update' }
         }
     }
+
     $script:C.BtnDefaults.Add_Click({
-        $vals = & $script:collect
-        $persist = @{} + $vals
-        $persist.Remove('ApiKey') | Out-Null
-        Save-LaunchDefaults -Values $persist
+        Invoke-GuiSafe -Context 'BtnDefaults.Click' -Action {
+            $vals = script:Get-GuiSnapshot
+            $persist = @{} + $vals
+            $persist.Remove('ApiKey') | Out-Null
+            Save-LaunchDefaults -Values $persist
+            Write-DebugLog "BtnDefaults.Click: saved defaults"
+        }
     })
-    $script:C.BtnCancel.Add_Click({ $window.DialogResult = $false; $window.Close() })
-    $script:C.BtnOK.Add_Click({ $Script:GuiResult = & $script:collect; $window.DialogResult = $true; $window.Close() })
+    $script:C.BtnCancel.Add_Click({
+        Invoke-GuiSafe -Context 'BtnCancel.Click' -Action {
+            Write-DebugLog "BtnCancel.Click"
+            $window.DialogResult = $false
+            $window.Close()
+        }
+    })
+    $script:C.BtnOK.Add_Click({
+        Invoke-GuiSafe -Context 'BtnOK.Click' -Action {
+            $Script:GuiResult = script:Get-GuiSnapshot
+            Write-DebugLog "BtnOK.Click: snapshot collected" -Extra @{
+                provider = $Script:GuiResult.Provider
+                model    = $Script:GuiResult.Model
+                freq     = $Script:GuiResult.ScheduleFrequency
+                time     = $Script:GuiResult.ScheduleTime
+                action   = $Script:GuiResult.Action
+            }
+            $window.DialogResult = $true
+            $window.Close()
+        }
+    })
+    Write-DebugLog "Show-LaunchGui: showing dialog"
     $ok = $window.ShowDialog()
+    Write-DebugLog "Show-LaunchGui: dialog closed result=$ok"
     if (-not $ok) { return $null }
     return $Script:GuiResult
 }
@@ -925,6 +1085,28 @@ function Invoke-FromGui {
 
 try {
     New-Dir $LogDir
+    if ($Script:DebugEnabled) {
+        Write-Json -Level info -Message "Debug logging enabled" -Extra @{
+            aggregateLog = $Script:AggregateLog
+            logDir       = $LogDir
+            pwsh         = $PSVersionTable.PSVersion.ToString()
+        }
+        Write-DebugLog "Invocation parameters" -Extra @{
+            Provider          = $Provider
+            Model             = $Model
+            OllamaHost        = $OllamaHost
+            RepoRoot          = $RepoRoot
+            LogDir            = $LogDir
+            ScheduleFrequency = $ScheduleFrequency
+            ScheduleTime      = $ScheduleTime
+            RegisterTask      = [bool]$RegisterTask
+            RunNow            = [bool]$RunNow
+            Unregister        = [bool]$Unregister
+            Update            = [bool]$Update
+            NoGui             = [bool]$NoGui
+            BoundKeys         = @($PSBoundParameters.Keys)
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($ScheduleTime)) {
         $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
     }

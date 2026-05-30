@@ -808,99 +808,95 @@ function Show-LaunchGui {
 "@
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    $C = @{}
+    $script:C = @{}
     foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',
         'PrvOllama','PrvOpenAI','PrvAnthropic','PrvAzure','CbModel','CbHost','PbApiKey',
         'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','LblTime','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
-        $C[$n] = $window.FindName($n)
+        $script:C[$n] = $window.FindName($n)
     }
-    $hourOptions = [System.Collections.Generic.List[string]]::new()
-    foreach ($v in ':00',':10',':20',':30',':40',':50') { $hourOptions.Add($v) }
-    $timeOptions = [System.Collections.Generic.List[string]]::new()
-    for ($h = 0; $h -lt 24; $h++) {
-        foreach ($m in 0,15,30,45) { $timeOptions.Add(('{0:D2}:{1:D2}' -f $h, $m)) }
-    }
-    $dayOptions = [System.Collections.Generic.List[string]]::new()
-    foreach ($n in 'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday') { $dayOptions.Add($n) }
-    $applyFreqItems = {
-        $freq = if ($C.CbFreq.SelectedItem) { [string]$C.CbFreq.SelectedItem.Content } else { 'Daily' }
-        switch ($freq) {
-            'Hourly' { $C.CbTime.ItemsSource = $hourOptions; $C.LblTime.Content = 'Minute of hour';            $defVal = ':00' }
-            'Weekly' { $C.CbTime.ItemsSource = $dayOptions;  $C.LblTime.Content = 'Day of week';               $defVal = 'Sunday' }
-            default  { $C.CbTime.ItemsSource = $timeOptions; $C.LblTime.Content = 'Time of day (HH:mm, local)'; $defVal = '18:00' }
+    $script:applyFreqItems = {
+        $freq = if ($script:C.CbFreq.SelectedItem) { [string]$script:C.CbFreq.SelectedItem.Content } else { 'Daily' }
+        $script:C.CbTime.SelectedIndex = -1
+        $script:C.CbTime.ItemsSource = $null
+        $opts = Get-ScheduleTimeOptions -Frequency $freq
+        $script:C.CbTime.ItemsSource = $opts
+        $script:C.LblTime.Content = switch ($freq) {
+            'Hourly' { 'Minute of hour' }
+            'Weekly' { 'Day of week' }
+            default  { 'Time of day (HH:mm, local)' }
         }
-        if ($C.CbTime.SelectedIndex -lt 0) {
-            $src = @($C.CbTime.ItemsSource)
-            $idx = $src.IndexOf($defVal)
-            if ($idx -ge 0) { $C.CbTime.SelectedIndex = $idx }
-        }
+        $defVal = Get-ScheduleTimeDefault -Frequency $freq
+        $idx = [array]::IndexOf($opts, $defVal)
+        if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
     }
-    $C.CbFreq.add_SelectionChanged({ $C.CbTime.SelectedIndex = -1; & $applyFreqItems })
-    & $applyFreqItems
-    $populateModels = {
+    $script:C.CbFreq.add_SelectionChanged({ & $script:applyFreqItems })
+    $script:populateModels = {
         param($prv)
-        $C.CbModel.Items.Clear()
-        foreach ($m in $Script:ProviderModels[$prv]) { $C.CbModel.Items.Add($m) | Out-Null }
-        $C.CbModel.SelectedIndex = 0
+        $script:C.CbModel.Items.Clear()
+        foreach ($m in $Script:ProviderModels[$prv]) { $script:C.CbModel.Items.Add($m) | Out-Null }
+        $script:C.CbModel.SelectedIndex = 0
         $azVis = if ($prv -eq 'azure') { 'Visible' } else { 'Collapsed' }
-        foreach ($k in 'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp') { $C[$k].Visibility = $azVis }
-        $C.CbHost.IsEnabled = ($prv -eq 'ollama')
+        foreach ($k in 'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp') { $script:C[$k].Visibility = $azVis }
+        $script:C.CbHost.IsEnabled = ($prv -eq 'ollama')
     }
-    $C.PrvOllama.Add_Checked({ & $populateModels 'ollama' })
-    $C.PrvOpenAI.Add_Checked({ & $populateModels 'openai' })
-    $C.PrvAnthropic.Add_Checked({ & $populateModels 'anthropic' })
-    $C.PrvAzure.Add_Checked({ & $populateModels 'azure' })
-    & $populateModels 'ollama'
+    $script:C.PrvOllama.Add_Checked({ & $script:populateModels 'ollama' })
+    $script:C.PrvOpenAI.Add_Checked({ & $script:populateModels 'openai' })
+    $script:C.PrvAnthropic.Add_Checked({ & $script:populateModels 'anthropic' })
+    $script:C.PrvAzure.Add_Checked({ & $script:populateModels 'azure' })
+    & $script:populateModels 'ollama'
     if ($d) {
         switch ($d.Provider) {
-            'openai'    { $C.PrvOpenAI.IsChecked = $true }
-            'anthropic' { $C.PrvAnthropic.IsChecked = $true }
-            'azure'     { $C.PrvAzure.IsChecked = $true }
-            default     { $C.PrvOllama.IsChecked = $true }
+            'openai'    { $script:C.PrvOpenAI.IsChecked = $true }
+            'anthropic' { $script:C.PrvAnthropic.IsChecked = $true }
+            'azure'     { $script:C.PrvAzure.IsChecked = $true }
+            default     { $script:C.PrvOllama.IsChecked = $true }
         }
-        if ($d.Model) { $C.CbModel.SelectedItem = $d.Model }
-        if ($d.OllamaHost) { $C.CbHost.Text = $d.OllamaHost }
-        if ($d.ScheduleFrequency) { $C.CbFreq.SelectedItem = ($C.CbFreq.Items | Where-Object { $_.Content -eq $d.ScheduleFrequency } | Select-Object -First 1) }
-        if ($d.ScheduleTime) {
-            $src = @($C.CbTime.ItemsSource)
-            $idx = $src.IndexOf([string]$d.ScheduleTime)
-            if ($idx -ge 0) { $C.CbTime.SelectedIndex = $idx }
+        if ($d.Model) { $script:C.CbModel.SelectedItem = $d.Model }
+        if ($d.OllamaHost) { $script:C.CbHost.Text = $d.OllamaHost }
+        if ($d.ScheduleFrequency) {
+            $script:C.CbFreq.SelectedItem = ($script:C.CbFreq.Items | Where-Object { $_.Content -eq $d.ScheduleFrequency } | Select-Object -First 1)
         }
-        if ($d.AzureEndpoint) { $C.TxtAzEp.Text = $d.AzureEndpoint }
-        if ($d.AzureDeployment) { $C.TxtAzDp.Text = $d.AzureDeployment }
+        if ($d.AzureEndpoint) { $script:C.TxtAzEp.Text = $d.AzureEndpoint }
+        if ($d.AzureDeployment) { $script:C.TxtAzDp.Text = $d.AzureDeployment }
+    }
+    & $script:applyFreqItems
+    if ($d -and $d.ScheduleTime) {
+        $src = @($script:C.CbTime.ItemsSource)
+        $idx = $src.IndexOf([string]$d.ScheduleTime)
+        if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
     }
     $Script:GuiResult = $null
-    $collect = {
-        $prv = if ($C.PrvOpenAI.IsChecked) { 'openai' }
-               elseif ($C.PrvAnthropic.IsChecked) { 'anthropic' }
-               elseif ($C.PrvAzure.IsChecked) { 'azure' }
+    $script:collect = {
+        $prv = if ($script:C.PrvOpenAI.IsChecked) { 'openai' }
+               elseif ($script:C.PrvAnthropic.IsChecked) { 'anthropic' }
+               elseif ($script:C.PrvAzure.IsChecked) { 'azure' }
                else { 'ollama' }
         @{
             Provider          = $prv
-            Model             = [string]$C.CbModel.SelectedItem
-            OllamaHost        = [string]$C.CbHost.Text
-            ApiKey            = $C.PbApiKey.Password
-            AzureEndpoint     = $C.TxtAzEp.Text
-            AzureDeployment   = $C.TxtAzDp.Text
-            ScheduleFrequency = [string]$C.CbFreq.SelectedItem.Content
-            ScheduleTime      = [string]$C.CbTime.SelectedItem
-            EnableHistory     = [bool]$C.ChkHistory.IsChecked
-            Action            = if ($C.ActPreflight.IsChecked) { 'Preflight' }
-                                elseif ($C.ActRunNow.IsChecked) { 'RunNow' }
-                                elseif ($C.ActRegister.IsChecked) { 'Register' }
-                                elseif ($C.ActRegisterRun.IsChecked) { 'RegisterRun' }
-                                elseif ($C.ActUnregister.IsChecked) { 'Unregister' }
+            Model             = [string]$script:C.CbModel.SelectedItem
+            OllamaHost        = [string]$script:C.CbHost.Text
+            ApiKey            = $script:C.PbApiKey.Password
+            AzureEndpoint     = $script:C.TxtAzEp.Text
+            AzureDeployment   = $script:C.TxtAzDp.Text
+            ScheduleFrequency = [string]$script:C.CbFreq.SelectedItem.Content
+            ScheduleTime      = [string]$script:C.CbTime.SelectedItem
+            EnableHistory     = [bool]$script:C.ChkHistory.IsChecked
+            Action            = if ($script:C.ActPreflight.IsChecked) { 'Preflight' }
+                                elseif ($script:C.ActRunNow.IsChecked) { 'RunNow' }
+                                elseif ($script:C.ActRegister.IsChecked) { 'Register' }
+                                elseif ($script:C.ActRegisterRun.IsChecked) { 'RegisterRun' }
+                                elseif ($script:C.ActUnregister.IsChecked) { 'Unregister' }
                                 else { 'Update' }
         }
     }
-    $C.BtnDefaults.Add_Click({
-        $vals = & $collect
+    $script:C.BtnDefaults.Add_Click({
+        $vals = & $script:collect
         $persist = @{} + $vals
         $persist.Remove('ApiKey') | Out-Null
         Save-LaunchDefaults -Values $persist
     })
-    $C.BtnCancel.Add_Click({ $window.DialogResult = $false; $window.Close() })
-    $C.BtnOK.Add_Click({ $Script:GuiResult = & $collect; $window.DialogResult = $true; $window.Close() })
+    $script:C.BtnCancel.Add_Click({ $window.DialogResult = $false; $window.Close() })
+    $script:C.BtnOK.Add_Click({ $Script:GuiResult = & $script:collect; $window.DialogResult = $true; $window.Close() })
     $ok = $window.ShowDialog()
     if (-not $ok) { return $null }
     return $Script:GuiResult

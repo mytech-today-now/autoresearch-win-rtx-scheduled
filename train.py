@@ -797,12 +797,12 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64         # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128            # target head dimension for attention
+ASPECT_RATIO = 32         # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 64            # target head dimension for attention
 WINDOW_PATTERN = "SSSL"   # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2 ** 19
+TOTAL_BATCH_SIZE = 2 ** 17
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
@@ -814,7 +814,7 @@ WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
 # Model size + memory defaults
-DEPTH = 8
+DEPTH = 4
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
 
@@ -1150,7 +1150,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         torch.cuda.synchronize()
         t1 = time.time()
         dt = t1 - t0
-        if step > 10:
+        if step > 1:
             total_training_time += dt
 
         ema_beta = 0.9
@@ -1182,7 +1182,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         step += 1
         if max_steps is not None and step >= max_steps:
             break
-        if step > 10 and total_training_time >= target_training_seconds:
+        if step > 1 and total_training_time >= target_training_seconds:
             break
         if smoke_test and total_training_time >= target_training_seconds:
             break

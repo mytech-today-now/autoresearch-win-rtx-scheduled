@@ -22,7 +22,7 @@
 
     USAGE OVERVIEW
     --------------
-    The script has five mutually independent ACTION switches. If none are
+    The script has four mutually independent ACTION switches. If none are
     supplied, the script only runs preflight and prints usage hints; it will
     NOT train and will NOT create a scheduled task.
 
@@ -31,18 +31,13 @@
       (none)          Preflight only. Prints next-step hints and exits 0.
       -RunNow         Runs `uv run train.py` once, in the foreground.
                       Does NOT register a scheduled task.
-      -RunLoop        Runs the autoresearch experiment loop described in
-                      program.md (edit train.py via ai-powered, commit, run,
-                      decide keep/discard, log to results.tsv, repeat) until
-                      -MaxLoopMinutes elapses or the process is killed.
       -RegisterTask   Creates/replaces the `Autoresearch-Train` scheduled
-                      task. Does NOT run training in this invocation. The
-                      task's action drives -RunLoop, not a single -RunNow.
+                      task. Does NOT run training in this invocation.
       -Unregister     Removes the scheduled task if present and exits.
       -Update         Upgrades uv, Ollama, ai-powered, and re-pulls the model.
 
-    Combine -RegisterTask with -RunNow or -RunLoop to both schedule the
-    task AND run training (or the loop) immediately in the same invocation.
+    Combine -RegisterTask with -RunNow to both schedule the task AND run
+    training immediately in the same invocation.
 
 .PARAMETER Model
     Ollama model tag used by `ai-powered` for code/research mediation. Must
@@ -227,28 +222,12 @@
 
     Scheduled task:
       Name:        Autoresearch-Train
-      Action:      pwsh.exe -NoProfile -ExecutionPolicy Bypass
-                            -EncodedCommand <base64-Start-Process>
-                   The encoded command runs Start-Process to spawn launch.ps1
-                   in its own detached process (-WindowStyle Hidden) with the
-                   -RunLoop switch, so the task action exits immediately and
-                   the experiment loop runs independently.
-      Workload:    The detached process drives the autoresearch loop from
-                   program.md: it edits train.py via `ai-powered text`, runs
-                   `uv run train.py` per iteration (10-minute kill switch by
-                   default), parses val_bpb/peak_vram_mb from run.log,
-                   appends a row to results.tsv, and reverts the commit when
-                   val_bpb did not improve. The loop continues until
-                   -MaxLoopMinutes elapses (default 0 = forever) or the
-                   process is killed.
-      Principal:   current user, Interactive logon, RunLevel Highest
+      Action:      pwsh.exe -NoProfile -ExecutionPolicy Bypass `
+                            -File <this script> -RunNow
+      Principal:   current user, S4U logon, RunLevel Highest
       Settings:    StartWhenAvailable, AllowStartIfOnBatteries,
                    DontStopIfGoingOnBatteries, RestartCount=3,
-                   RestartInterval=5m, MultipleInstances=IgnoreNew,
-                   RunOnlyIfIdle (IdleDuration=5m, IdleWaitTimeout=1h)
-      Idle guard:  The task only launches when the computer has been idle for
-                   at least 5 minutes. The scheduler waits up to 1 hour after
-                   the trigger fires for that idle window to occur.
+                   RestartInterval=5m, MultipleInstances=IgnoreNew
 
     Requirements:
       Windows PowerShell 5.1 or PowerShell 7+, internet access for the
@@ -269,10 +248,6 @@ param(
     [string]$ScheduleFrequency = 'Daily',
     [switch]$RegisterTask,
     [switch]$RunNow,
-    [switch]$RunLoop,
-    [int]$MaxLoopMinutes = 0,
-    [int]$PerRunTimeoutMinutes = 10,
-    [switch]$NoAiEdit,
     [switch]$Unregister,
     [switch]$Update,
     [switch]$NoGui,
@@ -677,262 +652,6 @@ function Invoke-Workload {
     return $exitCode
 }
 
-# --------------------------------------------------------------------------
-# Autoresearch experiment loop (driven by program.md). The deterministic
-# bookkeeping lives here in PowerShell; the per-iteration code edit step is
-# delegated to a single `ai-powered text` call. Because `ai-powered` is a
-# text/image/audio client (not an agentic code editor), the edit step is
-# best-effort: the model is asked to return a complete replacement train.py
-# inside a fenced ```python block. If the response cannot be parsed, the
-# iteration is recorded as 'crash' and the working tree is reset.
-# --------------------------------------------------------------------------
-
-function Initialize-ResultsTsv {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        Set-Content -LiteralPath $Path -Encoding UTF8 `
-            -Value "commit`tval_bpb`tmemory_gb`tstatus`tdescription"
-        Write-Json -Level info -Message "Initialized results.tsv at $Path"
-    }
-}
-
-function Get-CurrentBestValBpb {
-    param([Parameter(Mandatory)][string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    $best = $null
-    Get-Content -LiteralPath $Path -Encoding UTF8 | Select-Object -Skip 1 | ForEach-Object {
-        $cols = $_ -split "`t"
-        if ($cols.Count -ge 4 -and $cols[3] -eq 'keep') {
-            $v = 0.0
-            if ([double]::TryParse($cols[1], [ref]$v) -and $v -gt 0) {
-                if ($null -eq $best -or $v -lt $best) { $best = $v }
-            }
-        }
-    }
-    return $best
-}
-
-function Add-ResultsTsvRow {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Commit,
-        [double]$ValBpb,
-        [double]$MemoryGb,
-        [Parameter(Mandatory)][ValidateSet('keep','discard','crash')][string]$Status,
-        [Parameter(Mandatory)][string]$Description
-    )
-    $desc = ($Description -replace "[`t`r`n]", ' ').Trim()
-    $row  = "{0}`t{1}`t{2}`t{3}`t{4}" -f `
-        $Commit, $ValBpb.ToString('F6'), $MemoryGb.ToString('F1'), $Status, $desc
-    Add-Content -LiteralPath $Path -Value $row -Encoding UTF8
-}
-
-function Read-RunLogMetrics {
-    param([Parameter(Mandatory)][string]$Path)
-    $valBpb   = 0.0
-    $vramMb   = 0.0
-    if (-not (Test-Path -LiteralPath $Path)) { return @{ ValBpb = 0.0; PeakVramMb = 0.0 } }
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match '^val_bpb:\s*([0-9.]+)')        { [void][double]::TryParse($Matches[1], [ref]$valBpb) }
-        elseif ($line -match '^peak_vram_mb:\s*([0-9.]+)') { [void][double]::TryParse($Matches[1], [ref]$vramMb) }
-    }
-    return @{ ValBpb = $valBpb; PeakVramMb = $vramMb }
-}
-
-function Invoke-Git {
-    param([Parameter(Mandatory)][string[]]$GitArgs, [string]$Cwd = $RepoRoot)
-    $out = & git -C $Cwd @GitArgs 2>&1 | Out-String
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.Trim() }
-}
-
-function Invoke-AiPoweredEdit {
-    param(
-        [Parameter(Mandatory)][string]$RepoRootPath,
-        [int]$ResultsTailRows = 20
-    )
-    $programPath = Join-Path $RepoRootPath 'program.md'
-    $trainPath   = Join-Path $RepoRootPath 'train.py'
-    $resultsPath = Join-Path $RepoRootPath 'results.tsv'
-    if (-not (Test-Path -LiteralPath $programPath)) { Write-Json -Level warn -Message 'program.md missing; skipping AI edit'; return $null }
-    if (-not (Test-Path -LiteralPath $trainPath))   { Write-Json -Level warn -Message 'train.py missing; skipping AI edit';   return $null }
-    $program  = Get-Content -LiteralPath $programPath -Raw -Encoding UTF8
-    $train    = Get-Content -LiteralPath $trainPath   -Raw -Encoding UTF8
-    $results  = if (Test-Path -LiteralPath $resultsPath) {
-        ((Get-Content -LiteralPath $resultsPath -Encoding UTF8) | Select-Object -Last $ResultsTailRows) -join "`n"
-    } else { '' }
-    $system = 'You are an autonomous ML research agent. Reply with EXACTLY one short one-line description prefixed by "DESCRIPTION: ", then a single fenced code block ```python containing the COMPLETE new contents of train.py. No other text.'
-    $prompt = @"
-PROGRAM:
-$program
-
-RECENT RESULTS (tail of results.tsv):
-$results
-
-CURRENT train.py:
-``````python
-$train
-``````
-
-Propose ONE small experimental change to train.py and return the complete new file.
-"@
-    $tmpPrompt = [System.IO.Path]::GetTempFileName()
-    Set-Content -LiteralPath $tmpPrompt -Value $prompt -Encoding UTF8
-    try {
-        $raw = & ai-powered text --quiet --system $system (Get-Content -LiteralPath $tmpPrompt -Raw) 2>&1 | Out-String
-    } finally {
-        Remove-Item -LiteralPath $tmpPrompt -Force -ErrorAction SilentlyContinue
-    }
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {
-        Write-Json -Level warn -Message 'ai-powered text returned no output' -Extra @{ exit = $LASTEXITCODE }
-        return $null
-    }
-    $description = 'autoresearch iteration'
-    if ($raw -match '(?im)^DESCRIPTION:\s*(.+)$') { $description = $Matches[1].Trim() }
-    if ($raw -notmatch '(?s)```python\s*(.+?)```') {
-        Write-Json -Level warn -Message 'ai-powered response did not contain a python code fence; skipping edit'
-        return @{ NewContent = $null; Description = $description }
-    }
-    return @{ NewContent = $Matches[1].TrimEnd("`r","`n"); Description = $description }
-}
-
-function Invoke-AutoresearchIteration {
-    param(
-        [Parameter(Mandatory)][string]$RepoRootPath,
-        [Parameter(Mandatory)][string]$ResultsPath,
-        [int]$PerRunTimeoutMin = 10,
-        [switch]$SkipAiEdit,
-        [switch]$BaselineRun
-    )
-
-    $startCommit = (Invoke-Git -GitArgs @('rev-parse','HEAD') -Cwd $RepoRootPath).Output
-    $description = if ($BaselineRun) { 'baseline' } else { 'autoresearch iteration' }
-    $appliedEdit = $false
-
-    # Edit step (skipped on the baseline run or when -NoAiEdit is set).
-    if (-not $SkipAiEdit -and -not $BaselineRun) {
-        $edit = Invoke-AiPoweredEdit -RepoRootPath $RepoRootPath
-        if ($null -ne $edit) {
-            if ($edit.Description) { $description = $edit.Description }
-            if ($edit.NewContent) {
-                Set-Content -LiteralPath (Join-Path $RepoRootPath 'train.py') `
-                    -Value $edit.NewContent -Encoding UTF8 -NoNewline
-                $appliedEdit = $true
-                Write-Json -Level info -Message 'Applied AI-proposed edit to train.py' -Extra @{ description = $description }
-            }
-        }
-        if (-not $appliedEdit) {
-            Write-Json -Level info -Message 'No edit applied this iteration' -Extra @{ description = $description }
-        }
-    }
-
-    # Commit the (possibly edited) state so we can revert cleanly on discard.
-    & git -C $RepoRootPath add -A 2>&1 | Out-Null
-    & git -C $RepoRootPath -c 'user.name=autoresearch' -c 'user.email=autoresearch@local' `
-        commit --allow-empty -m ("autoresearch: " + $description) 2>&1 | Out-Null
-    $iterCommit = (Invoke-Git -GitArgs @('rev-parse','HEAD') -Cwd $RepoRootPath).Output
-    $shortSha   = if ($iterCommit) { $iterCommit.Substring(0, [Math]::Min(7, $iterCommit.Length)) } else { '0000000' }
-
-    # Run training with a per-run wall-clock kill switch.
-    $runLog = Join-Path $RepoRootPath 'run.log'
-    if (Test-Path -LiteralPath $runLog) { Remove-Item -LiteralPath $runLog -Force -ErrorAction SilentlyContinue }
-    Write-Json -Level info -Message 'Iteration: starting uv run train.py' -Extra @{ commit = $shortSha; timeoutMin = $PerRunTimeoutMin }
-    $proc = Start-Process -FilePath 'uv' -ArgumentList @('run','train.py') `
-        -WorkingDirectory $RepoRootPath -NoNewWindow -PassThru `
-        -RedirectStandardOutput $runLog -RedirectStandardError (Join-Path $RepoRootPath 'run.err.log')
-    $killed = $false
-    if (-not $proc.WaitForExit([int]($PerRunTimeoutMin * 60 * 1000))) {
-        try { $proc.Kill($true) } catch { }
-        $killed = $true
-        Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha }
-    }
-    # Merge stderr file into run.log so downstream parsing is unified.
-    $errFile = Join-Path $RepoRootPath 'run.err.log'
-    if (Test-Path -LiteralPath $errFile) {
-        Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Add-Content -LiteralPath $runLog -Encoding UTF8
-        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
-    }
-    $metrics = Read-RunLogMetrics -Path $runLog
-    $valBpb  = $metrics.ValBpb
-    $memGb   = if ($metrics.PeakVramMb -gt 0) { $metrics.PeakVramMb / 1024.0 } else { 0.0 }
-
-    # Decide outcome.
-    $status = 'crash'
-    if (-not $killed -and $valBpb -gt 0) {
-        $best = Get-CurrentBestValBpb -Path $ResultsPath
-        if ($BaselineRun -or $null -eq $best -or $valBpb -lt $best) {
-            $status = 'keep'
-        } else {
-            $status = 'discard'
-        }
-    }
-
-    Add-ResultsTsvRow -Path $ResultsPath -Commit $shortSha `
-        -ValBpb $valBpb -MemoryGb $memGb -Status $status -Description $description
-
-    if ($status -ne 'keep' -and $startCommit) {
-        # Revert any edits + the commit we just made.
-        & git -C $RepoRootPath reset --hard $startCommit 2>&1 | Out-Null
-        Write-Json -Level info -Message 'Iteration reverted to start commit' -Extra @{
-            startCommit = $startCommit.Substring(0,7); status = $status
-        }
-    }
-
-    Write-Json -Level info -Message 'Iteration finished' -Extra @{
-        commit = $shortSha; valBpb = $valBpb; memoryGb = $memGb; status = $status; description = $description
-    }
-    return @{ Commit = $shortSha; ValBpb = $valBpb; MemoryGb = $memGb; Status = $status; Description = $description }
-}
-
-function Invoke-AutoresearchLoop {
-    Set-WorkloadEnvironment
-    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-    $Script:RunLogPath = Join-Path $LogDir "autoresearch-loop-$stamp.jsonl"
-    New-Item -ItemType File -Path $Script:RunLogPath -Force | Out-Null
-
-    $resultsPath = Join-Path $RepoRoot 'results.tsv'
-    Initialize-ResultsTsv -Path $resultsPath
-
-    $deadline = if ($MaxLoopMinutes -gt 0) { (Get-Date).AddMinutes($MaxLoopMinutes) } else { [DateTime]::MaxValue }
-    Write-Json -Level info -Message 'Starting autoresearch loop' -Extra @{
-        repoRoot             = $RepoRoot
-        runLog               = $Script:RunLogPath
-        resultsTsv           = $resultsPath
-        maxLoopMinutes       = $MaxLoopMinutes
-        perRunTimeoutMinutes = $PerRunTimeoutMinutes
-        noAiEdit             = [bool]$NoAiEdit
-        deadline             = if ($deadline -eq [DateTime]::MaxValue) { 'none' } else { $deadline.ToString('o') }
-    }
-
-    # Baseline iteration first if results.tsv is empty (only the header row).
-    $hasBaseline = $false
-    if (Test-Path -LiteralPath $resultsPath) {
-        $rowCount = (@(Get-Content -LiteralPath $resultsPath -Encoding UTF8) | Where-Object { $_ -and $_ -notmatch '^commit\t' }).Count
-        $hasBaseline = ($rowCount -gt 0)
-    }
-    if (-not $hasBaseline) {
-        Write-Json -Level info -Message 'No baseline row in results.tsv; running baseline iteration'
-        [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-            -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun)
-    }
-
-    $iter = 0
-    while ((Get-Date) -lt $deadline) {
-        $iter++
-        Write-Json -Level info -Message "Autoresearch iteration #$iter starting"
-        try {
-            [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit)
-        } catch {
-            Write-Json -Level error -Message "Iteration #$iter raised: $($_.Exception.Message)"
-            # Keep looping; per-iteration failures should not kill the whole loop.
-        }
-    }
-
-    Write-Json -Level info -Message 'Autoresearch loop deadline reached; exiting' -Extra @{ iterations = $iter }
-    Limit-RunLogs
-    return 0
-}
-
 function Get-PwshExePath {
     $candidate = Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue
     if ($candidate) { return $candidate.Source }
@@ -1021,52 +740,24 @@ function Register-LauncherTask {
     }
     $pwshPath = Get-PwshExePath
     $scriptPath = $Script:CanonicalScript
-
-    # Build the inner argument list for the autoresearch loop invocation. Using
-    # an array literal avoids quoting ambiguity when embedded inside the
-    # base64-encoded Start-Process command below.
-    $innerArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
-                      '-NoGui', '-RunLoop', '-Provider', $Provider, '-Model', $Model,
-                      '-MaxLoopMinutes', $MaxLoopMinutes,
-                      '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes)
-    if ($Provider -eq 'ollama') { $innerArgList += @('-OllamaHost', $OllamaHost) }
-    if ($NoAiEdit) { $innerArgList += '-NoAiEdit' }
-    $innerArgArray = ($innerArgList | ForEach-Object { "'$_'" }) -join ','
-
-    # Wrap the invocation in Start-Process so the task action exits immediately
-    # and the training script runs in its own detached process.
-    $spCommand = "Start-Process -FilePath '$pwshPath' -ArgumentList @($innerArgArray) -WindowStyle Hidden"
-    $spBytes   = [System.Text.Encoding]::Unicode.GetBytes($spCommand)
-    $spEncoded = [Convert]::ToBase64String($spBytes)
-    $argument  = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $spEncoded"
-
-    $action  = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument -WorkingDirectory $RepoRoot
+    $argParts = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-NoGui','-RunNow','-Provider',$Provider,'-Model',"`"$Model`"")
+    if ($Provider -eq 'ollama') { $argParts += @('-OllamaHost',"`"$OllamaHost`"") }
+    $argument = ($argParts -join ' ')
+    $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument -WorkingDirectory $RepoRoot
     $trigger = Get-TaskTrigger
-    $userId  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
-
-    # RunOnlyIfIdle: the task fires only after the computer has been idle for
-    # 5 minutes. IdleWaitTimeout gives the scheduler up to 1 hour after the
-    # scheduled trigger to find that idle window before skipping the run.
-    $settings = New-ScheduledTaskSettingsSet `
-        -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
-        -MultipleInstances IgnoreNew `
-        -RunOnlyIfIdle `
-        -IdleDuration    (New-TimeSpan -Minutes 5) `
-        -IdleWaitTimeout (New-TimeSpan -Hours 1)
-
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
+        -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName $Script:TaskName -TaskPath $Script:TaskPath `
         -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
         -Description 'Autoresearch: uv run train.py via ai-powered.' | Out-Null
     Enable-TaskHistoryLog
     Write-Json -Level info -Message "Registered scheduled task $($Script:TaskPath)$($Script:TaskName)" -Extra @{
-        schedule        = $ScheduleFrequency
-        time            = $ScheduleTime
-        idleMinutes     = 5
-        ownProcess      = $true
-        launcherCommand = "$pwshPath $argument"
-        workloadCommand = "$pwshPath $($innerArgList -join ' ')"
+        schedule = $ScheduleFrequency
+        time     = $ScheduleTime
+        command  = "$pwshPath $argument"
     }
 }
 
@@ -1401,23 +1092,19 @@ try {
             pwsh         = $PSVersionTable.PSVersion.ToString()
         }
         Write-DebugLog "Invocation parameters" -Extra @{
-            Provider             = $Provider
-            Model                = $Model
-            OllamaHost           = $OllamaHost
-            RepoRoot             = $RepoRoot
-            LogDir               = $LogDir
-            ScheduleFrequency    = $ScheduleFrequency
-            ScheduleTime         = $ScheduleTime
-            RegisterTask         = [bool]$RegisterTask
-            RunNow               = [bool]$RunNow
-            RunLoop              = [bool]$RunLoop
-            MaxLoopMinutes       = $MaxLoopMinutes
-            PerRunTimeoutMinutes = $PerRunTimeoutMinutes
-            NoAiEdit             = [bool]$NoAiEdit
-            Unregister           = [bool]$Unregister
-            Update               = [bool]$Update
-            NoGui                = [bool]$NoGui
-            BoundKeys            = @($PSBoundParameters.Keys)
+            Provider          = $Provider
+            Model             = $Model
+            OllamaHost        = $OllamaHost
+            RepoRoot          = $RepoRoot
+            LogDir            = $LogDir
+            ScheduleFrequency = $ScheduleFrequency
+            ScheduleTime      = $ScheduleTime
+            RegisterTask      = [bool]$RegisterTask
+            RunNow            = [bool]$RunNow
+            Unregister        = [bool]$Unregister
+            Update            = [bool]$Update
+            NoGui             = [bool]$NoGui
+            BoundKeys         = @($PSBoundParameters.Keys)
         }
     }
     if ([string]::IsNullOrWhiteSpace($ScheduleTime)) {
@@ -1432,7 +1119,7 @@ try {
             $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
         }
     }
-    $actionGiven = ($RegisterTask -or $RunNow -or $RunLoop -or $Unregister -or $Update)
+    $actionGiven = ($RegisterTask -or $RunNow -or $Unregister -or $Update)
     if (-not $NoGui -and -not $actionGiven) {
         $gui = Show-LaunchGui
         if (-not $gui) { exit 0 }
@@ -1461,19 +1148,13 @@ try {
         $code = Invoke-Workload
         exit ([int]$code)
     }
-    if ($RunLoop) {
-        $code = Invoke-AutoresearchLoop
-        exit ([int]$code)
-    }
     if (-not ($RegisterTask -or $Update)) {
         $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:CanonicalScript }
         Write-Json -Level info -Message 'Preflight OK. No action selected; nothing to do.'
         Write-Host ''
         Write-Host 'Preflight OK. Re-run with one of:' -ForegroundColor Cyan
         Write-Host "  pwsh -File `"$scriptPath`"                 # GUI launcher"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunNow  # single training run via ai-powered"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop  # autoresearch experiment loop"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop -MaxLoopMinutes 120  # loop with 2-hour limit"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunNow  # headless run via ai-powered"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Unregister"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Update"

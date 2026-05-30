@@ -1293,7 +1293,7 @@ def main():
     _save_pre_eval_checkpoint(model)
     model.eval()
 
-    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else EVAL_TOKENS
+    eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else 524288
     val_bpb = None
     chosen_eval_batch = None
     initial_eval_batch = min(chosen_train_batch, runtime.gpu_profile.eval_batch_cap)

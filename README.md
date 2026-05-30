@@ -18,6 +18,66 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 - The original Linux/H100-oriented path from upstream is removed in this fork and is not supported here.
 - If you need the upstream Linux/H100 path, use [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
+## Quick Start: `launch.ps1` (remote one-liner)
+
+Either command below installs this repo to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\` and immediately runs `scripts\launch.ps1` from that location. Any extra CLI arguments are forwarded verbatim to the relaunched script.
+
+- **PowerShell:**
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1 | iex"
+  ```
+
+- **CMD:**
+
+  ```cmd
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr 'https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1' | iex"
+  ```
+
+See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-Powered Features](#ai-powered-features) for provider/model configuration.
+
+## How `launch.ps1` Works
+
+- **Self-installing.** On every invocation, `launch.ps1` checks whether it is running from the canonical install path `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.ps1`. If not (including when sourced via `iwr ... | iex`), it ensures `git` is on PATH (installing via `winget install --id Git.Git` if missing), clones (or `git pull --ff-only` updates) the repo into the canonical path, then re-launches itself from there forwarding all CLI arguments.
+- **Interactive WPF GUI (default).** With no action switch and without `-NoGui`, a WPF launcher window appears with radio buttons for the action (Preflight only, Run training now, Register scheduled task, Register task and run now, Unregister scheduled task, Update toolchain), an [AI Provider](#ai-powered-features) group (Ollama, OpenAI, Anthropic, Azure OpenAI) and a dependent model dropdown, an editable Ollama-host combo (enabled only for Ollama), Azure endpoint/deployment fields (shown only for Azure), schedule frequency/time dropdowns (Weekly switches the time dropdown to weekday names), a masked `PasswordBox` for API keys, an "Enable Task Scheduler history" checkbox, and **OK / Cancel / Save as Defaults** buttons. Save-as-Defaults persists selections (excluding the API key) to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\.launch-defaults.json`.
+- **Headless / preflight modes.** Pass `-NoGui` with explicit action switches (`-RunNow`, `-RegisterTask`, `-Unregister`, `-Update`) plus provider/model/schedule parameters to run fully unattended. `-NoGui` with **no** action switch performs preflight only (verify tools, install if missing, ensure `.venv` via `uv sync`, start Ollama and pull the model when Ollama is selected), prints next-step hints, and exits 0. `-RegisterTask` and `-RunNow` can be combined to both schedule and run immediately. `-Unregister` removes the task and exits before preflight. The scheduled task always invokes the script in `-NoGui -RunNow` form with the chosen `-Provider`/`-Model` (and `-OllamaHost` for Ollama).
+- **`-Update` action.** Runs `uv self update`, `winget upgrade --id Ollama.Ollama` (Ollama provider only), and `npm install -g ai-powered@latest`, refreshes the session `PATH`, then restarts the Ollama daemon and re-pulls `-Model` when Ollama is selected. Combinable with `-RegisterTask` and/or `-RunNow`.
+- **Per-run logs with pruning.** Each Python run writes to `%HOMEDRIVE%\myTech.Today\logs\autoresearch-run-<yyyyMMdd-HHmmss>.jsonl` (local time). After each run, only the **10 newest** `autoresearch-run-*.jsonl` files are retained; older ones are deleted. The aggregate append-only log `%HOMEDRIVE%\myTech.Today\logs\autoresearch.jsonl` is never rotated. Both surfaces capture timestamped `info`/`warn`/`error`/`stdout`/`stderr` JSON lines (UTC `ts`).
+- **Scheduled task is a first-class object.** The task is registered via `Register-ScheduledTask` into the visible `\myTech.Today\` folder as `Autoresearch-Train`, using `New-ScheduledTaskPrincipal -LogonType Interactive -RunLevel Highest` and only GUI-roundtrippable `New-ScheduledTaskSettingsSet` options: `-StartWhenAvailable`, `-AllowStartIfOnBatteries`, `-DontStopIfGoingOnBatteries`, `-RestartCount 3`, `-RestartInterval 5m`, `-MultipleInstances IgnoreNew`. Triggers: `Hourly` (once at `-ScheduleTime`, repeating every hour), `Daily` (at `-ScheduleTime`), or `Weekly` (Sunday at `-ScheduleTime`). The task is not hidden, is fully editable in `taskschd.msc` (no greyed-out controls), and the trigger/action/principal reflect the GUI/CLI selections. Task history is enabled by default via `wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true` (requires elevation; a warning is logged if elevation is unavailable).
+
+### `launch.ps1` parameter reference
+
+| Parameter | Type / values | Default | Purpose |
+| --- | --- | --- | --- |
+| `-Provider` | `ollama` \| `openai` \| `anthropic` \| `azure` | `ollama` | Selects the AI backend; exported as `AI_PROVIDER` (`ollama` maps to `custom` for `ai-powered`). |
+| `-Model` | string | `qwen2.5-coder:latest` | Model tag/name; exported as `AI_POWERED_MODEL` and `AI_MODEL`. |
+| `-OllamaHost` | URL | `http://127.0.0.1:11434` | Ollama daemon base URL; exported as `OLLAMA_HOST`. |
+| `-ApiKey` | string | _(empty)_ | Provider key; mapped to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY`. Never persisted. |
+| `-AzureEndpoint` / `-AzureDeployment` | string | _(empty)_ | Azure-only; exported as `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_DEPLOYMENT`. |
+| `-RepoRoot` | path | parent of `scripts\` | Repo containing `train.py`; `.venv` is auto-created via `uv sync` if missing. |
+| `-LogDir` | path | `%HOMEDRIVE%\myTech.Today\logs` | Destination for aggregate + per-run JSONL logs. |
+| `-ScheduleFrequency` | `Hourly` \| `Daily` \| `Weekly` | `Daily` | Trigger cadence for `-RegisterTask`. |
+| `-ScheduleTime` | `HH:mm` (24h, local) | `03:00` | Start time for the trigger. |
+| `-RegisterTask` / `-RunNow` / `-Unregister` / `-Update` | switch | off | Action selectors; see above. |
+| `-NoGui` | switch | off | Skip the WPF launcher (required for unattended/scheduled use). |
+
+## AI-Powered Features
+
+The repository routes all AI orchestration through the [`ai-powered`](https://www.npmjs.com/package/ai-powered) npm CLI (pinned in `package.json` and configured by `ai-powered.json` at the repo root). `train.py` is launched as `uv run train.py` so the model mediates orchestration via `ai-powered`'s SDK bindings.
+
+Supported providers and the GUI/CLI surface:
+
+| Provider | `-Provider` value | GUI model defaults | Required credentials |
+| --- | --- | --- | --- |
+| Ollama (local) | `ollama` | `qwen2.5-coder:latest`, `qwen2.5-coder:7b`, `qwen2.5-coder:3b`, `llama3.1:8b`, `llama3.2:3b` | none (uses `-OllamaHost`, default `http://127.0.0.1:11434`) |
+| OpenAI | `openai` | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini` | `OPENAI_API_KEY` (set from `-ApiKey` or GUI `PasswordBox`) |
+| Anthropic | `anthropic` | `claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, `claude-3-opus-latest` | `ANTHROPIC_API_KEY` |
+| Azure OpenAI | `azure` | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo` | `AZURE_OPENAI_API_KEY`, plus `-AzureEndpoint` / `-AzureDeployment` |
+
+The selected provider/model is exported to the child process as `AI_PROVIDER`, `AI_POWERED_MODEL`, and `AI_MODEL`. For Ollama, `OLLAMA_HOST` is also exported and the script will install/start the local `ollama` daemon and `ollama pull` the requested model during preflight. For non-Ollama providers the Ollama preflight steps are skipped.
+
+API keys are **never persisted** to `.launch-defaults.json`; only the provider, model, host, schedule, and Azure endpoint/deployment selections are saved. Supply the API key via the masked GUI field or the `-ApiKey` parameter at invocation time. See [How `launch.ps1` Works](#how-launchps1-works) for full launcher behavior.
+
 ## How it works
 
 The repo is deliberately kept small and only really has three files that matter:

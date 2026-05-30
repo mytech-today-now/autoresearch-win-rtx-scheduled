@@ -1,8 +1,18 @@
 #Requires -Version 5.1
+# Quick Start (remote one-liner). Either form installs this repo to
+# %HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\ and runs launch.ps1
+# from there, forwarding any CLI arguments verbatim.
+#   PowerShell:
+#     powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1 | iex"
+#   CMD:
+#     powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr 'https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1' | iex"
 <#
 .SYNOPSIS
-    Runs `uv run train.py` via the `ai-powered` CLI against Ollama
-    qwen2.5-coder:latest, optionally executed by a Windows Scheduled Task.
+    Runs `uv run train.py` via the `ai-powered` CLI against a selected AI
+    provider, optionally executed by a Windows Scheduled Task. Self-installs
+    to %HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\ when invoked
+    from anywhere else (including via `iwr ... | iex`). Presents a WPF GUI
+    by default; pass -NoGui for unattended/headless invocations.
 
 .DESCRIPTION
     Performs preflight checks (PATH, dependencies, Ollama daemon, model),
@@ -205,8 +215,13 @@
 #>
 [CmdletBinding()]
 param(
+    [ValidateSet('ollama', 'openai', 'anthropic', 'azure')]
+    [string]$Provider = 'ollama',
     [string]$Model = 'qwen2.5-coder:latest',
     [string]$OllamaHost = 'http://127.0.0.1:11434',
+    [string]$ApiKey,
+    [string]$AzureEndpoint,
+    [string]$AzureDeployment,
     [string]$RepoRoot,
     [string]$LogDir = "$env:HOMEDRIVE\myTech.Today\logs",
     [string]$ScheduleTime = '03:00',
@@ -215,7 +230,8 @@ param(
     [switch]$RegisterTask,
     [switch]$RunNow,
     [switch]$Unregister,
-    [switch]$Update
+    [switch]$Update,
+    [switch]$NoGui
 )
 
 Set-StrictMode -Version Latest
@@ -224,12 +240,80 @@ $ProgressPreference = 'SilentlyContinue'
 $ConfirmPreference = 'None'
 
 $Script:TaskName = 'Autoresearch-Train'
+$Script:TaskPath = '\myTech.Today\'
+$Script:InstallRoot = Join-Path $env:HOMEDRIVE 'myTech.Today'
+$Script:CanonicalRepo = Join-Path $Script:InstallRoot 'autoresearch-win-rtx-scheduled'
+$Script:CanonicalScript = Join-Path $Script:CanonicalRepo 'scripts\launch.ps1'
+$Script:DefaultsPath = Join-Path $Script:CanonicalRepo '.launch-defaults.json'
+$Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
-$Script:LogRetention = 190
+$Script:LogRetention = 10
+
+function ConvertTo-ForwardArgs {
+    param([System.Collections.IDictionary]$Bound)
+    $out = @()
+    foreach ($k in $Bound.Keys) {
+        $v = $Bound[$k]
+        if ($v -is [System.Management.Automation.SwitchParameter]) {
+            if ($v.IsPresent) { $out += "-$k" }
+        } elseif ($null -ne $v -and "$v" -ne '') {
+            $out += "-$k"; $out += "$v"
+        }
+    }
+    return ,$out
+}
+
+function Test-RunningFromCanonical {
+    $self = $PSCommandPath
+    if ([string]::IsNullOrEmpty($self)) { return $false }
+    if (-not (Test-Path -LiteralPath $Script:CanonicalScript)) { return $false }
+    $a = (Resolve-Path -LiteralPath $self).Path
+    $b = (Resolve-Path -LiteralPath $Script:CanonicalScript).Path
+    return ($a -ieq $b)
+}
+
+function Invoke-Bootstrap {
+    param([string[]]$ForwardArgs)
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        if (Get-Command winget -ErrorAction SilentlyContinue) {
+            & winget install --id Git.Git -e --silent `
+                --accept-package-agreements --accept-source-agreements | Out-Null
+            $m = [Environment]::GetEnvironmentVariable('Path','Machine')
+            $u = [Environment]::GetEnvironmentVariable('Path','User')
+            $env:Path = "$m;$u;$env:Path"
+        }
+        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+            Write-Error 'git is required to bootstrap. Install Git for Windows and re-run.'
+            exit 2
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Script:InstallRoot)) {
+        New-Item -ItemType Directory -Path $Script:InstallRoot -Force | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $Script:CanonicalRepo)) {
+        & git clone $Script:RepoUrl $Script:CanonicalRepo
+        if ($LASTEXITCODE -ne 0) { Write-Error 'git clone failed'; exit 3 }
+    } else {
+        & git -C $Script:CanonicalRepo pull --ff-only | Out-Null
+    }
+    $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
+    if (-not $pwshCmd) { $pwshCmd = Get-Command powershell.exe -ErrorAction Stop }
+    $argList = @('-NoProfile','-ExecutionPolicy','Bypass','-File', $Script:CanonicalScript) + $ForwardArgs
+    $p = Start-Process -FilePath $pwshCmd.Source -ArgumentList $argList -NoNewWindow -PassThru -Wait
+    exit $p.ExitCode
+}
+
+if (-not (Test-RunningFromCanonical)) {
+    Invoke-Bootstrap -ForwardArgs (ConvertTo-ForwardArgs $PSBoundParameters)
+}
 
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
-    $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    if ($PSCommandPath) {
+        $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    } else {
+        $RepoRoot = $Script:CanonicalRepo
+    }
 }
 $RepoRoot = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
 
@@ -390,11 +474,13 @@ function Assert-RepoLayout {
 function Invoke-Preflight {
     New-Dir $LogDir
     Install-Tool -Name 'uv' -WingetId 'astral-sh.uv' -PipxPackage 'uv' -PipPackage 'uv'
-    Install-Tool -Name 'ollama' -WingetId 'Ollama.Ollama'
     Install-Tool -Name 'ai-powered' -NpmPackage 'ai-powered'
     Assert-RepoLayout
-    Start-OllamaServer
-    Sync-OllamaModel
+    if ($Provider -eq 'ollama') {
+        Install-Tool -Name 'ollama' -WingetId 'Ollama.Ollama'
+        Start-OllamaServer
+        Sync-OllamaModel
+    }
 }
 
 function Invoke-Update {
@@ -402,20 +488,24 @@ function Invoke-Update {
     if (Test-CommandOnPath 'uv') {
         & uv self update 2>&1 | Out-Null
     }
-    Write-Json -Level info -Message 'Upgrading Ollama via winget'
-    Invoke-Winget @('upgrade', '--id', 'Ollama.Ollama', '--silent',
-        '--accept-package-agreements', '--accept-source-agreements',
-        '--disable-interactivity') | Out-Null
+    if ($Provider -eq 'ollama') {
+        Write-Json -Level info -Message 'Upgrading Ollama via winget'
+        Invoke-Winget @('upgrade', '--id', 'Ollama.Ollama', '--silent',
+            '--accept-package-agreements', '--accept-source-agreements',
+            '--disable-interactivity') | Out-Null
+    }
     Write-Json -Level info -Message 'Upgrading ai-powered via npm -g'
     if (Test-CommandOnPath 'npm') {
         & npm install -g ai-powered@latest | Out-Null
     }
     Update-SessionPath
-    Start-OllamaServer
-    Write-Json -Level info -Message "Re-pulling model $Model"
-    & ollama pull $Model
-    if ($LASTEXITCODE -ne 0) {
-        throw "ollama pull $Model failed (exit $LASTEXITCODE)"
+    if ($Provider -eq 'ollama') {
+        Start-OllamaServer
+        Write-Json -Level info -Message "Re-pulling model $Model"
+        & ollama pull $Model
+        if ($LASTEXITCODE -ne 0) {
+            throw "ollama pull $Model failed (exit $LASTEXITCODE)"
+        }
     }
 }
 
@@ -433,12 +523,24 @@ function Set-WorkloadEnvironment {
     [Environment]::SetEnvironmentVariable('OLLAMA_HOST', $OllamaHost, 'Process')
     [Environment]::SetEnvironmentVariable('AI_POWERED_MODEL', $Model, 'Process')
     [Environment]::SetEnvironmentVariable('AI_MODEL', $Model, 'Process')
-    [Environment]::SetEnvironmentVariable('AI_PROVIDER', 'custom', 'Process')
+    $apProvider = switch ($Provider) { 'ollama' { 'custom' } default { $Provider } }
+    [Environment]::SetEnvironmentVariable('AI_PROVIDER', $apProvider, 'Process')
+    if ($ApiKey) {
+        switch ($Provider) {
+            'openai'    { [Environment]::SetEnvironmentVariable('OPENAI_API_KEY', $ApiKey, 'Process') }
+            'anthropic' { [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', $ApiKey, 'Process') }
+            'azure'     { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_API_KEY', $ApiKey, 'Process') }
+        }
+    }
+    if ($Provider -eq 'azure') {
+        if ($AzureEndpoint) { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_ENDPOINT', $AzureEndpoint, 'Process') }
+        if ($AzureDeployment) { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_DEPLOYMENT', $AzureDeployment, 'Process') }
+    }
 }
 
 function Invoke-Workload {
     Set-WorkloadEnvironment
-    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
+    $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $Script:RunLogPath = Join-Path $LogDir "autoresearch-run-$stamp.jsonl"
     New-Item -ItemType File -Path $Script:RunLogPath -Force | Out-Null
 
@@ -486,41 +588,61 @@ function Get-PwshExePath {
 }
 
 function Get-TaskTrigger {
+    $weekDays = 'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
+    if ($ScheduleFrequency -eq 'Weekly') {
+        $day = if ($weekDays -contains $ScheduleTime) { $ScheduleTime } else { 'Sunday' }
+        $startAt = ([DateTime]::Today).AddHours(3)
+        return New-ScheduledTaskTrigger -Weekly -DaysOfWeek $day -At $startAt
+    }
     $timeSpan = [TimeSpan]::Parse($ScheduleTime)
     $startAt = ([DateTime]::Today).Add($timeSpan)
     switch ($ScheduleFrequency) {
-        'Hourly' {
-            $trigger = New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1)
-        }
-        'Daily' {
-            $trigger = New-ScheduledTaskTrigger -Daily -At $startAt
-        }
-        'Weekly' {
-            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At $startAt
-        }
+        'Hourly' { return New-ScheduledTaskTrigger -Once -At $startAt -RepetitionInterval (New-TimeSpan -Hours 1) }
+        'Daily'  { return New-ScheduledTaskTrigger -Daily -At $startAt }
     }
-    return $trigger
+}
+
+function Enable-TaskHistoryLog {
+    try {
+        $log = 'Microsoft-Windows-TaskScheduler/Operational'
+        & wevtutil set-log $log /enabled:true 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Json -Level warn -Message 'Could not enable Task Scheduler history log (elevation required). Run elevated to enable.'
+        }
+    } catch {
+        Write-Json -Level warn -Message "Task Scheduler history enable skipped: $($_.Exception.Message)"
+    }
+}
+
+function Get-RegisteredLauncherTask {
+    $t = Get-ScheduledTask -TaskPath $Script:TaskPath -TaskName $Script:TaskName -ErrorAction SilentlyContinue
+    if (-not $t) { $t = Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue }
+    return $t
 }
 
 function Register-LauncherTask {
-    if (Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue) {
+    $existing = Get-RegisteredLauncherTask
+    if ($existing) {
         Write-Json -Level info -Message "Existing task $($Script:TaskName) found; replacing"
-        Unregister-ScheduledTask -TaskName $Script:TaskName -Confirm:$false
+        Unregister-ScheduledTask -TaskPath $existing.TaskPath -TaskName $existing.TaskName -Confirm:$false
     }
     $pwshPath = Get-PwshExePath
-    $scriptPath = [System.IO.Path]::GetFullPath($PSCommandPath)
-    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -RunNow"
+    $scriptPath = $Script:CanonicalScript
+    $argParts = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$scriptPath`"",'-NoGui','-RunNow','-Provider',$Provider,'-Model',"`"$Model`"")
+    if ($Provider -eq 'ollama') { $argParts += @('-OllamaHost',"`"$OllamaHost`"") }
+    $argument = ($argParts -join ' ')
     $action = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument -WorkingDirectory $RepoRoot
     $trigger = Get-TaskTrigger
     $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType S4U -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
         -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName $Script:TaskName -Action $action -Trigger $trigger `
-        -Principal $principal -Settings $settings `
-        -Description 'Autoresearch: uv run train.py via ai-powered against Ollama qwen2.5-coder.' | Out-Null
-    Write-Json -Level info -Message "Registered scheduled task $($Script:TaskName)" -Extra @{
+    Register-ScheduledTask -TaskName $Script:TaskName -TaskPath $Script:TaskPath `
+        -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+        -Description 'Autoresearch: uv run train.py via ai-powered.' | Out-Null
+    Enable-TaskHistoryLog
+    Write-Json -Level info -Message "Registered scheduled task $($Script:TaskPath)$($Script:TaskName)" -Extra @{
         schedule = $ScheduleFrequency
         time     = $ScheduleTime
         command  = "$pwshPath $argument"
@@ -528,16 +650,230 @@ function Register-LauncherTask {
 }
 
 function Unregister-LauncherTask {
-    if (Get-ScheduledTask -TaskName $Script:TaskName -ErrorAction SilentlyContinue) {
-        Unregister-ScheduledTask -TaskName $Script:TaskName -Confirm:$false
-        Write-Json -Level info -Message "Unregistered scheduled task $($Script:TaskName)"
+    $existing = Get-RegisteredLauncherTask
+    if ($existing) {
+        Unregister-ScheduledTask -TaskPath $existing.TaskPath -TaskName $existing.TaskName -Confirm:$false
+        Write-Json -Level info -Message "Unregistered scheduled task $($existing.TaskPath)$($existing.TaskName)"
     } else {
         Write-Json -Level info -Message "Scheduled task $($Script:TaskName) was not present"
     }
 }
 
+$Script:ProviderModels = @{
+    ollama    = @('qwen2.5-coder:latest','qwen2.5-coder:7b','qwen2.5-coder:3b','llama3.1:8b','llama3.2:3b')
+    openai    = @('gpt-4o','gpt-4o-mini','gpt-4-turbo','o1','o1-mini')
+    anthropic = @('claude-3-5-sonnet-latest','claude-3-5-haiku-latest','claude-3-opus-latest')
+    azure     = @('gpt-4o','gpt-4o-mini','gpt-4-turbo')
+}
+
+function Read-LaunchDefaults {
+    if (Test-Path -LiteralPath $Script:DefaultsPath) {
+        try { return Get-Content -LiteralPath $Script:DefaultsPath -Raw | ConvertFrom-Json } catch { return $null }
+    }
+    return $null
+}
+
+function Save-LaunchDefaults {
+    param([hashtable]$Values)
+    New-Dir (Split-Path -Parent $Script:DefaultsPath)
+    ($Values | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Script:DefaultsPath -Encoding UTF8
+}
+
+function Show-LaunchGui {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+    $d = Read-LaunchDefaults
+    [xml]$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="autoresearch launcher" Width="520" SizeToContent="Height"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize">
+  <StackPanel Margin="10">
+    <GroupBox Header="Action" Padding="6" Margin="0,0,0,6">
+      <StackPanel>
+        <RadioButton x:Name="ActPreflight" Content="Preflight only"/>
+        <RadioButton x:Name="ActRunNow" Content="Run training now" IsChecked="True"/>
+        <RadioButton x:Name="ActRegister" Content="Register scheduled task"/>
+        <RadioButton x:Name="ActRegisterRun" Content="Register task and run now"/>
+        <RadioButton x:Name="ActUnregister" Content="Unregister scheduled task"/>
+        <RadioButton x:Name="ActUpdate" Content="Update toolchain"/>
+      </StackPanel>
+    </GroupBox>
+    <GroupBox Header="AI Provider" Padding="6" Margin="0,0,0,6">
+      <StackPanel>
+        <StackPanel Orientation="Horizontal">
+          <RadioButton x:Name="PrvOllama" GroupName="prv" Content="Ollama (local)" IsChecked="True" Margin="0,0,8,0"/>
+          <RadioButton x:Name="PrvOpenAI" GroupName="prv" Content="OpenAI" Margin="0,0,8,0"/>
+          <RadioButton x:Name="PrvAnthropic" GroupName="prv" Content="Anthropic" Margin="0,0,8,0"/>
+          <RadioButton x:Name="PrvAzure" GroupName="prv" Content="Azure OpenAI"/>
+        </StackPanel>
+        <Label Content="Model"/>
+        <ComboBox x:Name="CbModel"/>
+        <Label Content="Ollama host (Ollama only)"/>
+        <ComboBox x:Name="CbHost" IsEditable="True">
+          <ComboBoxItem Content="http://127.0.0.1:11434" IsSelected="True"/>
+          <ComboBoxItem Content="http://localhost:11434"/>
+        </ComboBox>
+        <Label Content="API key (OpenAI / Anthropic / Azure)"/>
+        <PasswordBox x:Name="PbApiKey"/>
+        <Label x:Name="LblAzEp" Content="Azure endpoint" Visibility="Collapsed"/>
+        <TextBox x:Name="TxtAzEp" Visibility="Collapsed"/>
+        <Label x:Name="LblAzDp" Content="Azure deployment" Visibility="Collapsed"/>
+        <TextBox x:Name="TxtAzDp" Visibility="Collapsed"/>
+      </StackPanel>
+    </GroupBox>
+    <GroupBox Header="Schedule" Padding="6" Margin="0,0,0,6">
+      <StackPanel>
+        <Label Content="Frequency"/>
+        <ComboBox x:Name="CbFreq">
+          <ComboBoxItem Content="Hourly"/>
+          <ComboBoxItem Content="Daily" IsSelected="True"/>
+          <ComboBoxItem Content="Weekly"/>
+        </ComboBox>
+        <Label Content="Time (HH:mm, local)"/>
+        <ComboBox x:Name="CbTime"/>
+        <CheckBox x:Name="ChkHistory" Content="Enable Task Scheduler history (requires elevation)" IsChecked="True" Margin="0,6,0,0"/>
+      </StackPanel>
+    </GroupBox>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="BtnDefaults" Content="Save as Defaults" Width="120" Margin="0,0,6,0"/>
+      <Button x:Name="BtnCancel" Content="Cancel" Width="80" Margin="0,0,6,0"/>
+      <Button x:Name="BtnOK" Content="OK" Width="80" IsDefault="True"/>
+    </StackPanel>
+  </StackPanel>
+</Window>
+"@
+    $reader = New-Object System.Xml.XmlNodeReader $xaml
+    $window = [Windows.Markup.XamlReader]::Load($reader)
+    $C = @{}
+    foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',
+        'PrvOllama','PrvOpenAI','PrvAnthropic','PrvAzure','CbModel','CbHost','PbApiKey',
+        'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
+        $C[$n] = $window.FindName($n)
+    }
+    $timeOptions = [System.Collections.Generic.List[string]]::new()
+    for ($h = 0; $h -lt 24; $h++) {
+        foreach ($m in 0,15,30,45) { $timeOptions.Add(('{0:D2}:{1:D2}' -f $h, $m)) }
+    }
+    $dayOptions = [System.Collections.Generic.List[string]]::new()
+    foreach ($n in 'Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday') { $dayOptions.Add($n) }
+    $applyFreqItems = {
+        $freq = if ($C.CbFreq.SelectedItem) { [string]$C.CbFreq.SelectedItem.Content } else { 'Daily' }
+        if ($freq -eq 'Weekly') {
+            $C.CbTime.ItemsSource = $dayOptions
+            if ($C.CbTime.SelectedIndex -lt 0) { $C.CbTime.SelectedIndex = 0 }
+        } else {
+            $C.CbTime.ItemsSource = $timeOptions
+            if ($C.CbTime.SelectedIndex -lt 0) { $C.CbTime.SelectedIndex = $timeOptions.IndexOf('03:00') }
+        }
+    }
+    $C.CbFreq.add_SelectionChanged({ $C.CbTime.SelectedIndex = -1; & $applyFreqItems })
+    & $applyFreqItems
+    $populateModels = {
+        param($prv)
+        $C.CbModel.Items.Clear()
+        foreach ($m in $Script:ProviderModels[$prv]) { $C.CbModel.Items.Add($m) | Out-Null }
+        $C.CbModel.SelectedIndex = 0
+        $azVis = if ($prv -eq 'azure') { 'Visible' } else { 'Collapsed' }
+        foreach ($k in 'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp') { $C[$k].Visibility = $azVis }
+        $C.CbHost.IsEnabled = ($prv -eq 'ollama')
+    }
+    $C.PrvOllama.Add_Checked({ & $populateModels 'ollama' })
+    $C.PrvOpenAI.Add_Checked({ & $populateModels 'openai' })
+    $C.PrvAnthropic.Add_Checked({ & $populateModels 'anthropic' })
+    $C.PrvAzure.Add_Checked({ & $populateModels 'azure' })
+    & $populateModels 'ollama'
+    if ($d) {
+        switch ($d.Provider) {
+            'openai'    { $C.PrvOpenAI.IsChecked = $true }
+            'anthropic' { $C.PrvAnthropic.IsChecked = $true }
+            'azure'     { $C.PrvAzure.IsChecked = $true }
+            default     { $C.PrvOllama.IsChecked = $true }
+        }
+        if ($d.Model) { $C.CbModel.SelectedItem = $d.Model }
+        if ($d.OllamaHost) { $C.CbHost.Text = $d.OllamaHost }
+        if ($d.ScheduleFrequency) { $C.CbFreq.SelectedItem = ($C.CbFreq.Items | Where-Object { $_.Content -eq $d.ScheduleFrequency } | Select-Object -First 1) }
+        if ($d.ScheduleTime) {
+            $src = @($C.CbTime.ItemsSource)
+            $idx = $src.IndexOf([string]$d.ScheduleTime)
+            if ($idx -ge 0) { $C.CbTime.SelectedIndex = $idx }
+        }
+        if ($d.AzureEndpoint) { $C.TxtAzEp.Text = $d.AzureEndpoint }
+        if ($d.AzureDeployment) { $C.TxtAzDp.Text = $d.AzureDeployment }
+    }
+    $Script:GuiResult = $null
+    $collect = {
+        $prv = if ($C.PrvOpenAI.IsChecked) { 'openai' }
+               elseif ($C.PrvAnthropic.IsChecked) { 'anthropic' }
+               elseif ($C.PrvAzure.IsChecked) { 'azure' }
+               else { 'ollama' }
+        @{
+            Provider          = $prv
+            Model             = [string]$C.CbModel.SelectedItem
+            OllamaHost        = [string]$C.CbHost.Text
+            ApiKey            = $C.PbApiKey.Password
+            AzureEndpoint     = $C.TxtAzEp.Text
+            AzureDeployment   = $C.TxtAzDp.Text
+            ScheduleFrequency = [string]$C.CbFreq.SelectedItem.Content
+            ScheduleTime      = [string]$C.CbTime.SelectedItem
+            EnableHistory     = [bool]$C.ChkHistory.IsChecked
+            Action            = if ($C.ActPreflight.IsChecked) { 'Preflight' }
+                                elseif ($C.ActRunNow.IsChecked) { 'RunNow' }
+                                elseif ($C.ActRegister.IsChecked) { 'Register' }
+                                elseif ($C.ActRegisterRun.IsChecked) { 'RegisterRun' }
+                                elseif ($C.ActUnregister.IsChecked) { 'Unregister' }
+                                else { 'Update' }
+        }
+    }
+    $C.BtnDefaults.Add_Click({
+        $vals = & $collect
+        $persist = @{} + $vals
+        $persist.Remove('ApiKey') | Out-Null
+        Save-LaunchDefaults -Values $persist
+    })
+    $C.BtnCancel.Add_Click({ $window.DialogResult = $false; $window.Close() })
+    $C.BtnOK.Add_Click({ $Script:GuiResult = & $collect; $window.DialogResult = $true; $window.Close() })
+    $ok = $window.ShowDialog()
+    if (-not $ok) { return $null }
+    return $Script:GuiResult
+}
+
+function Invoke-FromGui {
+    param($Gui)
+    $Script:Provider = $Gui.Provider
+    $Script:Model = $Gui.Model
+    if ($Gui.OllamaHost) { $Script:OllamaHost = $Gui.OllamaHost }
+    $Script:ApiKey = $Gui.ApiKey
+    $Script:AzureEndpoint = $Gui.AzureEndpoint
+    $Script:AzureDeployment = $Gui.AzureDeployment
+    $Script:ScheduleFrequency = $Gui.ScheduleFrequency
+    $Script:ScheduleTime = $Gui.ScheduleTime
+    # Mirror back to function-scope params consumed downstream.
+    Set-Variable -Name Provider -Value $Gui.Provider -Scope 1
+    Set-Variable -Name Model -Value $Gui.Model -Scope 1
+    if ($Gui.OllamaHost) { Set-Variable -Name OllamaHost -Value $Gui.OllamaHost -Scope 1 }
+    Set-Variable -Name ApiKey -Value $Gui.ApiKey -Scope 1
+    Set-Variable -Name AzureEndpoint -Value $Gui.AzureEndpoint -Scope 1
+    Set-Variable -Name AzureDeployment -Value $Gui.AzureDeployment -Scope 1
+    Set-Variable -Name ScheduleFrequency -Value $Gui.ScheduleFrequency -Scope 1
+    Set-Variable -Name ScheduleTime -Value $Gui.ScheduleTime -Scope 1
+}
+
 try {
     New-Dir $LogDir
+    $actionGiven = ($RegisterTask -or $RunNow -or $Unregister -or $Update)
+    if (-not $NoGui -and -not $actionGiven) {
+        $gui = Show-LaunchGui
+        if (-not $gui) { exit 0 }
+        Invoke-FromGui -Gui $gui
+        switch ($gui.Action) {
+            'Preflight'   { }
+            'RunNow'      { $RunNow = $true }
+            'Register'    { $RegisterTask = $true }
+            'RegisterRun' { $RegisterTask = $true; $RunNow = $true }
+            'Unregister'  { $Unregister = $true }
+            'Update'      { $Update = $true }
+        }
+    }
     if ($Unregister) {
         Unregister-LauncherTask
         exit 0
@@ -554,14 +890,15 @@ try {
         exit ([int]$code)
     }
     if (-not ($RegisterTask -or $Update)) {
-        $scriptPath = $PSCommandPath
-        Write-Json -Level info -Message 'Preflight OK. No action switch supplied; nothing to do.'
+        $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:CanonicalScript }
+        Write-Json -Level info -Message 'Preflight OK. No action selected; nothing to do.'
         Write-Host ''
-        Write-Host 'Preflight OK. No action switch supplied. Choose one of:' -ForegroundColor Cyan
-        Write-Host "  pwsh -File `"$scriptPath`" -RunNow         # run 'uv run train.py' now via ai-powered + Ollama"
-        Write-Host "  pwsh -File `"$scriptPath`" -RegisterTask   # schedule Autoresearch-Train at $ScheduleTime $ScheduleFrequency"
-        Write-Host "  pwsh -File `"$scriptPath`" -Unregister     # remove the scheduled task"
-        Write-Host "  pwsh -File `"$scriptPath`" -Update         # upgrade uv, ollama, ai-powered and re-pull the model"
+        Write-Host 'Preflight OK. Re-run with one of:' -ForegroundColor Cyan
+        Write-Host "  pwsh -File `"$scriptPath`"                 # GUI launcher"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunNow  # headless run via ai-powered"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Unregister"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Update"
         Write-Host ''
     }
     exit 0

@@ -802,7 +802,7 @@ HEAD_DIM = 64            # target head dimension for attention
 WINDOW_PATTERN = "SSSL"   # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2 ** 17
+TOTAL_BATCH_SIZE = 2 ** 16
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04

@@ -1,15 +1,35 @@
 #Requires -Version 5.1
-#Requires -Modules @{ ModuleName = 'Pester'; ModuleVersion = '5.0.0' }
 
-$HarnessRoot = Split-Path -Parent $PSScriptRoot
-
-function Assert-True {
-    param(
-        [bool]$Condition,
-        [string]$Message
-    )
-    if (-not $Condition) { throw $Message }
+$script:RequiredPesterVersion = [version]'5.0.0'
+$script:PesterBootstrapScript = Join-Path $PSScriptRoot '..\scripts\install-pester.ps1'
+function Test-RunningUnderPesterDiscovery {
+    $stack = Get-PSCallStack
+    return [bool]($stack | Where-Object {
+        $_.Command -in @('Invoke-Pester', 'Discover-Test', 'Invoke-BlockContainer', 'Invoke-Test')
+    })
 }
+
+if (-not (Test-RunningUnderPesterDiscovery)) {
+    if (-not (Test-Path -LiteralPath $script:PesterBootstrapScript)) {
+        throw "Pester $($script:RequiredPesterVersion) is required, but the bootstrap script was not found at '$script:PesterBootstrapScript'."
+    }
+
+    & $script:PesterBootstrapScript -RequiredVersion $script:RequiredPesterVersion
+
+    $shell = if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh' } else { 'powershell' }
+    $quotedSelf = "'" + ($PSCommandPath -replace "'", "''") + "'"
+    $command = @"
+`$ErrorActionPreference = 'Stop'
+Import-Module Pester -RequiredVersion $($script:RequiredPesterVersion) -Force
+`$result = Invoke-Pester -Path $quotedSelf -Output Detailed -PassThru
+if (`$result.FailedCount -gt 0) { exit 1 }
+exit 0
+"@
+    & $shell -NoProfile -ExecutionPolicy Bypass -Command $command
+    exit $LASTEXITCODE
+}
+
+$script:HarnessRoot = Split-Path -Parent $PSScriptRoot
 
 BeforeAll {
     $scriptPath = Join-Path $PSScriptRoot '..\scripts\launch.ps1'
@@ -104,6 +124,30 @@ exit /b 0
     return $bin
 }
 
+function script:Write-FakePesterModule {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    $moduleRoot = Join-Path $Root (Join-Path 'Pester' $Version)
+    New-Item -ItemType Directory -Path $moduleRoot -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $moduleRoot 'Pester.psd1') -Value @"
+@{
+  RootModule = 'Pester.psm1'
+  ModuleVersion = '$Version'
+  GUID = '9b4b87df-5f8d-4a3e-83f7-9e2b0a2a7fd4'
+  Author = 'autoresearch tests'
+  CompanyName = 'autoresearch'
+  PowerShellVersion = '5.1'
+}
+"@ -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $moduleRoot 'Pester.psm1') -Value @'
+# Fake Pester module used by bootstrap regression tests.
+'@ -Encoding ASCII
+    return $moduleRoot
+}
+
 function script:Write-ProviderVerificationFixture {
     param([Parameter(Mandatory)][string]$Root)
     New-Item -ItemType Directory -Path (Join-Path $Root 'scripts') -Force | Out-Null
@@ -136,11 +180,13 @@ function script:Invoke-PowershellCommandForTest {
         [hashtable]$Environment = @{}
     )
     $previous = @{}
+    $previousErrorActionPreference = $ErrorActionPreference
     foreach ($key in $Environment.Keys) {
         $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
         [Environment]::SetEnvironmentVariable($key, [string]$Environment[$key], "Process")
     }
     try {
+        $ErrorActionPreference = "Continue"
         $output = & powershell -NoProfile -ExecutionPolicy Bypass -Command $Command 2>&1
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($output) }
     }
@@ -148,6 +194,7 @@ function script:Invoke-PowershellCommandForTest {
         foreach ($key in $Environment.Keys) {
             [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
         }
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 }
 
@@ -157,7 +204,7 @@ function script:Invoke-ProviderVerificationForTest {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & node (Join-Path $HarnessRoot 'scripts/verify-ai-provider.mjs') 2>&1
+        $output = & node (Join-Path $script:HarnessRoot 'scripts/verify-ai-provider.mjs') 2>&1
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($output) }
     }
     finally {
@@ -211,7 +258,7 @@ function script:Decode-EncodedCommand {
 function script:Get-LaunchGuiXaml {
     $launch = Get-Content -Path $scriptPath -Raw
     $match = [regex]::Match($launch, '(?s)\[xml\]\$xaml = @"\s*(<Window.*?</Window>)\s*"@')
-    Assert-True ($match.Success) "Unable to locate the launcher XAML block."
+    if (-not $match.Success) { throw "Unable to locate the launcher XAML block." }
     return $match.Groups[1].Value
 }
 
@@ -562,6 +609,31 @@ function Unregister-ScheduledTask {
         $output = $result.Output -join "`n"
         $output | Should -Match '(-NoBootstrap was supplied|Import-only mode enabled via AUTORESEARCH_DOT_SOURCE_ONLY)'
         Test-Path -LiteralPath $fakeGitLog | Should -BeFalse
+    }
+}
+
+Describe 'Pester bootstrap' {
+    It 'reports a clear setup error when only an older Pester version is visible' {
+        $root = New-TestRoot 'pester-bootstrap'
+        $moduleRoot = Join-Path $root 'modules'
+        Write-FakePesterModule -Root $moduleRoot -Version '4.10.0' | Out-Null
+        $installScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\scripts\install-pester.ps1')).Path
+        $command = @"
+`$ErrorActionPreference = 'Stop'
+function Install-Module {
+    throw 'simulated install failure'
+}
+& $(ConvertTo-SingleQuotedLiteral $installScript) -RequiredVersion 5.0.0
+"@
+        $result = Invoke-PowershellCommandForTest -Command $command -Environment @{
+            PSModulePath = $moduleRoot
+        }
+        $result.ExitCode | Should -Not -Be 0
+        $output = $result.Output -join "`n"
+        $output | Should -Match 'Pester 5\.0\.0'
+        $output | Should -Match 'Available Pester versions before bootstrap: 4\.10\.0'
+        $output | Should -Match 'Install-Module Pester -Scope CurrentUser -RequiredVersion 5\.0\.0 -Force -AllowClobber'
+        $output | Should -Match 'simulated install failure'
     }
 }
 

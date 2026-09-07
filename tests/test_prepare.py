@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import requests
+import torch
 
 import prepare
 
@@ -56,6 +57,61 @@ class PrepareTestCase(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return func(*args, **kwargs)
 
+    def _write_tokenizer_cache(
+        self,
+        *,
+        dataset="tinystories",
+        version=1,
+        vocab_size=5,
+        mergeable_ranks=None,
+    ):
+        payload = {
+            "cache_kind": prepare.TOKENIZER_CACHE_KIND,
+            "format_version": version,
+            "dataset": dataset,
+            "dataset_sha256": prepare._dataset_sha256(dataset),
+            "vocab_size": vocab_size,
+            "pattern": prepare.SPLIT_PATTERN,
+            "special_tokens": list(prepare.SPECIAL_TOKENS),
+            "mergeable_ranks": mergeable_ranks or {"00": 0},
+        }
+        path = os.path.join(
+            self.cache_dir,
+            "datasets",
+            dataset,
+            "tokenizer",
+            f"tokenizer.v{version}.json",
+        )
+        prepare._write_json_cache(path, payload)
+        return path
+
+    def _write_token_bytes_cache(
+        self,
+        *,
+        dataset="tinystories",
+        version=1,
+        vocab_size=5,
+        token_bytes=None,
+    ):
+        token_bytes_list = token_bytes.tolist() if hasattr(token_bytes, "tolist") else token_bytes
+        payload = {
+            "cache_kind": prepare.TOKEN_BYTES_CACHE_KIND,
+            "format_version": version,
+            "dataset": dataset,
+            "dataset_sha256": prepare._dataset_sha256(dataset),
+            "vocab_size": vocab_size,
+            "token_bytes": token_bytes_list or list(range(vocab_size)),
+        }
+        path = os.path.join(
+            self.cache_dir,
+            "datasets",
+            dataset,
+            "tokenizer",
+            f"token_bytes.v{version}.json",
+        )
+        prepare._write_json_cache(path, payload)
+        return path
+
 
 class PrepareMainTests(PrepareTestCase):
     def test_main_prepares_clean_cache(self):
@@ -96,6 +152,101 @@ class PrepareMainTests(PrepareTestCase):
         self.assertEqual(exit_code, 1)
         mock_train.assert_not_called()
         mock_activate.assert_not_called()
+
+
+class PrepareTokenizerCacheTests(PrepareTestCase):
+    def test_tokenizer_cache_paths_are_dataset_scoped(self):
+        tokenizer_path = prepare._tokenizer_cache_path("tinystories")
+        token_bytes_path = prepare._token_bytes_cache_path("tinystories")
+        expected_prefix = os.path.join(self.cache_dir, "datasets", "tinystories", "tokenizer")
+
+        self.assertTrue(tokenizer_path.startswith(expected_prefix))
+        self.assertTrue(token_bytes_path.startswith(expected_prefix))
+        self.assertTrue(
+            tokenizer_path.endswith(f"tokenizer.v{prepare.TOKENIZER_CACHE_VERSION}.json")
+        )
+        self.assertTrue(
+            token_bytes_path.endswith(f"token_bytes.v{prepare.TOKEN_BYTES_CACHE_VERSION}.json")
+        )
+
+    def test_tokenizer_cache_rejects_malformed_file_before_deserialization(self):
+        path = prepare._tokenizer_cache_path("tinystories")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\x80\x04bad-pickle")
+
+        with mock.patch.object(prepare, "train_tokenizer") as mock_train:
+            with self.assertRaises(prepare.TokenizerCacheError):
+                self._quiet_call(prepare.Tokenizer.from_directory, dataset="tinystories")
+
+        mock_train.assert_not_called()
+
+    def test_tokenizer_cache_round_trips_valid_data(self):
+        self._write_tokenizer_cache(vocab_size=5)
+
+        with mock.patch.object(prepare, "VOCAB_SIZE", 5):
+            tokenizer = self._quiet_call(prepare.Tokenizer.from_directory, dataset="tinystories")
+
+        self.assertEqual(tokenizer.dataset, "tinystories")
+        self.assertEqual(tokenizer.get_vocab_size(), 5)
+        self.assertEqual(tokenizer.get_bos_token_id(), 1)
+
+    def test_tokenizer_loads_successfully_after_format_version_bump(self):
+        self._write_tokenizer_cache(vocab_size=5, version=1)
+
+        def regenerate(dataset_name):
+            self._write_tokenizer_cache(dataset=dataset_name, version=2, vocab_size=5)
+
+        with mock.patch.object(prepare, "VOCAB_SIZE", 5):
+            with mock.patch.object(prepare, "TOKENIZER_CACHE_VERSION", 2):
+                with mock.patch.object(prepare, "train_tokenizer", side_effect=regenerate) as mock_train:
+                    tokenizer = self._quiet_call(
+                        prepare.Tokenizer.from_directory,
+                        dataset="tinystories",
+                    )
+
+        mock_train.assert_called_once_with("tinystories")
+        self.assertEqual(tokenizer.dataset, "tinystories")
+        self.assertEqual(tokenizer.get_vocab_size(), 5)
+        self.assertEqual(tokenizer.get_bos_token_id(), 1)
+
+    def test_token_bytes_cache_rejects_malformed_file_before_deserialization(self):
+        path = prepare._token_bytes_cache_path("tinystories")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\x80\x04bad-pickle")
+
+        with mock.patch.object(prepare, "train_tokenizer") as mock_train:
+            with self.assertRaises(prepare.TokenizerCacheError):
+                self._quiet_call(prepare.get_token_bytes, dataset="tinystories")
+
+        mock_train.assert_not_called()
+
+    def test_token_bytes_cache_round_trips_same_tensor(self):
+        token_bytes = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+        self._write_token_bytes_cache(token_bytes=token_bytes, vocab_size=5)
+
+        with mock.patch.object(prepare, "VOCAB_SIZE", 5):
+            loaded = self._quiet_call(prepare.get_token_bytes, dataset="tinystories")
+
+        self.assertTrue(torch.equal(loaded.cpu(), token_bytes))
+
+    def test_missing_token_bytes_cache_triggers_regeneration(self):
+        token_bytes = torch.tensor([4, 3, 2, 1, 0], dtype=torch.int32)
+
+        def regenerate(dataset_name):
+            self._write_token_bytes_cache(
+                dataset=dataset_name,
+                token_bytes=token_bytes,
+                vocab_size=5,
+            )
+
+        with mock.patch.object(prepare, "VOCAB_SIZE", 5):
+            with mock.patch.object(prepare, "train_tokenizer", side_effect=regenerate) as mock_train:
+                loaded = self._quiet_call(prepare.get_token_bytes, dataset="tinystories")
+
+        mock_train.assert_called_once_with("tinystories")
+        self.assertTrue(torch.equal(loaded.cpu(), token_bytes))
 
 
 class PrepareDownloadTests(PrepareTestCase):

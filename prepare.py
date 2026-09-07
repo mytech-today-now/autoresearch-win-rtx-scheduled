@@ -12,9 +12,9 @@ AUTORESEARCH_DATASET or by running this script with --dataset.
 
 import argparse
 import hashlib
+import json
 import math
 import os
-import pickle
 import shutil
 import time
 
@@ -102,6 +102,16 @@ class DatasetPlacementError(RuntimeError):
     """Raised when a verified dataset file cannot be moved into place."""
 
 
+class TokenizerCacheError(RuntimeError):
+    """Raised when a tokenizer cache file is missing, mismatched, or corrupt."""
+
+
+TOKENIZER_CACHE_VERSION = 1
+TOKEN_BYTES_CACHE_VERSION = 1
+TOKENIZER_CACHE_KIND = "tokenizer"
+TOKEN_BYTES_CACHE_KIND = "token_bytes"
+
+
 def _normalize_dataset_name(dataset_name):
     if dataset_name is None:
         return None
@@ -162,6 +172,217 @@ def _data_dir(dataset_name=None):
 
 def _tokenizer_dir(dataset_name=None):
     return os.path.join(_dataset_root(dataset_name), "tokenizer")
+
+
+def _tokenizer_cache_path(dataset_name=None):
+    return os.path.join(
+        _tokenizer_dir(dataset_name),
+        f"tokenizer.v{TOKENIZER_CACHE_VERSION}.json",
+    )
+
+
+def _token_bytes_cache_path(dataset_name=None):
+    return os.path.join(
+        _tokenizer_dir(dataset_name),
+        f"token_bytes.v{TOKEN_BYTES_CACHE_VERSION}.json",
+    )
+
+
+def _write_json_cache(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temp_path = path + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+            f.write("\n")
+        os.replace(temp_path, path)
+    except (OSError, TypeError) as exc:
+        _remove_path(temp_path)
+        raise TokenizerCacheError(
+            f"Tokenizer cache write error at {path}: {exc}"
+        ) from exc
+
+
+def _load_json_cache(path, cache_kind, dataset_name, expected_version):
+    dataset = _resolve_dataset_name(dataset_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} is not valid JSON: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} must contain a JSON object."
+        )
+
+    if payload.get("cache_kind") != cache_kind:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has unexpected kind {payload.get('cache_kind')!r}."
+        )
+
+    if payload.get("format_version") != expected_version:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has format version {payload.get('format_version')!r}, "
+            f"expected {expected_version}."
+        )
+
+    if payload.get("dataset") != dataset:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} is for dataset {payload.get('dataset')!r}, "
+            f"expected {dataset!r}."
+        )
+
+    expected_sha256 = _dataset_sha256(dataset)
+    if payload.get("dataset_sha256") != expected_sha256:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has dataset sha256 {payload.get('dataset_sha256')!r}, "
+            f"expected {expected_sha256!r}."
+        )
+
+    return payload
+
+
+def _save_tokenizer_cache(path, dataset, pattern, mergeable_ranks):
+    payload = {
+        "cache_kind": TOKENIZER_CACHE_KIND,
+        "format_version": TOKENIZER_CACHE_VERSION,
+        "dataset": dataset,
+        "dataset_sha256": _dataset_sha256(dataset),
+        "vocab_size": VOCAB_SIZE,
+        "pattern": pattern,
+        "special_tokens": list(SPECIAL_TOKENS),
+        "mergeable_ranks": {token.hex(): rank for token, rank in mergeable_ranks.items()},
+    }
+    _write_json_cache(path, payload)
+
+
+def _load_tokenizer_cache(path, dataset_name=None):
+    payload = _load_json_cache(
+        path,
+        TOKENIZER_CACHE_KIND,
+        dataset_name,
+        TOKENIZER_CACHE_VERSION,
+    )
+
+    if payload.get("pattern") != SPLIT_PATTERN:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has an unexpected split pattern."
+        )
+
+    if payload.get("special_tokens") != list(SPECIAL_TOKENS):
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has unexpected special tokens."
+        )
+
+    if payload.get("vocab_size") != VOCAB_SIZE:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has vocab size {payload.get('vocab_size')!r}, "
+            f"expected {VOCAB_SIZE}."
+        )
+
+    mergeable_ranks_payload = payload.get("mergeable_ranks")
+    if not isinstance(mergeable_ranks_payload, dict):
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} must store mergeable ranks as an object."
+        )
+
+    mergeable_ranks = {}
+    for token_hex, rank in mergeable_ranks_payload.items():
+        if not isinstance(token_hex, str) or type(rank) is not int:
+            raise TokenizerCacheError(
+                f"Tokenizer cache at {path} has an invalid mergeable-rank entry."
+            )
+        try:
+            token_bytes = bytes.fromhex(token_hex)
+        except ValueError as exc:
+            raise TokenizerCacheError(
+                f"Tokenizer cache at {path} has an invalid token encoding."
+            ) from exc
+        mergeable_ranks[token_bytes] = rank
+
+    expected_mergeable_ranks = VOCAB_SIZE - len(SPECIAL_TOKENS)
+    if len(mergeable_ranks) != expected_mergeable_ranks:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has {len(mergeable_ranks)} mergeable ranks, "
+            f"expected {expected_mergeable_ranks}."
+        )
+
+    expected_ranks = list(range(expected_mergeable_ranks))
+    if sorted(mergeable_ranks.values()) != expected_ranks:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has non-contiguous mergeable-rank ids."
+        )
+
+    token_offset = len(mergeable_ranks)
+    special_tokens = {name: token_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+    enc = tiktoken.Encoding(
+        name="rustbpe",
+        pat_str=payload["pattern"],
+        mergeable_ranks=mergeable_ranks,
+        special_tokens=special_tokens,
+    )
+    if enc.n_vocab != VOCAB_SIZE:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} rebuilt to vocab size {enc.n_vocab}, "
+            f"expected {VOCAB_SIZE}."
+        )
+    return enc
+
+
+def _save_token_bytes_cache(path, dataset, token_bytes):
+    token_bytes_list = (
+        token_bytes.tolist() if hasattr(token_bytes, "tolist") else list(token_bytes)
+    )
+    payload = {
+        "cache_kind": TOKEN_BYTES_CACHE_KIND,
+        "format_version": TOKEN_BYTES_CACHE_VERSION,
+        "dataset": dataset,
+        "dataset_sha256": _dataset_sha256(dataset),
+        "vocab_size": VOCAB_SIZE,
+        "token_bytes": token_bytes_list,
+    }
+    _write_json_cache(path, payload)
+
+
+def _load_token_bytes_cache(path, dataset_name=None, device="cpu"):
+    payload = _load_json_cache(
+        path,
+        TOKEN_BYTES_CACHE_KIND,
+        dataset_name,
+        TOKEN_BYTES_CACHE_VERSION,
+    )
+
+    if payload.get("vocab_size") != VOCAB_SIZE:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has vocab size {payload.get('vocab_size')!r}, "
+            f"expected {VOCAB_SIZE}."
+        )
+
+    token_bytes = payload.get("token_bytes")
+    if not isinstance(token_bytes, list):
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} must store token bytes as a JSON array."
+        )
+
+    if len(token_bytes) != VOCAB_SIZE:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has {len(token_bytes)} token bytes, "
+            f"expected {VOCAB_SIZE}."
+        )
+
+    for value in token_bytes:
+        if type(value) is not int or value < 0:
+            raise TokenizerCacheError(
+                f"Tokenizer cache at {path} has an invalid token-byte entry."
+            )
+
+    return torch.tensor(token_bytes, dtype=torch.int32, device=device)
 
 
 def _tiny_parquet_path(dataset_name=None):
@@ -452,10 +673,12 @@ def text_iterator(dataset_name=None, max_chars=1_000_000_000, doc_cap=10_000):
 def train_tokenizer(dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     tokenizer_dir = _tokenizer_dir(dataset)
-    tokenizer_pkl = os.path.join(tokenizer_dir, "tokenizer.pkl")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
+    tokenizer_cache_path = _tokenizer_cache_path(dataset)
+    token_bytes_path = _token_bytes_cache_path(dataset)
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
+    if os.path.exists(tokenizer_cache_path) and os.path.exists(token_bytes_path):
+        _load_tokenizer_cache(tokenizer_cache_path, dataset_name=dataset)
+        _load_token_bytes_cache(token_bytes_path, dataset_name=dataset)
         print(f"Tokenizer: already trained at {tokenizer_dir}")
         return
 
@@ -487,11 +710,10 @@ def train_tokenizer(dataset_name=None):
         special_tokens=special_tokens,
     )
 
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    _save_tokenizer_cache(tokenizer_cache_path, dataset, pattern, mergeable_ranks)
 
     t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_cache_path}")
 
     print("Tokenizer: building token_bytes lookup...")
     special_set = set(SPECIAL_TOKENS)
@@ -502,8 +724,7 @@ def train_tokenizer(dataset_name=None):
             token_bytes_list.append(0)
         else:
             token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
+    _save_token_bytes_cache(token_bytes_path, dataset, token_bytes_list)
     print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
 
     with open(os.path.join(tokenizer_dir, "dataset.txt"), "w", encoding="utf-8") as f:
@@ -531,9 +752,21 @@ class Tokenizer:
     @classmethod
     def from_directory(cls, tokenizer_dir=None, dataset=None):
         dataset_name = _resolve_dataset_name(dataset)
-        resolved_dir = tokenizer_dir if tokenizer_dir is not None else _tokenizer_dir(dataset_name)
-        with open(os.path.join(resolved_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
+        if tokenizer_dir is None:
+            tokenizer_cache_path = _tokenizer_cache_path(dataset_name)
+        else:
+            tokenizer_cache_path = os.path.join(
+                tokenizer_dir,
+                f"tokenizer.v{TOKENIZER_CACHE_VERSION}.json",
+            )
+        if not os.path.exists(tokenizer_cache_path):
+            if tokenizer_dir is None:
+                train_tokenizer(dataset_name)
+            if not os.path.exists(tokenizer_cache_path):
+                raise FileNotFoundError(
+                    f"Tokenizer cache not found at {tokenizer_cache_path}. Run prepare.py first."
+                )
+        enc = _load_tokenizer_cache(tokenizer_cache_path, dataset_name=dataset_name)
         return cls(enc, dataset=dataset_name)
 
     def get_vocab_size(self):
@@ -564,9 +797,14 @@ class Tokenizer:
 
 def get_token_bytes(device="cpu", dataset=None):
     dataset_name = _resolve_dataset_name(dataset)
-    path = os.path.join(_tokenizer_dir(dataset_name), "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+    path = _token_bytes_cache_path(dataset_name)
+    if not os.path.exists(path):
+        train_tokenizer(dataset_name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Token-byte cache not found at {path}. Run prepare.py first."
+        )
+    return _load_token_bytes_cache(path, dataset_name=dataset_name, device=device)
 
 
 def _document_batches(split, dataset=None, tokenizer_batch_size=128):
@@ -726,7 +964,12 @@ def main(argv=None):
         print()
         train_tokenizer(dataset_name)
         _set_active_dataset(dataset_name)
-    except (DatasetTransportError, DatasetIntegrityError, DatasetPlacementError) as exc:
+    except (
+        DatasetTransportError,
+        DatasetIntegrityError,
+        DatasetPlacementError,
+        TokenizerCacheError,
+    ) as exc:
         print(f"Error: {exc}")
         return 1
 

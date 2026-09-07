@@ -5,11 +5,14 @@ Usage: uv run train.py
 """
 
 import argparse
+import hashlib
 import gc
 import json
 import math
 import os
 import platform
+import secrets
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -82,6 +85,7 @@ AUTOTUNE_WARMUP_STEPS = 2
 AUTOTUNE_MEASURE_STEPS = 3
 AUTOTUNE_MAX_MEMORY_FRACTION = 0.90
 AUTOTUNE_CACHE_VERSION = "gpu-profile-v2"
+AUTOTUNE_CACHE_FORMAT_VERSION = 2
 
 
 def _get_gpu_peak_flops(gpu_name):
@@ -200,6 +204,94 @@ def _compatibility_warning(gpu_name, capability, gpu_vram_gb):
     return None
 
 
+def _file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _build_autotune_gpu_profile_signature(profile):
+    return {
+        "name": profile.name,
+        "is_supported_consumer": bool(profile.is_supported_consumer),
+        "is_compatibility_only": bool(profile.is_compatibility_only),
+        "train_batch_candidates": [int(candidate) for candidate in profile.train_batch_candidates],
+        "checkpoint_modes": [bool(mode) for mode in profile.checkpoint_modes],
+        "default_checkpointing": bool(profile.default_checkpointing),
+        "eval_batch_cap": int(profile.eval_batch_cap),
+    }
+
+
+def _build_autotune_source_signature():
+    # Hash the training and data-preparation sources so recipe edits cannot reuse stale tuning data.
+    train_path = Path(__file__).resolve()
+    prepare_path = train_path.with_name("prepare.py")
+    return {
+        "train_py_sha256": _file_sha256(train_path),
+        "prepare_py_sha256": _file_sha256(prepare_path),
+        "benchmark": {
+            "warmup_steps": int(AUTOTUNE_WARMUP_STEPS),
+            "measure_steps": int(AUTOTUNE_MEASURE_STEPS),
+            "max_memory_fraction": float(AUTOTUNE_MAX_MEMORY_FRACTION),
+        },
+    }
+
+
+def _build_autotune_runtime_signature(runtime):
+    return {
+        "platform": platform.system().lower(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "device_type": runtime.device_type,
+        "amp_dtype": _dtype_name(runtime.amp_dtype),
+        "attention_backend": runtime.attention_backend,
+        "tf32_enabled": bool(runtime.tf32_enabled),
+        "gpu_name": runtime.gpu_name,
+        "gpu_cc": [int(runtime.gpu_cc[0]), int(runtime.gpu_cc[1])],
+        "gpu_total_memory_bytes": int(runtime.gpu_total_memory_bytes),
+        "gpu_profile": _build_autotune_gpu_profile_signature(runtime.gpu_profile),
+    }
+
+
+def _build_autotune_recipe_signature(runtime, dataset, vocab_size, train_candidates):
+    model_config = build_model_config(DEPTH, vocab_size, runtime, use_activation_checkpointing=False)
+    return {
+        "dataset": dataset,
+        "vocab_size": int(vocab_size),
+        "sequence_len": int(MAX_SEQ_LEN),
+        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "depth": int(DEPTH),
+        "window_pattern": WINDOW_PATTERN,
+        "model": _build_model_signature(model_config),
+        "optimizer": {
+            "unembedding_lr": float(UNEMBEDDING_LR),
+            "embedding_lr": float(EMBEDDING_LR),
+            "matrix_lr": float(MATRIX_LR),
+            "scalar_lr": float(SCALAR_LR),
+            "weight_decay": float(WEIGHT_DECAY),
+            "adam_betas": [float(ADAM_BETAS[0]), float(ADAM_BETAS[1])],
+        },
+        "candidate_space": [
+            {
+                "train_batch_size": int(train_batch_size),
+                "use_activation_checkpointing": bool(use_checkpointing),
+            }
+            for train_batch_size, use_checkpointing in train_candidates
+        ],
+    }
+
+
+def _build_autotune_cache_fingerprint(runtime, dataset, vocab_size, train_candidates):
+    return {
+        "source": _build_autotune_source_signature(),
+        "runtime": _build_autotune_runtime_signature(runtime),
+        "recipe": _build_autotune_recipe_signature(runtime, dataset, vocab_size, train_candidates),
+    }
+
+
+def _digest_autotune_cache_fingerprint(fingerprint):
+    canonical = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _get_autotune_cache_path():
     if platform.system().lower().startswith("win"):
         local_app_data = os.environ.get("LOCALAPPDATA")
@@ -219,6 +311,16 @@ def _load_autotune_entries(path):
         return {}
     if not isinstance(raw, dict):
         return {}
+    format_version = raw.get("format_version")
+    if format_version != AUTOTUNE_CACHE_FORMAT_VERSION:
+        if format_version is None:
+            print("Autotune cache file is missing a format version; ignoring stale cache.")
+        else:
+            print(
+                "Autotune cache format version "
+                f"{format_version!r} is unsupported; ignoring stale cache."
+            )
+        return {}
     entries = raw.get("entries", {})
     return entries if isinstance(entries, dict) else {}
 
@@ -227,25 +329,31 @@ def _save_autotune_entries(path, entries):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_suffix(".tmp")
-        payload = {"entries": entries}
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        payload = {
+            "format_version": AUTOTUNE_CACHE_FORMAT_VERSION,
+            "entries": entries,
+        }
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         tmp_path.replace(path)
     except Exception as exc:
         print(f"Warning: could not write autotune cache ({exc}).")
 
 
-def _make_autotune_cache_key(runtime):
-    cc = f"{runtime.gpu_cc[0]}.{runtime.gpu_cc[1]}"
-    return "|".join(
-        [
-            runtime.gpu_name,
-            cc,
-            str(runtime.gpu_total_memory_bytes),
-            torch.__version__,
-            platform.system(),
-            str(MAX_SEQ_LEN),
-        ]
-    )
+def _make_autotune_cache_key(runtime, dataset=None, vocab_size=None, train_candidates=None):
+    if dataset is None or vocab_size is None or train_candidates is None:
+        cc = f"{runtime.gpu_cc[0]}.{runtime.gpu_cc[1]}"
+        return "|".join(
+            [
+                runtime.gpu_name,
+                cc,
+                str(runtime.gpu_total_memory_bytes),
+                torch.__version__,
+                platform.system(),
+                str(MAX_SEQ_LEN),
+            ]
+        )
+    fingerprint = _build_autotune_cache_fingerprint(runtime, dataset, vocab_size, train_candidates)
+    return _digest_autotune_cache_fingerprint(fingerprint), fingerprint
 
 
 def _select_amp_dtype(gpu_cc):
@@ -817,6 +925,10 @@ FINAL_LR_FRAC = 0.0
 DEPTH = 6
 DEVICE_BATCH_SIZE = 16
 EVAL_BATCH_SIZE = 8
+CHECKPOINT_FORMAT_VERSION = 1
+CHECKPOINT_FILE_NAME = "checkpoint.pt"
+CHECKPOINT_METADATA_FILE_NAME = "metadata.json"
+CHECKPOINT_SAVE_INTERVAL_SECONDS = 60.0
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
@@ -865,6 +977,13 @@ def _build_train_candidates(runtime):
     if not candidates:
         raise RuntimeError("No train candidates available for this runtime profile.")
     return candidates
+
+
+def _get_grad_accum_steps(device_batch_size):
+    tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
+    if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
+        raise RuntimeError("TOTAL_BATCH_SIZE must be divisible by the tokens per fwd/bwd pass.")
+    return TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 
 def _build_eval_batch_candidates(train_batch_size, initial_eval_batch):
@@ -964,24 +1083,43 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         return None
 
     cache_path = _get_autotune_cache_path()
-    cache_key = _make_autotune_cache_key(runtime)
+    cache_key, cache_contract = _make_autotune_cache_key(
+        runtime,
+        tokenizer.dataset,
+        vocab_size,
+        train_candidates,
+    )
     refresh_cache = os.environ.get("AUTORESEARCH_AUTOTUNE_REFRESH", "0") == "1"
     cache_entries = _load_autotune_entries(cache_path)
+    cached_entry = cache_entries.get(cache_key)
     if refresh_cache:
-        print("Autotune cache refresh requested by AUTORESEARCH_AUTOTUNE_REFRESH=1.")
+        if cache_entries:
+            print(
+                "Autotune cache entry skipped by AUTORESEARCH_AUTOTUNE_REFRESH=1; "
+                "re-benchmarking the current training contract."
+            )
+        else:
+            print("Autotune cache refresh requested by AUTORESEARCH_AUTOTUNE_REFRESH=1.")
     else:
-        cached = cache_entries.get(cache_key)
-        if isinstance(cached, dict):
-            cached_batch_size = cached.get("train_batch_size")
-            cached_checkpointing = cached.get("use_activation_checkpointing")
-            if isinstance(cached_batch_size, int) and isinstance(cached_checkpointing, bool):
-                cached_candidate = (cached_batch_size, cached_checkpointing)
-                if cached_candidate in train_candidates:
-                    print(
-                        "Using cached autotune candidate: "
-                        f"batch_size={cached_batch_size}, checkpointing={'on' if cached_checkpointing else 'off'}."
-                    )
-                    return cached_candidate
+        if isinstance(cached_entry, dict):
+            cached_contract = cached_entry.get("contract")
+            cached_candidate = cached_entry.get("candidate")
+            if cached_contract == cache_contract and isinstance(cached_candidate, dict):
+                cached_batch_size = cached_candidate.get("train_batch_size")
+                cached_checkpointing = cached_candidate.get("use_activation_checkpointing")
+                if isinstance(cached_batch_size, int) and isinstance(cached_checkpointing, bool):
+                    cached_candidate_tuple = (cached_batch_size, cached_checkpointing)
+                    if cached_candidate_tuple in train_candidates:
+                        print(
+                            "Using cached autotune candidate: "
+                            f"batch_size={cached_batch_size}, checkpointing={'on' if cached_checkpointing else 'off'}."
+                        )
+                        return cached_candidate_tuple
+        if cache_entries:
+            print(
+                "Cached autotune result skipped: no cache entry matched the current "
+                f"training contract (depth={DEPTH}, window_pattern={WINDOW_PATTERN})."
+            )
 
     print("Running consumer GPU autotune in eager mode...")
     best_candidate = None
@@ -1012,10 +1150,15 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         return None
 
     cache_entries[cache_key] = {
-        "train_batch_size": best_candidate[0],
-        "use_activation_checkpointing": best_candidate[1],
-        "tok_per_sec": round(best_tok_per_sec, 3),
-        "peak_memory_bytes": int(best_peak_memory),
+        "contract": cache_contract,
+        "candidate": {
+            "train_batch_size": best_candidate[0],
+            "use_activation_checkpointing": best_candidate[1],
+        },
+        "benchmark": {
+            "tok_per_sec": round(best_tok_per_sec, 3),
+            "peak_memory_bytes": int(best_peak_memory),
+        },
         "updated_unix": int(time.time()),
     }
     _save_autotune_entries(cache_path, cache_entries)
@@ -1051,7 +1194,16 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
-def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test):
+def _run_training_once(
+    runtime,
+    tokenizer,
+    config,
+    device_batch_size,
+    smoke_test,
+    checkpoint_root=None,
+    resume_artifact=None,
+    requested_resume_path=None,
+):
     t_start = time.time()
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -1073,8 +1225,7 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         print(f"  {key:24s}: {value:,}")
     print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-    tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
-    grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+    grad_accum_steps = _get_grad_accum_steps(device_batch_size)
     optimizer = model.setup_optimizer(
         unembedding_lr=UNEMBEDDING_LR,
         embedding_lr=EMBEDDING_LR,
@@ -1093,7 +1244,6 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         device=runtime.device,
         dataset=tokenizer.dataset,
     )
-    x, y, epoch = next(train_loader)
     print(f"Time budget: {TIME_BUDGET}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
@@ -1115,77 +1265,247 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
     target_training_seconds = 10 if smoke_test else TIME_BUDGET
     max_steps = 3 if smoke_test else None
 
-    t_start_training = time.time()
-    smooth_train_loss = 0.0
-    total_training_time = 0.0
-    step = 0
+    checkpoint_root_path = _default_checkpoint_root() if checkpoint_root is None else Path(checkpoint_root)
+    checkpoint_context = {
+        "run_id": None,
+        "status": "resumed" if resume_artifact is not None else "cold",
+        "resume": {
+            "requested_path": str(Path(requested_resume_path).resolve()) if requested_resume_path else None,
+            "source_path": resume_artifact["source_path"] if resume_artifact is not None else None,
+        },
+        "resume_reason": None,
+        "runtime": runtime,
+        "config": config,
+        "dataset": tokenizer.dataset,
+        "vocab_size": config.vocab_size,
+        "device_batch_size": device_batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "target_training_seconds": target_training_seconds,
+        "max_steps": max_steps,
+        "smoke_test": smoke_test,
+        "num_params": num_params,
+        "num_flops_per_token": num_flops_per_token,
+    }
 
-    while True:
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = model(x, y)
-            train_loss = loss.detach()
-            loss = loss / grad_accum_steps
-            loss.backward()
-            x, y, epoch = next(train_loader)
-
-        progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
-        lrm = get_lr_multiplier(progress)
-        muon_momentum = get_muon_momentum(step)
-        muon_weight_decay = get_weight_decay(progress)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-            if group["kind"] == "muon":
-                group["momentum"] = muon_momentum
-                group["weight_decay"] = muon_weight_decay
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
-
-        train_loss_f = train_loss.item()
-        if math.isnan(train_loss_f) or train_loss_f > 100:
-            raise RuntimeError("FAIL: training loss exploded")
-
-        torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1 - t0
-        if step > 1:
-            total_training_time += dt
-
-        ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * progress
-        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-        if runtime.gpu_peak_flops:
-            mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / runtime.gpu_peak_flops
-            mfu_text = f"{mfu:.1f}%"
-        else:
-            mfu_text = "n/a"
-        remaining = max(0, target_training_seconds - total_training_time)
-        print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-            f"mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-            end="",
-            flush=True,
+    expected_model_training_signature = _build_model_training_signature(
+        dataset=tokenizer.dataset,
+        vocab_size=config.vocab_size,
+        config=config,
+        device_batch_size=device_batch_size,
+        grad_accum_steps=grad_accum_steps,
+    )
+    if resume_artifact is not None:
+        resume_metadata = resume_artifact["metadata"]
+        resume_signature = resume_metadata.get("compatibility_signature") or {}
+        resume_reason = (
+            f"resumed from {resume_artifact['source_path']} because the checkpoint matched "
+            "the current dataset, model shape, and batch settings."
         )
+        model_training_issues = _checkpoint_signature_issues(
+            expected_model_training_signature,
+            resume_signature.get("model_training", {}),
+        )
+        if model_training_issues:
+            raise CheckpointCompatibilityError(
+                "Checkpoint is not compatible with the current run:\n- "
+                + "\n- ".join(model_training_issues)
+            )
+        expected_full_signature = _build_checkpoint_signature(
+            dataset=tokenizer.dataset,
+            vocab_size=config.vocab_size,
+            config=config,
+            device_batch_size=device_batch_size,
+            grad_accum_steps=grad_accum_steps,
+            optimizer=optimizer,
+        )
+        full_signature_issues = _checkpoint_signature_issues(
+            expected_full_signature,
+            resume_signature,
+        )
+        if full_signature_issues:
+            raise CheckpointCompatibilityError(
+                "Checkpoint is not compatible with the current optimizer state:\n- "
+                + "\n- ".join(full_signature_issues)
+            )
+    else:
+        resume_reason = "cold start; no --resume-from path was supplied."
 
-        if step == 0:
-            gc.collect()
-            gc.freeze()
-            gc.disable()
-        elif (step + 1) % 5000 == 0:
-            gc.collect()
+    checkpoint_context["resume_reason"] = resume_reason
+    checkpoint_context["run_id"] = None
+    checkpoint_context["checkpoint_root"] = str(checkpoint_root_path.resolve())
 
-        step += 1
-        if max_steps is not None and step >= max_steps:
-            break
-        if step > 1 and total_training_time >= target_training_seconds:
-            break
-        if smoke_test and total_training_time >= target_training_seconds:
-            break
+    run_dir = _create_run_checkpoint_dir(checkpoint_root_path)
+    checkpoint_context["run_id"] = run_dir.name
+    print(f"Checkpoint artifacts: {run_dir.resolve()}")
+    print(f"Checkpoint resume: {resume_reason}")
+
+    step = 0
+    total_training_time = 0.0
+    smooth_train_loss = 0.0
+    minibatches_seen = 0
+    initial_epoch = 1
+    x = y = None
+    epoch = initial_epoch
+    last_checkpoint_save_time = None
+
+    def current_train_state():
+        return {
+            "step": int(step),
+            "epoch": int(epoch),
+            "total_training_time": float(total_training_time),
+            "smooth_train_loss": float(smooth_train_loss),
+            "minibatches_seen": int(minibatches_seen),
+        }
+
+    if resume_artifact is not None:
+        try:
+            model.load_state_dict(resume_artifact["model_state_dict"], strict=True)
+        except RuntimeError as exc:
+            raise CheckpointCompatibilityError(
+                f"Checkpoint model state could not be restored: {exc}"
+            ) from exc
+        try:
+            optimizer.load_state_dict(resume_artifact["optimizer_state_dict"])
+        except (KeyError, ValueError, RuntimeError) as exc:
+            raise CheckpointCompatibilityError(
+                f"Checkpoint optimizer state could not be restored: {exc}"
+            ) from exc
+        _move_optimizer_state_to_device(optimizer, runtime.device)
+        _restore_rng_state(resume_artifact.get("rng_state"))
+        resume_train_state = resume_artifact["train_state"]
+        step = int(resume_train_state.get("step", 0))
+        total_training_time = float(resume_train_state.get("total_training_time", 0.0))
+        smooth_train_loss = float(resume_train_state.get("smooth_train_loss", 0.0))
+        minibatches_seen = int(resume_train_state.get("minibatches_seen", step * grad_accum_steps))
+        epoch = int(resume_train_state.get("epoch", 1))
+        if step < 0 or total_training_time < 0 or minibatches_seen < 0:
+            raise CheckpointFormatError("Checkpoint contains negative training counters.")
+        if minibatches_seen != step * grad_accum_steps:
+            raise CheckpointFormatError(
+                "Checkpoint minibatch counter does not match the saved step count."
+            )
+        _save_run_checkpoint(
+            checkpoint_dir=run_dir,
+            context=checkpoint_context,
+            model=model,
+            optimizer=optimizer,
+            train_state=current_train_state(),
+            snapshot_reason="resume",
+        )
+        last_checkpoint_save_time = time.time()
+        _advance_dataloader_batches(train_loader, minibatches_seen)
+        x, y, epoch = next(train_loader)
+    else:
+        x, y, epoch = next(train_loader)
+
+    t_start_training = time.time()
+
+    print()
+
+    try:
+        while True:
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(grad_accum_steps):
+                with autocast_ctx:
+                    loss = model(x, y)
+                train_loss = loss.detach()
+                loss = loss / grad_accum_steps
+                loss.backward()
+                x, y, epoch = next(train_loader)
+
+            progress = min(total_training_time / max(target_training_seconds, 1e-6), 1.0)
+            lrm = get_lr_multiplier(progress)
+            muon_momentum = get_muon_momentum(step)
+            muon_weight_decay = get_weight_decay(progress)
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+                if group["kind"] == "muon":
+                    group["momentum"] = muon_momentum
+                    group["weight_decay"] = muon_weight_decay
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+
+            train_loss_f = train_loss.item()
+            if math.isnan(train_loss_f) or train_loss_f > 100:
+                raise RuntimeError("FAIL: training loss exploded")
+
+            torch.cuda.synchronize()
+            t1 = time.time()
+            dt = t1 - t0
+            if step > 1:
+                total_training_time += dt
+
+            ema_beta = 0.9
+            smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+            debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+            pct_done = 100 * progress
+            tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+            if runtime.gpu_peak_flops:
+                mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / runtime.gpu_peak_flops
+                mfu_text = f"{mfu:.1f}%"
+            else:
+                mfu_text = "n/a"
+            remaining = max(0, target_training_seconds - total_training_time)
+            print(
+                f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+                f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+                f"mfu: {mfu_text} | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+                end="",
+                flush=True,
+            )
+
+            if step == 0:
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif (step + 1) % 5000 == 0:
+                gc.collect()
+
+            step += 1
+            minibatches_seen += grad_accum_steps
+
+            save_reason = None
+            if last_checkpoint_save_time is None:
+                save_reason = "initial"
+            elif (time.time() - last_checkpoint_save_time) >= CHECKPOINT_SAVE_INTERVAL_SECONDS:
+                save_reason = "periodic"
+            if max_steps is not None and step >= max_steps:
+                save_reason = "final"
+            if total_training_time >= target_training_seconds:
+                save_reason = "final"
+            if smoke_test and total_training_time >= target_training_seconds:
+                save_reason = "final"
+
+            if save_reason is not None:
+                _save_run_checkpoint(
+                    checkpoint_dir=run_dir,
+                    context=checkpoint_context,
+                    model=model,
+                    optimizer=optimizer,
+                    train_state=current_train_state(),
+                    snapshot_reason=save_reason,
+                )
+                last_checkpoint_save_time = time.time()
+
+            if max_steps is not None and step >= max_steps:
+                break
+            if step > 1 and total_training_time >= target_training_seconds:
+                break
+            if smoke_test and total_training_time >= target_training_seconds:
+                break
+
+    finally:
+        pass
+
+    _save_run_checkpoint(
+        checkpoint_dir=run_dir,
+        context=checkpoint_context,
+        model=model,
+        optimizer=optimizer,
+        train_state=current_train_state(),
+        snapshot_reason="final",
+    )
 
     print()
     return {
@@ -1196,16 +1516,370 @@ def _run_training_once(runtime, tokenizer, config, device_batch_size, smoke_test
         "step": step,
         "t_start": t_start,
         "t_start_training": t_start_training,
+        "checkpoint_dir": str(run_dir.resolve()),
+        "checkpoint_path": str((run_dir / CHECKPOINT_FILE_NAME).resolve()),
+        "checkpoint_status": "resumed" if resume_artifact is not None else "cold",
+        "checkpoint_reason": resume_reason,
     }
 
 
-def _save_pre_eval_checkpoint(model):
+class CheckpointError(Exception):
+    pass
+
+
+class CheckpointFormatError(CheckpointError):
+    pass
+
+
+class CheckpointCompatibilityError(CheckpointError):
+    pass
+
+
+def _dtype_name(dtype):
+    if dtype is None:
+        return None
+    return str(dtype).removeprefix("torch.")
+
+
+def _serialize_model_config(config):
+    payload = asdict(config)
+    payload["compute_dtype"] = _dtype_name(config.compute_dtype)
+    return payload
+
+
+def _serialize_runtime(runtime):
+    payload = asdict(runtime)
+    payload["device"] = str(runtime.device)
+    payload["gpu_cc"] = list(runtime.gpu_cc)
+    payload["amp_dtype"] = _dtype_name(runtime.amp_dtype)
+    payload["gpu_profile"] = asdict(runtime.gpu_profile)
+    return payload
+
+
+def _build_model_signature(config):
+    return {
+        "sequence_len": int(config.sequence_len),
+        "vocab_size": int(config.vocab_size),
+        "n_layer": int(config.n_layer),
+        "n_head": int(config.n_head),
+        "n_kv_head": int(config.n_kv_head),
+        "n_embd": int(config.n_embd),
+        "window_pattern": config.window_pattern,
+        "compute_dtype": _dtype_name(config.compute_dtype),
+    }
+
+
+def _build_model_training_signature(*, dataset, vocab_size, config, device_batch_size, grad_accum_steps):
+    return {
+        "dataset": dataset,
+        "vocab_size": int(vocab_size),
+        "device_batch_size": int(device_batch_size),
+        "grad_accum_steps": int(grad_accum_steps),
+        "total_batch_size": int(TOTAL_BATCH_SIZE),
+        "model": _build_model_signature(config),
+    }
+
+
+def _build_optimizer_signature(optimizer):
+    return {
+        "name": optimizer.__class__.__name__,
+        "param_group_count": len(optimizer.param_groups),
+        "group_kinds": [group.get("kind") for group in optimizer.param_groups],
+        "group_param_counts": [len(group.get("params", ())) for group in optimizer.param_groups],
+    }
+
+
+def _build_checkpoint_signature(
+    *,
+    dataset,
+    vocab_size,
+    config,
+    device_batch_size,
+    grad_accum_steps,
+    optimizer=None,
+):
+    signature = {
+        "model_training": _build_model_training_signature(
+            dataset=dataset,
+            vocab_size=vocab_size,
+            config=config,
+            device_batch_size=device_batch_size,
+            grad_accum_steps=grad_accum_steps,
+        ),
+    }
+    if optimizer is not None:
+        signature["optimizer"] = _build_optimizer_signature(optimizer)
+    return signature
+
+
+def _default_checkpoint_root():
+    return Path.cwd() / "artifacts" / "checkpoints"
+
+
+def _make_run_id():
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return f"{timestamp}-{os.getpid():05d}-{secrets.token_hex(4)}"
+
+
+def _create_run_checkpoint_dir(checkpoint_root, run_id=None):
+    root = Path(checkpoint_root)
+    root.mkdir(parents=True, exist_ok=True)
+    run_id = run_id or _make_run_id()
+    run_dir = root / f"run-{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     try:
-        state_dict = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
-        torch.save(state_dict, "checkpoint_pre_eval.pt")
-        print("Saved checkpoint_pre_eval.pt")
-    except Exception as exc:  # pragma: no cover
-        print(f"Warning: could not save pre-eval checkpoint: {exc}")
+        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _atomic_torch_save(payload, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _resolve_checkpoint_artifact_path(checkpoint_ref):
+    if checkpoint_ref is None:
+        return None
+
+    path = Path(checkpoint_ref)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint path not found: {path}")
+    if path.is_file():
+        return path.resolve()
+
+    if not path.is_dir():
+        raise CheckpointFormatError(f"Checkpoint path is neither a file nor a directory: {path}")
+
+    candidates = [
+        path / CHECKPOINT_FILE_NAME,
+        path / "checkpoint_pre_eval.pt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    pt_files = sorted(path.glob("*.pt"))
+    if len(pt_files) == 1:
+        return pt_files[0].resolve()
+    if len(pt_files) > 1:
+        names = ", ".join(p.name for p in pt_files)
+        raise CheckpointFormatError(
+            f"Checkpoint directory {path} contains multiple .pt files ({names}); "
+            "pass the exact checkpoint file instead."
+        )
+    raise FileNotFoundError(
+        f"No checkpoint file found in {path}. Expected {CHECKPOINT_FILE_NAME} "
+        f"or a legacy checkpoint_pre_eval.pt."
+    )
+
+
+def _load_checkpoint_artifact(checkpoint_ref):
+    checkpoint_path = _resolve_checkpoint_artifact_path(checkpoint_ref)
+    if checkpoint_path is None:
+        raise FileNotFoundError("No checkpoint path was supplied.")
+
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except TypeError:  # pragma: no cover - fallback for older torch builds
+        payload = torch.load(checkpoint_path, map_location="cpu")
+    except Exception as exc:
+        raise CheckpointFormatError(f"Could not read checkpoint {checkpoint_path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise CheckpointFormatError(
+            f"Checkpoint {checkpoint_path} is not a recoverable training artifact."
+        )
+
+    required_keys = {"metadata", "model_state_dict", "optimizer_state_dict", "train_state"}
+    if not required_keys.issubset(payload):
+        if payload and all(torch.is_tensor(value) for value in payload.values()):
+            raise CheckpointFormatError(
+                f"Legacy snapshot {checkpoint_path} only contains model weights. "
+                "It cannot restore optimizer state or step counters; run the updated "
+                "training script to create a recoverable checkpoint."
+            )
+        missing = ", ".join(sorted(required_keys - set(payload)))
+        raise CheckpointFormatError(
+            f"Checkpoint {checkpoint_path} is missing required fields: {missing}"
+        )
+
+    metadata = payload["metadata"]
+    if not isinstance(metadata, dict):
+        raise CheckpointFormatError(
+            f"Checkpoint {checkpoint_path} has invalid metadata; expected a dictionary."
+        )
+
+    format_version = metadata.get("format_version")
+    if format_version != CHECKPOINT_FORMAT_VERSION:
+        raise CheckpointFormatError(
+            f"Checkpoint {checkpoint_path} uses format version {format_version!r}; "
+            f"expected {CHECKPOINT_FORMAT_VERSION}."
+        )
+
+    return {
+        "source_path": str(checkpoint_path.resolve()),
+        "metadata": metadata,
+        "model_state_dict": payload["model_state_dict"],
+        "optimizer_state_dict": payload["optimizer_state_dict"],
+        "train_state": payload["train_state"],
+        "rng_state": payload.get("rng_state"),
+    }
+
+
+def _signature_differences(expected, actual, prefix=""):
+    issues = []
+    label = prefix or "signature"
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        expected_keys = set(expected)
+        actual_keys = set(actual)
+        for missing_key in sorted(expected_keys - actual_keys):
+            field = f"{label}.{missing_key}" if prefix else missing_key
+            issues.append(f"missing {field}")
+        for extra_key in sorted(actual_keys - expected_keys):
+            field = f"{label}.{extra_key}" if prefix else extra_key
+            issues.append(f"unexpected {field}")
+        for key in sorted(expected_keys & actual_keys):
+            child_prefix = f"{label}.{key}" if prefix else key
+            issues.extend(_signature_differences(expected[key], actual[key], child_prefix))
+        return issues
+
+    if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
+        if len(expected) != len(actual):
+            issues.append(f"{label} length mismatch: expected {len(expected)}, found {len(actual)}")
+        for idx, (expected_item, actual_item) in enumerate(zip(expected, actual)):
+            child_prefix = f"{label}[{idx}]"
+            issues.extend(_signature_differences(expected_item, actual_item, child_prefix))
+        return issues
+
+    if expected != actual:
+        issues.append(f"{label} mismatch: expected {expected!r}, found {actual!r}")
+    return issues
+
+
+def _checkpoint_signature_issues(expected, actual):
+    return _signature_differences(expected, actual)
+
+
+def _move_value_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {key: _move_value_to_device(child, device) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_move_value_to_device(child, device) for child in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(child, device) for child in value)
+    return value
+
+
+def _move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in list(state.items()):
+            state[key] = _move_value_to_device(value, device)
+
+
+def _capture_rng_state():
+    state = {"torch": torch.random.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state):
+    if not isinstance(state, dict):
+        return
+    torch_state = state.get("torch")
+    if torch_state is not None:
+        torch.random.set_rng_state(torch_state)
+    cuda_state = state.get("cuda")
+    if cuda_state is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def _advance_dataloader_batches(loader, num_batches):
+    for _ in range(max(0, int(num_batches))):
+        next(loader)
+
+
+def _save_run_checkpoint(*, checkpoint_dir, context, model, optimizer, train_state, snapshot_reason):
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILE_NAME
+    metadata_path = checkpoint_dir / CHECKPOINT_METADATA_FILE_NAME
+    saved_unix = int(time.time())
+    metadata = {
+        "format_version": CHECKPOINT_FORMAT_VERSION,
+        "artifact_kind": "autoresearch-training-checkpoint",
+        "run_id": context["run_id"],
+        "run_dir": str(checkpoint_dir.resolve()),
+        "checkpoint_path": str(checkpoint_path.resolve()),
+        "snapshot_reason": snapshot_reason,
+        "status": context["status"],
+        "resume": context["resume"],
+        "resume_reason": context["resume_reason"],
+        "run_context": {
+            "runtime": _serialize_runtime(context["runtime"]),
+            "model_config": _serialize_model_config(context["config"]),
+            "dataset": context["dataset"],
+            "vocab_size": context["vocab_size"],
+            "device_batch_size": context["device_batch_size"],
+            "grad_accum_steps": context["grad_accum_steps"],
+            "total_batch_size": TOTAL_BATCH_SIZE,
+            "target_training_seconds": context["target_training_seconds"],
+            "max_steps": context["max_steps"],
+            "smoke_test": context["smoke_test"],
+            "num_params": context["num_params"],
+            "num_flops_per_token": context["num_flops_per_token"],
+            "checkpoint_save_interval_seconds": CHECKPOINT_SAVE_INTERVAL_SECONDS,
+        },
+        "compatibility_signature": _build_checkpoint_signature(
+            dataset=context["dataset"],
+            vocab_size=context["vocab_size"],
+            config=context["config"],
+            device_batch_size=context["device_batch_size"],
+            grad_accum_steps=context["grad_accum_steps"],
+            optimizer=optimizer,
+        ),
+        "train_state": train_state,
+        "saved_unix": saved_unix,
+    }
+    payload = {
+        "metadata": metadata,
+        "model_state_dict": model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "train_state": train_state,
+        "rng_state": _capture_rng_state(),
+    }
+    _atomic_torch_save(payload, checkpoint_path)
+    _atomic_write_json(metadata_path, metadata)
+    print(f"Saved checkpoint ({snapshot_reason}, step={train_state['step']}) -> {checkpoint_path}")
+    return checkpoint_path
 
 
 def _restore_gc_after_attempt():
@@ -1219,6 +1893,16 @@ def main():
     parser = argparse.ArgumentParser(description="Autoresearch training script")
     parser.add_argument("--smoke-test", action="store_true", help="Run a short train/eval pass for validation.")
     parser.add_argument("--dataset", choices=DATASET_CHOICES, default=None, help="Optional dataset override.")
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Optional checkpoint file or run directory to restore before training starts.",
+    )
+    parser.add_argument(
+        "--checkpoint-root",
+        default=None,
+        help="Directory where each run writes its checkpoint artifact subdirectory.",
+    )
     args = parser.parse_args()
 
     runtime = detect_runtime()
@@ -1245,9 +1929,20 @@ def main():
     print(f"Attention backend: {runtime.attention_backend}")
     print(f"torch.compile: {'enabled' if USE_COMPILE else 'disabled'}")
 
+    resume_artifact = None
+    if args.resume_from:
+        try:
+            resume_path = _resolve_checkpoint_artifact_path(args.resume_from)
+            resume_artifact = _load_checkpoint_artifact(resume_path)
+            print(f"Requested checkpoint restore: {resume_path}")
+        except (CheckpointError, FileNotFoundError) as exc:
+            print(f"FAIL: {exc}")
+            return 1
+
     result = None
     chosen_train_batch = None
     chosen_checkpointing = None
+    resume_reasons = []
     for train_batch_size, use_checkpointing in train_candidates:
         config = build_model_config(
             DEPTH,
@@ -1261,6 +1956,28 @@ def main():
             f"activation_checkpointing={'enabled' if use_checkpointing else 'disabled'}"
         )
         print(f"Model config: {asdict(config)}")
+        if resume_artifact is not None:
+            grad_accum_steps = _get_grad_accum_steps(train_batch_size)
+            candidate_signature = _build_model_training_signature(
+                dataset=tokenizer.dataset,
+                vocab_size=vocab_size,
+                config=config,
+                device_batch_size=train_batch_size,
+                grad_accum_steps=grad_accum_steps,
+            )
+            saved_signature = (
+                resume_artifact["metadata"].get("compatibility_signature") or {}
+            ).get("model_training", {})
+            signature_issues = _checkpoint_signature_issues(candidate_signature, saved_signature)
+            if signature_issues:
+                resume_reason = (
+                    f"candidate batch_size={train_batch_size}, "
+                    f"checkpointing={'on' if use_checkpointing else 'off'}: "
+                    + "; ".join(signature_issues)
+                )
+                resume_reasons.append(resume_reason)
+                print(f"Checkpoint resume skipped: {resume_reason}")
+                continue
         try:
             result = _run_training_once(
                 runtime=runtime,
@@ -1268,10 +1985,24 @@ def main():
                 config=config,
                 device_batch_size=train_batch_size,
                 smoke_test=args.smoke_test,
+                checkpoint_root=args.checkpoint_root,
+                resume_artifact=resume_artifact,
+                requested_resume_path=args.resume_from,
             )
             chosen_train_batch = train_batch_size
             chosen_checkpointing = use_checkpointing
             break
+        except CheckpointError as exc:
+            if resume_artifact is None:
+                print(f"FAIL: {exc}")
+                return 1
+            resume_reason = (
+                f"candidate batch_size={train_batch_size}, "
+                f"checkpointing={'on' if use_checkpointing else 'off'}: {exc}"
+            )
+            resume_reasons.append(resume_reason)
+            print(f"Checkpoint resume failed: {resume_reason}")
+            continue
         except torch.cuda.OutOfMemoryError:
             print(
                 "Train OOM at "
@@ -1286,11 +2017,15 @@ def main():
             return 1
 
     if result is None:
+        if resume_artifact is not None:
+            print("FAIL: requested checkpoint did not match any train candidate.")
+            for reason in resume_reasons:
+                print(f"  - {reason}")
+            return 1
         print("FAIL: training failed for all batch size candidates.")
         return 1
 
     model = result["model"]
-    _save_pre_eval_checkpoint(model)
     model.eval()
 
     eval_tokens = max(MAX_SEQ_LEN * chosen_train_batch * 2, 8192) if args.smoke_test else 524288
@@ -1358,6 +2093,10 @@ def main():
     print(f"train_batch_size: {chosen_train_batch}")
     print(f"eval_batch_size:  {chosen_eval_batch}")
     print(f"activation_checkpointing: {'enabled' if chosen_checkpointing else 'disabled'}")
+    print(f"checkpoint_dir:   {result['checkpoint_dir']}")
+    print(f"checkpoint_path:  {result['checkpoint_path']}")
+    print(f"checkpoint_mode:  {result['checkpoint_status']}")
+    print(f"checkpoint_reason: {result['checkpoint_reason']}")
     if args.smoke_test:
         print("smoke_test:       true")
     return 0

@@ -111,6 +111,7 @@ The repo is deliberately kept small and only really has three files that matter:
 
 - **`prepare.py`** — fixed constants, one-time data prep (downloads TinyStories data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
 - **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **Resumable checkpoints.** Each run writes to its own artifact directory under `artifacts/checkpoints/run-<id>/`, with `checkpoint.pt` for model/optimizer/step state and `metadata.json` for run metadata. To resume a compatible run, pass `--resume-from` with either the run directory or the checkpoint file, for example `uv run train.py --resume-from artifacts/checkpoints/run-20260907-123456-12345-abcd1234`. Fresh runs always get a new run directory, so concurrent runs do not overwrite one another.
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
@@ -146,6 +147,31 @@ Quick validation run (recommended after setup):
 ```powershell
 uv run train.py --smoke-test
 ```
+
+## PowerShell test bootstrap
+
+`tests/launch.Tests.ps1` now bootstraps Pester 5.0.0 automatically when the
+module is missing. If you want to provision the dependency ahead of time, use
+the repo-owned setup script from the same shell family you plan to use for the
+tests:
+
+```powershell
+# Windows PowerShell 5.1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-pester.ps1
+
+# PowerShell 7+
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/install-pester.ps1
+```
+
+After that, run the test file directly with the same host:
+
+```powershell
+powershell -NoProfile -File tests/launch.Tests.ps1
+pwsh -NoProfile -File tests/launch.Tests.ps1
+```
+
+If the module is still wrong or missing, the test file now prints a setup
+message that names the required version and the exact install command.
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 

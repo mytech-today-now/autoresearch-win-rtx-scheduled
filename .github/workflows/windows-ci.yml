@@ -1,0 +1,113 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  verify:
+    name: Verify local scripts
+    runs-on: windows-latest
+    env:
+      CI_ARTIFACT_ROOT: ${{ runner.temp }}/autoresearch-ci
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate workflow syntax
+        run: |
+          python -m pip install --disable-pip-version-check --quiet --user pyyaml
+          $workflowDir = Join-Path $env:GITHUB_WORKSPACE '.github/workflows'
+          @'
+          from pathlib import Path
+          import sys
+          import yaml
+
+          root = Path(sys.argv[1])
+          files = sorted(list(root.glob("*.yml")) + list(root.glob("*.yaml")))
+          if not files:
+              raise SystemExit("No workflow files found.")
+          for path in files:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+              print(f"Parsed {path.name}")
+          '@ | python - $workflowDir
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Pester 5.0.0
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -ErrorAction SilentlyContinue | Out-Null; Install-Module -Name Pester -RequiredVersion 5.0.0 -Scope CurrentUser -Force -SkipPublisherCheck -AllowClobber -ErrorAction Stop"
+
+      - name: Run provider verification
+        run: |
+          New-Item -ItemType Directory -Path $env:CI_ARTIFACT_ROOT -Force | Out-Null
+          $providerLog = Join-Path $env:CI_ARTIFACT_ROOT 'provider-verification.log'
+          Start-Transcript -Path $providerLog -Force | Out-Null
+          $exitCode = 0
+          try {
+            npm run verify:ai-provider
+            $exitCode = $LASTEXITCODE
+          }
+          finally {
+            Stop-Transcript | Out-Null
+          }
+          if ($exitCode -ne 0) {
+            exit $exitCode
+          }
+
+      - name: Run wrapper verification
+        run: |
+          $wrapperLog = Join-Path $env:CI_ARTIFACT_ROOT 'wrapper-verification.log'
+          Start-Transcript -Path $wrapperLog -Force | Out-Null
+          $exitCode = 0
+          try {
+            npm run test:wrapper
+            $exitCode = $LASTEXITCODE
+          }
+          finally {
+            Stop-Transcript | Out-Null
+          }
+          if ($exitCode -ne 0) {
+            exit $exitCode
+          }
+
+      - name: Run acceptance verification
+        env:
+          TEMP: ${{ runner.temp }}/autoresearch-ci/tmp
+          TMP: ${{ runner.temp }}/autoresearch-ci/tmp
+        run: |
+          New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+          $acceptanceLog = Join-Path $env:CI_ARTIFACT_ROOT 'acceptance-verification.log'
+          Start-Transcript -Path $acceptanceLog -Force | Out-Null
+          $exitCode = 0
+          try {
+            npm run test:acceptance
+            $exitCode = $LASTEXITCODE
+          }
+          finally {
+            Stop-Transcript | Out-Null
+          }
+          if ($exitCode -ne 0) {
+            exit $exitCode
+          }
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ci-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/autoresearch-ci/**/*.jsonl
+            ${{ runner.temp }}/autoresearch-ci/**/*.log

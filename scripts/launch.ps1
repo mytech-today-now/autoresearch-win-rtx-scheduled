@@ -12,7 +12,9 @@
     provider, optionally executed by a Windows Scheduled Task. Self-installs
     to %HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\ when invoked
     from anywhere else (including via `iwr ... | iex`). Presents a WPF GUI
-    by default; pass -NoGui for unattended/headless invocations.
+    by default; pass -NoGui for unattended/headless invocations. The GUI and
+    CLI now expose an explicit scheduler policy so the task can be registered
+    as interactive, idle-only, or unattended.
 
 .DESCRIPTION
     Performs preflight checks (PATH, dependencies, Ollama daemon, model),
@@ -113,12 +115,28 @@
         pwsh -File .\scripts\launch.ps1 -RegisterTask `
              -ScheduleFrequency Hourly -ScheduleTime ':00'
 
+.PARAMETER SchedulerPolicy
+    Task policy for scheduled launches. The selected policy is shown in the
+    GUI and recorded in the task description and logs before registration.
+    Allowed values:
+      * Interactive - Current user, interactive logon, no idle wait.
+      * IdleOnly    - Current user, interactive logon, launcher waits up to
+                      1 hour for 5 minutes of idle time and logs the reason
+                      if the wait window expires.
+      * Unattended  - Current user, S4U logon, no active desktop session
+                      required.
+    Default: 'IdleOnly'.
+
+    Example (register an unattended overnight task):
+        pwsh -File .\scripts\launch.ps1 -NoGui -RegisterTask `
+             -SchedulerPolicy Unattended
+
 .PARAMETER RegisterTask
     Switch. When set, creates (or replaces) a Windows scheduled task named
-    `Autoresearch-Train` that re-invokes this script with `-RunNow` on the
-    configured trigger. The task runs as the current user with S4U logon
-    (no stored password), at highest run level, and is allowed to start on
-    battery. An existing task with the same name is unregistered first.
+    `Autoresearch-Train` that re-invokes this script with `-RunLoop` on the
+    configured trigger. The selected scheduler policy controls whether the
+    task is interactive, idle-only, or unattended. An existing task with the
+    same name is unregistered first.
 
     Example (schedule daily at 03:00 - the defaults):
         pwsh -File .\scripts\launch.ps1 -RegisterTask
@@ -166,6 +184,13 @@
     Example:
         pwsh -File .\scripts\launch.ps1 -Debug
 
+.PARAMETER NoBootstrap
+    Switch. When set, skips the canonical self-install/bootstrap handoff and
+    keeps running from the current checkout without cloning or relaunching.
+    The `AUTORESEARCH_DOT_SOURCE_ONLY=1` environment variable enables
+    import-only mode for test harnesses and returns immediately after loading
+    helper functions.
+
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1
     # Preflight only. Verifies uv, ollama, ai-powered, the model, and the
@@ -180,8 +205,7 @@
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RegisterTask
     # Register the Autoresearch-Train scheduled task to fire daily at
-    # 03:00 local time. Does not run training in this invocation; the
-    # task itself will invoke the script with -RunNow when it fires.
+    # 03:00 local time with the default idle-only launcher policy.
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RegisterTask -RunNow
@@ -194,8 +218,10 @@
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RegisterTask `
-         -ScheduleFrequency Weekly -ScheduleTime 'Wednesday'
-    # Run weekly on Wednesdays at 03:00 local.
+         -ScheduleFrequency Weekly -ScheduleTime 'Wednesday' `
+         -SchedulerPolicy Unattended
+    # Run weekly on Wednesdays at 03:00 local without requiring an active
+    # desktop session.
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1 -RunNow `
@@ -241,14 +267,21 @@
                    val_bpb did not improve. The loop continues until
                    -MaxLoopMinutes elapses (default 0 = forever) or the
                    process is killed.
-      Principal:   current user, Interactive logon, RunLevel Highest
+      Policy:      Interactive, IdleOnly, or Unattended
+                   - Interactive = current user, logged-on session only.
+                   - IdleOnly = current user, launcher waits up to 1 hour for
+                     5 minutes of idle time and logs the skip reason if the
+                     window expires.
+                   - Unattended = current user, S4U logon, no active desktop
+                     session required.
+      Principal:   current user, highest run level, with the selected
+                   logon mode reflected in the task XML.
       Settings:    StartWhenAvailable, AllowStartIfOnBatteries,
                    DontStopIfGoingOnBatteries, RestartCount=3,
-                   RestartInterval=5m, MultipleInstances=IgnoreNew,
-                   RunOnlyIfIdle (IdleDuration=5m, IdleWaitTimeout=1h)
-      Idle guard:  The task only launches when the computer has been idle for
-                   at least 5 minutes. The scheduler waits up to 1 hour after
-                   the trigger fires for that idle window to occur.
+                   RestartInterval=5m, MultipleInstances=IgnoreNew
+      Idle policy: The launcher logs explicit skip reasons when IdleOnly is
+                   selected and the computer never reaches the configured
+                   idle window.
 
     Requirements:
       Windows PowerShell 5.1 or PowerShell 7+, internet access for the
@@ -267,6 +300,8 @@ param(
     [string]$ScheduleTime,
     [ValidateSet('Hourly', 'Daily', 'Weekly')]
     [string]$ScheduleFrequency = 'Daily',
+    [ValidateSet('Interactive', 'IdleOnly', 'Unattended')]
+    [string]$SchedulerPolicy = 'IdleOnly',
     [switch]$RegisterTask,
     [switch]$RunNow,
     [switch]$RunLoop,
@@ -275,6 +310,7 @@ param(
     [switch]$NoAiEdit,
     [switch]$Unregister,
     [switch]$Update,
+    [switch]$NoBootstrap,
     [switch]$NoGui,
     [switch]$Debug
 )
@@ -286,6 +322,7 @@ $ConfirmPreference = 'None'
 
 $Script:TaskName = 'Autoresearch-Train'
 $Script:TaskPath = '\myTech.Today\'
+$Script:ScheduledTaskAuthor = 'myTech.Today (sales@mytech.today)'
 $Script:InstallRoot = Join-Path $env:HOMEDRIVE 'myTech.Today'
 $Script:CanonicalRepo = Join-Path $Script:InstallRoot 'autoresearch-win-rtx-scheduled'
 $Script:CanonicalScript = Join-Path $Script:CanonicalRepo 'scripts\launch.ps1'
@@ -310,6 +347,11 @@ function ConvertTo-ForwardArgs {
     return ,$out
 }
 
+function Test-TruthyEnvValue {
+    param([string]$Value)
+    return (-not [string]::IsNullOrWhiteSpace($Value) -and $Value -match '^(?i:1|true|yes|on)$')
+}
+
 function Test-RunningFromCanonical {
     $self = $PSCommandPath
     if ([string]::IsNullOrEmpty($self)) { return $false }
@@ -317,6 +359,11 @@ function Test-RunningFromCanonical {
     $a = (Resolve-Path -LiteralPath $self).Path
     $b = (Resolve-Path -LiteralPath $Script:CanonicalScript).Path
     return ($a -ieq $b)
+}
+
+function Write-BootstrapMessage {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Output "[info] $Message"
 }
 
 function Invoke-Bootstrap {
@@ -341,7 +388,17 @@ function Invoke-Bootstrap {
         & git clone $Script:RepoUrl $Script:CanonicalRepo
         if ($LASTEXITCODE -ne 0) { Write-Error 'git clone failed'; exit 3 }
     } else {
+        $status = & git -C $Script:CanonicalRepo status --porcelain 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Unable to inspect canonical install at '$Script:CanonicalRepo' before bootstrap (git status --porcelain failed with exit $LASTEXITCODE)."
+            exit 4
+        }
+        if (-not [string]::IsNullOrWhiteSpace($status)) {
+            Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because it has local changes. Commit, stash, or clean the tree before re-running."
+            exit 4
+        }
         & git -C $Script:CanonicalRepo pull --ff-only | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Error "git pull --ff-only failed for '$Script:CanonicalRepo'"; exit 3 }
     }
     $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwshCmd) { $pwshCmd = Get-Command powershell.exe -ErrorAction Stop }
@@ -350,8 +407,14 @@ function Invoke-Bootstrap {
     exit $p.ExitCode
 }
 
-if (-not (Test-RunningFromCanonical)) {
-    Invoke-Bootstrap -ForwardArgs (ConvertTo-ForwardArgs $PSBoundParameters)
+if (-not (Test-TruthyEnvValue $env:AUTORESEARCH_DOT_SOURCE_ONLY)) {
+    if (-not (Test-RunningFromCanonical)) {
+        if ($NoBootstrap) {
+            Write-BootstrapMessage "-NoBootstrap was supplied; skipping canonical bootstrap and relaunch for target '$Script:CanonicalRepo'."
+        } else {
+            Invoke-Bootstrap -ForwardArgs (ConvertTo-ForwardArgs $PSBoundParameters)
+        }
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
@@ -646,6 +709,8 @@ function Invoke-Workload {
         repoRoot   = $RepoRoot
         model      = $Model
         ollamaHost = $OllamaHost
+        schedulerPolicy = $SchedulerPolicy
+        policySummary = (Get-SchedulerPolicyInfo -Policy $SchedulerPolicy).Summary
         runLog     = $Script:RunLogPath
     }
 
@@ -884,10 +949,16 @@ function Invoke-AutoresearchIteration {
 }
 
 function Invoke-AutoresearchLoop {
-    Set-WorkloadEnvironment
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $Script:RunLogPath = Join-Path $LogDir "autoresearch-loop-$stamp.jsonl"
     New-Item -ItemType File -Path $Script:RunLogPath -Force | Out-Null
+
+    if (-not (Invoke-IdlePolicyGate -Policy $SchedulerPolicy -IdleMinutes 5 -WaitTimeoutMinutes 60)) {
+        Limit-RunLogs
+        return 0
+    }
+
+    Set-WorkloadEnvironment
 
     $resultsPath = Join-Path $RepoRoot 'results.tsv'
     Initialize-ResultsTsv -Path $resultsPath
@@ -900,6 +971,8 @@ function Invoke-AutoresearchLoop {
         maxLoopMinutes       = $MaxLoopMinutes
         perRunTimeoutMinutes = $PerRunTimeoutMinutes
         noAiEdit             = [bool]$NoAiEdit
+        schedulerPolicy      = $SchedulerPolicy
+        policySummary        = (Get-SchedulerPolicyInfo -Policy $SchedulerPolicy).Summary
         deadline             = if ($deadline -eq [DateTime]::MaxValue) { 'none' } else { $deadline.ToString('o') }
     }
 
@@ -995,6 +1068,305 @@ function Get-TaskTrigger {
     }
 }
 
+function Get-SchedulerPolicyInfo {
+    param([Parameter(Mandatory)][string]$Policy)
+    switch ($Policy) {
+        'Interactive' {
+            return [pscustomobject]@{
+                Name                  = 'Interactive'
+                DisplayName           = 'Interactive'
+                Summary               = 'Runs only while the current user is logged on. No idle wait window is applied.'
+                LogonType             = 3
+                LogonTypeName         = 'InteractiveToken'
+                RequiresDesktopSession = $true
+                UsesIdleGate          = $false
+                IdleDuration          = $null
+                IdleWaitTimeout       = $null
+            }
+        }
+        'IdleOnly' {
+            return [pscustomobject]@{
+                Name                  = 'IdleOnly'
+                DisplayName           = 'Idle-only interactive'
+                Summary               = 'Runs while the current user is logged on and the launcher waits for 5 minutes of idle time before starting. If the wait window expires, the launcher logs why the run was skipped.'
+                LogonType             = 3
+                LogonTypeName         = 'InteractiveToken'
+                RequiresDesktopSession = $true
+                UsesIdleGate          = $true
+                IdleDuration          = 'PT5M'
+                IdleWaitTimeout       = 'PT1H'
+            }
+        }
+        'Unattended' {
+            return [pscustomobject]@{
+                Name                  = 'Unattended'
+                DisplayName           = 'Unattended'
+                Summary               = 'Runs without an active desktop session by using S4U logon. No idle wait window is applied.'
+                LogonType             = 2
+                LogonTypeName         = 'S4U'
+                RequiresDesktopSession = $false
+                UsesIdleGate          = $false
+                IdleDuration          = $null
+                IdleWaitTimeout       = $null
+            }
+        }
+    }
+}
+
+function Get-ScheduleTriggerSpec {
+    param(
+        [Parameter(Mandatory)][string]$Frequency,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value
+    )
+    Test-ScheduleTime -Frequency $Frequency -Value $Value
+    switch ($Frequency) {
+        'Hourly' {
+            $minute = [int]($Value.TrimStart(':'))
+            return [pscustomobject]@{
+                Kind          = 'Hourly'
+                StartBoundary = ([DateTime]::Today).AddMinutes($minute)
+                Repetition    = 'PT1H'
+            }
+        }
+        'Daily' {
+            return [pscustomobject]@{
+                Kind          = 'Daily'
+                StartBoundary = ([DateTime]::Today).Add([TimeSpan]::Parse($Value))
+                DaysInterval  = 1
+            }
+        }
+        'Weekly' {
+            return [pscustomobject]@{
+                Kind          = 'Weekly'
+                StartBoundary = ([DateTime]::Today).AddHours(3)
+                DaysOfWeek    = ConvertTo-WeekdayMask -DayName $Value
+                WeeksInterval = 1
+            }
+        }
+    }
+}
+
+function ConvertTo-WeekdayMask {
+    param([Parameter(Mandatory)][string]$DayName)
+    switch ($DayName) {
+        'Sunday'    { return 1 }
+        'Monday'    { return 2 }
+        'Tuesday'   { return 4 }
+        'Wednesday' { return 8 }
+        'Thursday'  { return 16 }
+        'Friday'    { return 32 }
+        'Saturday'  { return 64 }
+        default {
+            throw "Unsupported weekday '$DayName'."
+        }
+    }
+}
+
+function Get-TaskLauncherPlan {
+    $pwshPath = Get-PwshExePath
+    $scriptPath = $Script:CanonicalScript
+
+    # Build the inner argument list for the autoresearch loop invocation. Using
+    # an array literal avoids quoting ambiguity when embedded inside the
+    # base64-encoded Start-Process command below.
+    $innerArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
+                      '-NoGui', '-RunLoop', '-Provider', $Provider, '-Model', $Model,
+                      '-SchedulerPolicy', $SchedulerPolicy,
+                      '-MaxLoopMinutes', $MaxLoopMinutes,
+                      '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes)
+    if ($Provider -eq 'ollama') { $innerArgList += @('-OllamaHost', $OllamaHost) }
+    if ($NoAiEdit) { $innerArgList += '-NoAiEdit' }
+    $innerArgArray = ($innerArgList | ForEach-Object { "'$_'" }) -join ','
+
+    # Wrap the invocation in Start-Process so the task action exits immediately
+    # and the training script runs in its own detached process.
+    $spCommand = "Start-Process -FilePath '$pwshPath' -ArgumentList @($innerArgArray) -WindowStyle Hidden"
+    $spBytes   = [System.Text.Encoding]::Unicode.GetBytes($spCommand)
+    $spEncoded = [Convert]::ToBase64String($spBytes)
+    $argument  = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $spEncoded"
+
+    return [pscustomobject]@{
+        PwshPath        = $pwshPath
+        ScriptPath      = $scriptPath
+        InnerArgList    = $innerArgList
+        StartProcess    = $spCommand
+        EncodedArgument = $argument
+        WorkloadCommand = "$pwshPath $($innerArgList -join ' ')"
+    }
+}
+
+function Get-ScheduledTaskDescription {
+    param([Parameter(Mandatory)]$PolicyInfo)
+    return "Autoresearch: uv run train.py via ai-powered. Policy: $($PolicyInfo.DisplayName). $($PolicyInfo.Summary)"
+}
+
+function Get-ComputerIdleState {
+    if (-not $IsWindows) {
+        return [pscustomobject]@{
+            Available = $false
+            IdleMs    = $null
+            IdleMinutes = $null
+            Reason    = 'Idle detection is only available on Windows.'
+        }
+    }
+
+    try {
+        if (-not ('Autoresearch.IdleNative' -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace Autoresearch {
+    public static class IdleNative {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct LASTINPUTINFO {
+            public uint cbSize;
+            public uint dwTime;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetTickCount();
+
+        public static uint GetIdleMilliseconds() {
+            LASTINPUTINFO info = new LASTINPUTINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+            GetLastInputInfo(ref info);
+            return GetTickCount() - info.dwTime;
+        }
+    }
+}
+"@ -Language CSharp
+        }
+
+        $idleMs = [Autoresearch.IdleNative]::GetIdleMilliseconds()
+        return [pscustomobject]@{
+            Available  = $true
+            IdleMs     = [int64]$idleMs
+            IdleMinutes = [math]::Round(($idleMs / 60000), 2)
+            Reason     = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            Available  = $false
+            IdleMs     = $null
+            IdleMinutes = $null
+            Reason     = $_.Exception.Message
+        }
+    }
+}
+
+function Invoke-IdlePolicyGate {
+    param(
+        [Parameter(Mandatory)][string]$Policy,
+        [int]$IdleMinutes = 5,
+        [int]$WaitTimeoutMinutes = 60,
+        [int]$PollIntervalSeconds = 30
+    )
+
+    if ($Policy -ne 'IdleOnly') {
+        return $true
+    }
+
+    Write-Json -Level info -Message "Idle-only policy active; waiting up to $WaitTimeoutMinutes minute(s) for at least $IdleMinutes minute(s) of idle time." -Extra @{
+        policy             = $Policy
+        idleMinutes        = $IdleMinutes
+        waitTimeoutMinutes = $WaitTimeoutMinutes
+    }
+
+    $deadline = (Get-Date).AddMinutes($WaitTimeoutMinutes)
+    while ((Get-Date) -lt $deadline) {
+        $state = Get-ComputerIdleState
+        if (-not $state.Available) {
+            Write-Json -Level info -Message "Idle-only policy skipped because Windows idle state could not be determined: $($state.Reason)" -Extra @{
+                policy = $Policy
+                reason = $state.Reason
+            }
+            return $false
+        }
+        if ($state.IdleMinutes -ge $IdleMinutes) {
+            Write-Json -Level info -Message "Idle-only policy satisfied after observing $($state.IdleMinutes) minute(s) of idle time." -Extra @{
+                policy        = $Policy
+                idleMinutes   = $state.IdleMinutes
+                requiredIdle  = $IdleMinutes
+            }
+            return $true
+        }
+        if ($WaitTimeoutMinutes -le 0) {
+            break
+        }
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
+
+    $finalState = Get-ComputerIdleState
+    $observed = if ($finalState.Available) { $finalState.IdleMinutes } else { $null }
+    Write-Json -Level info -Message "Idle-only policy skipped after waiting $WaitTimeoutMinutes minute(s); observed idle time was $observed minute(s), which did not reach the required $IdleMinutes minute(s)." -Extra @{
+        policy            = $Policy
+        observedIdle      = $observed
+        requiredIdle      = $IdleMinutes
+        waitTimeoutMinutes = $WaitTimeoutMinutes
+    }
+    return $false
+}
+
+function Get-TaskXml {
+    $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
+    $schedule = Get-ScheduleTriggerSpec -Frequency $ScheduleFrequency -Value $ScheduleTime
+    $plan = Get-TaskLauncherPlan
+
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $task = $service.NewTask(0)
+
+    $task.RegistrationInfo.Author = $Script:ScheduledTaskAuthor
+    $task.RegistrationInfo.Description = Get-ScheduledTaskDescription -PolicyInfo $policy
+    $task.Principal.UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $task.Principal.LogonType = $policy.LogonType
+    $task.Principal.RunLevel = 1
+    $task.Settings.StartWhenAvailable = $true
+    $task.Settings.AllowDemandStart = $true
+    $task.Settings.DisallowStartIfOnBatteries = $false
+    $task.Settings.StopIfGoingOnBatteries = $false
+    $task.Settings.RestartCount = 3
+    $task.Settings.RestartInterval = 'PT5M'
+    $task.Settings.RunOnlyIfIdle = [bool]$policy.UsesIdleGate
+    if ($policy.UsesIdleGate) {
+        $task.Settings.IdleSettings.IdleDuration = $policy.IdleDuration
+        $task.Settings.IdleSettings.WaitTimeout = $policy.IdleWaitTimeout
+    } else {
+        $task.Settings.IdleSettings.IdleDuration = 'PT0M'
+        $task.Settings.IdleSettings.WaitTimeout = 'PT0M'
+    }
+
+    switch ($schedule.Kind) {
+        'Hourly' {
+            $trigger = $task.Triggers.Create(1)
+            $trigger.StartBoundary = $schedule.StartBoundary.ToString('s')
+            $trigger.Repetition.Interval = $schedule.Repetition
+        }
+        'Daily' {
+            $trigger = $task.Triggers.Create(2)
+            $trigger.StartBoundary = $schedule.StartBoundary.ToString('s')
+            $trigger.DaysInterval = $schedule.DaysInterval
+        }
+        'Weekly' {
+            $trigger = $task.Triggers.Create(3)
+            $trigger.StartBoundary = $schedule.StartBoundary.ToString('s')
+            $trigger.WeeksInterval = $schedule.WeeksInterval
+            $trigger.DaysOfWeek = $schedule.DaysOfWeek
+        }
+    }
+
+    $action = $task.Actions.Create(0)
+    $action.Path = $plan.PwshPath
+    $action.Arguments = $plan.EncodedArgument
+    $action.WorkingDirectory = $RepoRoot
+
+    return $task.XmlText
+}
+
 function Enable-TaskHistoryLog {
     try {
         $log = 'Microsoft-Windows-TaskScheduler/Operational'
@@ -1019,54 +1391,33 @@ function Register-LauncherTask {
         Write-Json -Level info -Message "Existing task $($Script:TaskName) found; replacing"
         Unregister-ScheduledTask -TaskPath $existing.TaskPath -TaskName $existing.TaskName -Confirm:$false
     }
-    $pwshPath = Get-PwshExePath
-    $scriptPath = $Script:CanonicalScript
-
-    # Build the inner argument list for the autoresearch loop invocation. Using
-    # an array literal avoids quoting ambiguity when embedded inside the
-    # base64-encoded Start-Process command below.
-    $innerArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
-                      '-NoGui', '-RunLoop', '-Provider', $Provider, '-Model', $Model,
-                      '-MaxLoopMinutes', $MaxLoopMinutes,
-                      '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes)
-    if ($Provider -eq 'ollama') { $innerArgList += @('-OllamaHost', $OllamaHost) }
-    if ($NoAiEdit) { $innerArgList += '-NoAiEdit' }
-    $innerArgArray = ($innerArgList | ForEach-Object { "'$_'" }) -join ','
-
-    # Wrap the invocation in Start-Process so the task action exits immediately
-    # and the training script runs in its own detached process.
-    $spCommand = "Start-Process -FilePath '$pwshPath' -ArgumentList @($innerArgArray) -WindowStyle Hidden"
-    $spBytes   = [System.Text.Encoding]::Unicode.GetBytes($spCommand)
-    $spEncoded = [Convert]::ToBase64String($spBytes)
-    $argument  = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $spEncoded"
-
-    $action  = New-ScheduledTaskAction -Execute $pwshPath -Argument $argument -WorkingDirectory $RepoRoot
-    $trigger = Get-TaskTrigger
-    $userId  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
-
-    # RunOnlyIfIdle: the task fires only after the computer has been idle for
-    # 5 minutes. IdleWaitTimeout gives the scheduler up to 1 hour after the
-    # scheduled trigger to find that idle window before skipping the run.
-    $settings = New-ScheduledTaskSettingsSet `
-        -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
-        -MultipleInstances IgnoreNew `
-        -RunOnlyIfIdle `
-        -IdleDuration    (New-TimeSpan -Minutes 5) `
-        -IdleWaitTimeout (New-TimeSpan -Hours 1)
+    $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
+    $plan = Get-TaskLauncherPlan
+    Write-Json -Level info -Message "Registering scheduled task $($Script:TaskPath)$($Script:TaskName) with $($policy.DisplayName) policy" -Extra @{
+        schedulerPolicy = $SchedulerPolicy
+        policySummary   = $policy.Summary
+        logonType       = $policy.LogonTypeName
+        requiresDesktop = $policy.RequiresDesktopSession
+        idleGate        = $policy.UsesIdleGate
+    }
+    $xml = Get-TaskXml
 
     Register-ScheduledTask -TaskName $Script:TaskName -TaskPath $Script:TaskPath `
-        -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-        -Description 'Autoresearch: uv run train.py via ai-powered.' | Out-Null
+        -Xml $xml | Out-Null
     Enable-TaskHistoryLog
     Write-Json -Level info -Message "Registered scheduled task $($Script:TaskPath)$($Script:TaskName)" -Extra @{
-        schedule        = $ScheduleFrequency
-        time            = $ScheduleTime
-        idleMinutes     = 5
-        ownProcess      = $true
-        launcherCommand = "$pwshPath $argument"
-        workloadCommand = "$pwshPath $($innerArgList -join ' ')"
+        schedule             = $ScheduleFrequency
+        time                 = $ScheduleTime
+        schedulerPolicy      = $SchedulerPolicy
+        policySummary        = $policy.Summary
+        logonType            = $policy.LogonTypeName
+        requiresDesktop      = $policy.RequiresDesktopSession
+        idleGate             = $policy.UsesIdleGate
+        idleMinutes          = if ($policy.UsesIdleGate) { 5 } else { $null }
+        idleWaitMinutes      = if ($policy.UsesIdleGate) { 60 } else { $null }
+        ownProcess           = $true
+        launcherCommand      = "$($plan.PwshPath) $($plan.EncodedArgument)"
+        workloadCommand      = $plan.WorkloadCommand
     }
 }
 
@@ -1105,7 +1456,7 @@ function Initialize-LaunchConfig {
     if (Test-Path -LiteralPath $Script:DefaultsPath) {
         $d = Read-LaunchDefaults
         if ($d) {
-            foreach ($k in 'Provider','Model','OllamaHost','AzureEndpoint','AzureDeployment','LogDir','ScheduleFrequency','ScheduleTime') {
+            foreach ($k in 'Provider','Model','OllamaHost','AzureEndpoint','AzureDeployment','LogDir','ScheduleFrequency','ScheduleTime','SchedulerPolicy') {
                 if (-not $Bound.ContainsKey($k) -and $d.PSObject.Properties[$k] -and $d.$k) {
                     Set-Variable -Name $k -Value $d.$k -Scope 1
                 }
@@ -1116,6 +1467,7 @@ function Initialize-LaunchConfig {
             Provider=$Provider; Model=$Model; OllamaHost=$OllamaHost
             AzureEndpoint=$AzureEndpoint; AzureDeployment=$AzureDeployment
             LogDir=$LogDir; ScheduleFrequency=$ScheduleFrequency; ScheduleTime=$ScheduleTime
+            SchedulerPolicy=$SchedulerPolicy
         }
     }
 }
@@ -1146,70 +1498,92 @@ function Show-LaunchGui {
     [xml]$xaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="autoresearch launcher" Width="520" SizeToContent="Height"
-        WindowStartupLocation="CenterScreen" ResizeMode="NoResize">
-  <StackPanel Margin="10">
-    <GroupBox Header="Action" Padding="6" Margin="0,0,0,6">
+        Title="autoresearch launcher" Width="640" Height="340" MinWidth="600" MinHeight="320"
+        WindowStartupLocation="CenterScreen" ResizeMode="CanResize" SizeToContent="Manual"
+        UseLayoutRounding="True" SnapsToDevicePixels="True"
+        KeyboardNavigation.TabNavigation="Cycle"
+        KeyboardNavigation.DirectionalNavigation="Contained">
+  <Grid Margin="10">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
       <StackPanel>
-        <RadioButton x:Name="ActPreflight" Content="Preflight only"/>
-        <RadioButton x:Name="ActRunNow" Content="Run training now" IsChecked="True"/>
-        <RadioButton x:Name="ActRegister" Content="Register scheduled task"/>
-        <RadioButton x:Name="ActRegisterRun" Content="Register task and run now"/>
-        <RadioButton x:Name="ActUnregister" Content="Unregister scheduled task"/>
-        <RadioButton x:Name="ActUpdate" Content="Update toolchain"/>
-      </StackPanel>
-    </GroupBox>
-    <GroupBox Header="AI Provider" Padding="6" Margin="0,0,0,6">
-      <StackPanel>
-        <StackPanel Orientation="Horizontal">
-          <RadioButton x:Name="PrvOllama" GroupName="prv" Content="Ollama (local)" IsChecked="True" Margin="0,0,8,0"/>
-          <RadioButton x:Name="PrvOpenAI" GroupName="prv" Content="OpenAI" Margin="0,0,8,0"/>
-          <RadioButton x:Name="PrvAnthropic" GroupName="prv" Content="Anthropic" Margin="0,0,8,0"/>
-          <RadioButton x:Name="PrvAzure" GroupName="prv" Content="Azure OpenAI"/>
-        </StackPanel>
-        <Label Content="Model"/>
-        <ComboBox x:Name="CbModel"/>
-        <Label Content="Ollama host (Ollama only)"/>
-        <ComboBox x:Name="CbHost" IsEditable="True">
+        <GroupBox Header="Action" Padding="6" Margin="0,0,0,6">
+          <StackPanel>
+            <RadioButton x:Name="ActPreflight" TabIndex="0" Margin="0,0,0,2"><TextBlock Text="Preflight only" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="ActRunNow" TabIndex="1" IsChecked="True" Margin="0,0,0,2"><TextBlock Text="Run training now" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="ActRegister" TabIndex="2" Margin="0,0,0,2"><TextBlock Text="Register scheduled task" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="ActRegisterRun" TabIndex="3" Margin="0,0,0,2"><TextBlock Text="Register task and run now" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="ActUnregister" TabIndex="4" Margin="0,0,0,2"><TextBlock Text="Unregister scheduled task" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="ActUpdate" TabIndex="5"><TextBlock Text="Update toolchain" TextWrapping="Wrap"/></RadioButton>
+          </StackPanel>
+        </GroupBox>
+        <GroupBox Header="AI Provider" Padding="6" Margin="0,0,0,6">
+          <StackPanel>
+            <WrapPanel Margin="0,0,0,6">
+              <RadioButton x:Name="PrvOllama" GroupName="prv" TabIndex="6" IsChecked="True" Margin="0,0,8,4"><TextBlock Text="Ollama (local)" TextWrapping="Wrap"/></RadioButton>
+              <RadioButton x:Name="PrvOpenAI" GroupName="prv" TabIndex="7" Margin="0,0,8,4"><TextBlock Text="OpenAI" TextWrapping="Wrap"/></RadioButton>
+              <RadioButton x:Name="PrvAnthropic" GroupName="prv" TabIndex="8" Margin="0,0,8,4"><TextBlock Text="Anthropic" TextWrapping="Wrap"/></RadioButton>
+              <RadioButton x:Name="PrvAzure" GroupName="prv" TabIndex="9" Margin="0,0,8,4"><TextBlock Text="Azure OpenAI" TextWrapping="Wrap"/></RadioButton>
+            </WrapPanel>
+            <TextBlock Text="Model" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbModel" TabIndex="10" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
+            <TextBlock Text="Ollama host (Ollama only)" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbHost" TabIndex="11" HorizontalAlignment="Stretch" MinWidth="260" IsEditable="True" Margin="0,0,0,6">
           <ComboBoxItem Content="http://127.0.0.1:11434" IsSelected="True"/>
           <ComboBoxItem Content="http://localhost:11434"/>
         </ComboBox>
-        <Label Content="API key (OpenAI / Anthropic / Azure)"/>
-        <PasswordBox x:Name="PbApiKey"/>
-        <Label x:Name="LblAzEp" Content="Azure endpoint" Visibility="Collapsed"/>
-        <TextBox x:Name="TxtAzEp" Visibility="Collapsed"/>
-        <Label x:Name="LblAzDp" Content="Azure deployment" Visibility="Collapsed"/>
-        <TextBox x:Name="TxtAzDp" Visibility="Collapsed"/>
+            <TextBlock Text="API key (OpenAI / Anthropic / Azure)" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <PasswordBox x:Name="PbApiKey" TabIndex="12" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
+            <TextBlock x:Name="LblAzEp" Text="Azure endpoint" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <TextBox x:Name="TxtAzEp" TabIndex="13" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed" Margin="0,0,0,6"/>
+            <TextBlock x:Name="LblAzDp" Text="Azure deployment" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <TextBox x:Name="TxtAzDp" TabIndex="14" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed"/>
+          </StackPanel>
+        </GroupBox>
+        <GroupBox Header="Scheduler policy" Padding="6" Margin="0,0,0,6">
+          <StackPanel>
+            <RadioButton x:Name="PolInteractive" GroupName="policy" TabIndex="15" Margin="0,0,0,2"><TextBlock Text="Interactive - logged-on session only, no idle wait" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="PolIdleOnly" GroupName="policy" TabIndex="16" IsChecked="True" Margin="0,0,0,2"><TextBlock Text="Idle-only - waits for 5 minutes of idle time, then logs a skip after 1 hour if needed" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="PolUnattended" GroupName="policy" TabIndex="17" Margin="0,0,0,2"><TextBlock Text="Unattended - S4U logon, no active desktop required" TextWrapping="Wrap"/></RadioButton>
+            <TextBlock x:Name="TxtPolicySummary" TextWrapping="Wrap" Margin="0,6,0,0" Foreground="DarkSlateGray"/>
+          </StackPanel>
+        </GroupBox>
+        <GroupBox Header="Schedule" Padding="6" Margin="0,0,0,6">
+          <StackPanel>
+            <TextBlock Text="Frequency" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbFreq" TabIndex="18" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6">
+              <ComboBoxItem Content="Hourly"/>
+              <ComboBoxItem Content="Daily" IsSelected="True"/>
+              <ComboBoxItem Content="Weekly"/>
+            </ComboBox>
+            <TextBlock x:Name="LblTime" Text="Time (HH:mm, local)" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbTime" TabIndex="19" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
+            <CheckBox x:Name="ChkHistory" TabIndex="20" IsChecked="True" Margin="0,6,0,0"><TextBlock Text="Enable Task Scheduler history (requires elevation)" TextWrapping="Wrap"/></CheckBox>
+          </StackPanel>
+        </GroupBox>
       </StackPanel>
-    </GroupBox>
-    <GroupBox Header="Schedule" Padding="6" Margin="0,0,0,6">
-      <StackPanel>
-        <Label Content="Frequency"/>
-        <ComboBox x:Name="CbFreq">
-          <ComboBoxItem Content="Hourly"/>
-          <ComboBoxItem Content="Daily" IsSelected="True"/>
-          <ComboBoxItem Content="Weekly"/>
-        </ComboBox>
-        <Label x:Name="LblTime" Content="Time (HH:mm, local)"/>
-        <ComboBox x:Name="CbTime"/>
-        <CheckBox x:Name="ChkHistory" Content="Enable Task Scheduler history (requires elevation)" IsChecked="True" Margin="0,6,0,0"/>
-      </StackPanel>
-    </GroupBox>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-      <Button x:Name="BtnDefaults" Content="Save as Defaults" Width="120" Margin="0,0,6,0"/>
-      <Button x:Name="BtnCancel" Content="Cancel" Width="80" Margin="0,0,6,0"/>
-      <Button x:Name="BtnOK" Content="OK" Width="80" IsDefault="True"/>
+    </ScrollViewer>
+    <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button x:Name="BtnDefaults" TabIndex="21" MinWidth="130" Margin="0,0,6,0"><TextBlock Text="Save as Defaults" TextWrapping="Wrap"/></Button>
+      <Button x:Name="BtnCancel" TabIndex="22" MinWidth="90" Margin="0,0,6,0" IsCancel="True"><TextBlock Text="Cancel" TextWrapping="Wrap"/></Button>
+      <Button x:Name="BtnOK" TabIndex="23" MinWidth="90" IsDefault="True"><TextBlock Text="OK" TextWrapping="Wrap"/></Button>
     </StackPanel>
-  </StackPanel>
+  </Grid>
 </Window>
 "@
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
+    $window.MaxWidth = [SystemParameters]::WorkArea.Width
+    $window.MaxHeight = [SystemParameters]::WorkArea.Height
     Write-DebugLog "Show-LaunchGui: XAML loaded"
     $script:C = @{}
     foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',
         'PrvOllama','PrvOpenAI','PrvAnthropic','PrvAzure','CbModel','CbHost','PbApiKey',
-        'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','CbFreq','LblTime','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
+        'LblAzEp','TxtAzEp','LblAzDp','TxtAzDp','PolInteractive','PolIdleOnly','PolUnattended',
+        'TxtPolicySummary','CbFreq','LblTime','CbTime','ChkHistory','BtnDefaults','BtnCancel','BtnOK') {
         $script:C[$n] = $window.FindName($n)
         if ($null -eq $script:C[$n]) {
             Write-DebugLog "Show-LaunchGui: FindName returned null for '$n'"
@@ -1234,7 +1608,7 @@ function Show-LaunchGui {
         $script:C.CbTime.SelectedIndex = -1
         $script:C.CbTime.Items.Clear()
         foreach ($o in $opts) { $null = $script:C.CbTime.Items.Add([string]$o) }
-        $script:C.LblTime.Content = switch ($freq) {
+        $script:C.LblTime.Text = switch ($freq) {
             'Hourly' { 'Minute of hour' }
             'Weekly' { 'Day of week' }
             default  { 'Time of day (HH:mm, local)' }
@@ -1242,7 +1616,7 @@ function Show-LaunchGui {
         $defVal = Get-ScheduleTimeDefault -Frequency $freq
         $idx = [array]::IndexOf($opts, $defVal)
         if ($idx -ge 0) { $script:C.CbTime.SelectedIndex = $idx }
-        Write-DebugLog "Update-CbTimeForFrequency: applied label='$($script:C.LblTime.Content)' defaultVal='$defVal' selectedIndex=$($script:C.CbTime.SelectedIndex) itemsCount=$($script:C.CbTime.Items.Count)"
+        Write-DebugLog "Update-CbTimeForFrequency: applied label='$($script:C.LblTime.Text)' defaultVal='$defVal' selectedIndex=$($script:C.CbTime.SelectedIndex) itemsCount=$($script:C.CbTime.Items.Count)"
     }
 
     $script:C.CbFreq.add_SelectionChanged({
@@ -1270,6 +1644,19 @@ function Show-LaunchGui {
 
     Invoke-GuiSafe -Context 'initial-populateModels' -Action { script:Update-ModelsForProvider 'ollama' }
 
+    function script:Update-PolicySummary {
+        $policy = if ($script:C.PolInteractive.IsChecked) { 'Interactive' }
+        elseif ($script:C.PolUnattended.IsChecked) { 'Unattended' }
+        else { 'IdleOnly' }
+        $info = Get-SchedulerPolicyInfo -Policy $policy
+        $script:C.TxtPolicySummary.Text = $info.Summary
+        Write-DebugLog "Update-PolicySummary: policy='$policy' summary='$($info.Summary)'"
+    }
+
+    $script:C.PolInteractive.Add_Checked({ Invoke-GuiSafe -Context 'PolInteractive.Checked' -Action { script:Update-PolicySummary } })
+    $script:C.PolIdleOnly.Add_Checked({ Invoke-GuiSafe -Context 'PolIdleOnly.Checked' -Action { script:Update-PolicySummary } })
+    $script:C.PolUnattended.Add_Checked({ Invoke-GuiSafe -Context 'PolUnattended.Checked' -Action { script:Update-PolicySummary } })
+
     if ($d) {
         Invoke-GuiSafe -Context 'apply-defaults' -Action {
             switch ($d.Provider) {
@@ -1286,6 +1673,13 @@ function Show-LaunchGui {
             }
             if ($d.PSObject.Properties['AzureEndpoint']   -and $d.AzureEndpoint)   { $script:C.TxtAzEp.Text = $d.AzureEndpoint }
             if ($d.PSObject.Properties['AzureDeployment'] -and $d.AzureDeployment) { $script:C.TxtAzDp.Text = $d.AzureDeployment }
+            if ($d.PSObject.Properties['SchedulerPolicy'] -and $d.SchedulerPolicy) {
+                switch ($d.SchedulerPolicy) {
+                    'Interactive' { $script:C.PolInteractive.IsChecked = $true }
+                    'Unattended'  { $script:C.PolUnattended.IsChecked = $true }
+                    default       { $script:C.PolIdleOnly.IsChecked = $true }
+                }
+            }
             Write-DebugLog "apply-defaults: provider=$($d.Provider) freq=$($d.ScheduleFrequency) time=$($d.ScheduleTime)"
         }
     }
@@ -1304,12 +1698,17 @@ function Show-LaunchGui {
         }
     }
 
+    Invoke-GuiSafe -Context 'initial-policySummary' -Action { script:Update-PolicySummary }
+
     $Script:GuiResult = $null
     function script:Get-GuiSnapshot {
         $prv = if ($script:C.PrvOpenAI.IsChecked) { 'openai' }
                elseif ($script:C.PrvAnthropic.IsChecked) { 'anthropic' }
                elseif ($script:C.PrvAzure.IsChecked) { 'azure' }
                else { 'ollama' }
+        $policy = if ($script:C.PolInteractive.IsChecked) { 'Interactive' }
+                  elseif ($script:C.PolUnattended.IsChecked) { 'Unattended' }
+                  else { 'IdleOnly' }
         $freqItem = $script:C.CbFreq.SelectedItem
         $freqStr = if ($null -ne $freqItem) {
             if ($freqItem -is [System.Windows.Controls.ComboBoxItem]) { [string]$freqItem.Content }
@@ -1324,6 +1723,7 @@ function Show-LaunchGui {
             AzureDeployment   = $script:C.TxtAzDp.Text
             ScheduleFrequency = $freqStr
             ScheduleTime      = [string]$script:C.CbTime.SelectedItem
+            SchedulerPolicy   = $policy
             EnableHistory     = [bool]$script:C.ChkHistory.IsChecked
             Action            = if ($script:C.ActPreflight.IsChecked) { 'Preflight' }
                                 elseif ($script:C.ActRunNow.IsChecked) { 'RunNow' }
@@ -1358,10 +1758,18 @@ function Show-LaunchGui {
                 model    = $Script:GuiResult.Model
                 freq     = $Script:GuiResult.ScheduleFrequency
                 time     = $Script:GuiResult.ScheduleTime
+                policy   = $Script:GuiResult.SchedulerPolicy
                 action   = $Script:GuiResult.Action
             }
             $window.DialogResult = $true
             $window.Close()
+        }
+    })
+    $window.Add_ContentRendered({
+        Invoke-GuiSafe -Context 'Window.ContentRendered' -Action {
+            # Put initial focus on the main action so keyboard users can start
+            # interacting immediately without tabbing through the chrome.
+            if ($script:C.ActRunNow) { $null = $script:C.ActRunNow.Focus() }
         }
     })
     Write-DebugLog "Show-LaunchGui: showing dialog"
@@ -1381,6 +1789,7 @@ function Invoke-FromGui {
     $Script:AzureDeployment = $Gui.AzureDeployment
     $Script:ScheduleFrequency = $Gui.ScheduleFrequency
     $Script:ScheduleTime = $Gui.ScheduleTime
+    $Script:SchedulerPolicy = $Gui.SchedulerPolicy
     # Mirror back to function-scope params consumed downstream.
     Set-Variable -Name Provider -Value $Gui.Provider -Scope 1
     Set-Variable -Name Model -Value $Gui.Model -Scope 1
@@ -1390,6 +1799,12 @@ function Invoke-FromGui {
     Set-Variable -Name AzureDeployment -Value $Gui.AzureDeployment -Scope 1
     Set-Variable -Name ScheduleFrequency -Value $Gui.ScheduleFrequency -Scope 1
     Set-Variable -Name ScheduleTime -Value $Gui.ScheduleTime -Scope 1
+    Set-Variable -Name SchedulerPolicy -Value $Gui.SchedulerPolicy -Scope 1
+}
+
+if (Test-TruthyEnvValue $env:AUTORESEARCH_DOT_SOURCE_ONLY) {
+    Write-BootstrapMessage "Import-only mode enabled via AUTORESEARCH_DOT_SOURCE_ONLY; skipping bootstrap and relaunch for target '$Script:CanonicalRepo'."
+    return
 }
 
 try {
@@ -1408,6 +1823,7 @@ try {
             LogDir               = $LogDir
             ScheduleFrequency    = $ScheduleFrequency
             ScheduleTime         = $ScheduleTime
+            SchedulerPolicy      = $SchedulerPolicy
             RegisterTask         = [bool]$RegisterTask
             RunNow               = [bool]$RunNow
             RunLoop              = [bool]$RunLoop
@@ -1474,7 +1890,8 @@ try {
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunNow  # single training run via ai-powered"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop  # autoresearch experiment loop"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop -MaxLoopMinutes 120  # loop with 2-hour limit"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime -SchedulerPolicy $SchedulerPolicy"
+        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -SchedulerPolicy Unattended -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Unregister"
         Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Update"
         Write-Host ''

@@ -11,6 +11,7 @@ AUTORESEARCH_DATASET or by running this script with --dataset.
 """
 
 import argparse
+import hashlib
 import math
 import os
 import pickle
@@ -68,9 +69,17 @@ CACHE_DIR = _default_cache_dir()
 DATASETS_DIR = os.path.join(CACHE_DIR, "datasets")
 ACTIVE_DATASET_PATH = os.path.join(CACHE_DIR, "active_dataset.txt")
 
+DATA_DOWNLOAD_TIMEOUT_SECONDS = 60
+DATA_DOWNLOAD_MAX_ATTEMPTS = 4
+DATA_DOWNLOAD_INITIAL_BACKOFF_SECONDS = 1.0
+DATA_DOWNLOAD_MAX_BACKOFF_SECONDS = 8.0
+DATA_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+
 DATASET_CONFIGS = {
     "tinystories": {
         "filename": "tinystories_gpt4_clean.parquet",
+        "sha256": "8bacd849e57784e06ebaaab3ef7b01077ca2d9d27ce7d95f2fbe465f1483548b",
         "url": "https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean/resolve/main/tinystories_gpt4_clean.parquet",
         "splits": {
             "test": (0, 10_000),
@@ -79,6 +88,18 @@ DATASET_CONFIGS = {
         },
     },
 }
+
+
+class DatasetTransportError(RuntimeError):
+    """Raised when the dataset download cannot complete over the network."""
+
+
+class DatasetIntegrityError(RuntimeError):
+    """Raised when a downloaded dataset file does not match the pinned checksum."""
+
+
+class DatasetPlacementError(RuntimeError):
+    """Raised when a verified dataset file cannot be moved into place."""
 
 
 def _normalize_dataset_name(dataset_name):
@@ -160,6 +181,120 @@ def _tiny_legacy_parquet_paths(dataset_name=None):
     )
 
 
+def _dataset_sha256(dataset_name):
+    config = DATASET_CONFIGS[dataset_name]
+    return config["sha256"]
+
+
+def _sha256_file(path, chunk_size=DATA_DOWNLOAD_CHUNK_SIZE):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _remove_path(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _verify_tinystories_parquet(path, dataset_name):
+    expected_sha256 = _dataset_sha256(dataset_name)
+    if not os.path.exists(path):
+        raise DatasetIntegrityError(
+            f"Integrity error: TinyStories parquet is missing at {path}."
+        )
+
+    actual_sha256 = _sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise DatasetIntegrityError(
+            "Integrity error: TinyStories parquet at "
+            f"{path} has sha256 {actual_sha256}, expected {expected_sha256}."
+        )
+
+    return actual_sha256
+
+
+def _download_url_with_retries(url, temp_path, description):
+    backoff_seconds = DATA_DOWNLOAD_INITIAL_BACKOFF_SECONDS
+    for attempt in range(1, DATA_DOWNLOAD_MAX_ATTEMPTS + 1):
+        _remove_path(temp_path)
+        try:
+            with requests.get(
+                url,
+                stream=True,
+                timeout=DATA_DOWNLOAD_TIMEOUT_SECONDS,
+            ) as response:
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    status_code = getattr(response, "status_code", None)
+                    if (
+                        status_code in TRANSIENT_HTTP_STATUSES
+                        and attempt < DATA_DOWNLOAD_MAX_ATTEMPTS
+                    ):
+                        print(
+                            f"Data: transient HTTP {status_code} while downloading {description} "
+                            f"(attempt {attempt}/{DATA_DOWNLOAD_MAX_ATTEMPTS}); retrying in "
+                            f"{backoff_seconds:.1f}s..."
+                        )
+                        time.sleep(backoff_seconds)
+                        backoff_seconds = min(
+                            backoff_seconds * 2,
+                            DATA_DOWNLOAD_MAX_BACKOFF_SECONDS,
+                        )
+                        continue
+                    raise DatasetTransportError(
+                        f"Transport error downloading {description}: HTTP {status_code} from {url}."
+                    ) from exc
+
+                try:
+                    with open(temp_path, "wb") as f:
+                        for chunk in response.iter_content(
+                            chunk_size=DATA_DOWNLOAD_CHUNK_SIZE,
+                        ):
+                            if chunk:
+                                f.write(chunk)
+                except OSError as exc:
+                    _remove_path(temp_path)
+                    raise DatasetPlacementError(
+                        f"File placement error while writing {description} to {temp_path}: {exc}"
+                    ) from exc
+            return
+        except requests.RequestException as exc:
+            _remove_path(temp_path)
+            if attempt < DATA_DOWNLOAD_MAX_ATTEMPTS:
+                print(
+                    f"Data: transport error while downloading {description} "
+                    f"(attempt {attempt}/{DATA_DOWNLOAD_MAX_ATTEMPTS}): {exc}. "
+                    f"Retrying in {backoff_seconds:.1f}s..."
+                )
+                time.sleep(backoff_seconds)
+                backoff_seconds = min(
+                    backoff_seconds * 2,
+                    DATA_DOWNLOAD_MAX_BACKOFF_SECONDS,
+                )
+                continue
+            raise DatasetTransportError(
+                f"Transport error downloading {description} after {DATA_DOWNLOAD_MAX_ATTEMPTS} attempts: {exc}"
+            ) from exc
+
+
+def _promote_verified_download(temp_path, filepath, description):
+    try:
+        os.replace(temp_path, filepath)
+    except OSError as exc:
+        _remove_path(temp_path)
+        raise DatasetPlacementError(
+            f"File placement error moving verified {description} into {filepath}: {exc}"
+        ) from exc
+
+
 def _resolve_tiny_parquet_for_read(dataset_name=None):
     dataset = _resolve_dataset_name(dataset_name)
     data_dir = _data_dir(dataset)
@@ -197,21 +332,54 @@ def _download_tinystories_file(dataset_name):
 
     filename = config["filename"]
     filepath = os.path.join(data_dir, filename)
-    resolved_existing_path = _resolve_tiny_parquet_for_read(dataset_name)
-    if os.path.exists(resolved_existing_path):
-        print(f"Data: {filename} already downloaded at {resolved_existing_path}")
-        return
+    temp_path = filepath + ".tmp"
+
+    if os.path.exists(filepath):
+        try:
+            _verify_tinystories_parquet(filepath, dataset_name)
+        except DatasetIntegrityError:
+            print(
+                f"Data: existing {filename} at {filepath} failed integrity check; redownloading."
+            )
+            _remove_path(filepath)
+        else:
+            print(f"Data: {filename} already downloaded at {filepath}")
+            return
+
+    for legacy_path in _tiny_legacy_parquet_paths(dataset_name):
+        if not os.path.exists(legacy_path):
+            continue
+        try:
+            _verify_tinystories_parquet(legacy_path, dataset_name)
+        except DatasetIntegrityError:
+            print(
+                f"Data: ignoring stale legacy TinyStories parquet at {legacy_path} after integrity failure."
+            )
+            _remove_path(legacy_path)
+            continue
+        try:
+            os.replace(legacy_path, filepath)
+            print(f"Data: migrated legacy TinyStories parquet to {filepath}")
+            return
+        except OSError:
+            try:
+                shutil.copy2(legacy_path, filepath)
+                print(f"Data: copied legacy TinyStories parquet to {filepath}")
+                return
+            except OSError as exc:
+                raise DatasetPlacementError(
+                    f"File placement error copying legacy TinyStories parquet from {legacy_path} to {filepath}: {exc}"
+                ) from exc
 
     url = config["url"]
     print(f"Data: downloading {filename}...")
-    response = requests.get(url, stream=True, timeout=60)
-    response.raise_for_status()
-    temp_path = filepath + ".tmp"
-    with open(temp_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
-    os.rename(temp_path, filepath)
+    _download_url_with_retries(url, temp_path, filename)
+    try:
+        _verify_tinystories_parquet(temp_path, dataset_name)
+    except DatasetIntegrityError:
+        _remove_path(temp_path)
+        raise
+    _promote_verified_download(temp_path, filepath, filename)
     print(f"Data: downloaded {filename} to {filepath}")
 
 
@@ -534,7 +702,7 @@ def evaluate_bpb(model, tokenizer, batch_size, device="cuda", dataset=None, eval
 # Main
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
     parser.add_argument(
         "--dataset",
@@ -545,7 +713,7 @@ if __name__ == "__main__":
             "AUTORESEARCH_DATASET, active_dataset.txt, then default tinystories."
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     dataset_name = _resolve_dataset_name(args.dataset)
 
@@ -553,9 +721,19 @@ if __name__ == "__main__":
     print(f"Dataset: {dataset_name}")
     print()
 
-    download_data(dataset_name)
-    print()
-    train_tokenizer(dataset_name)
-    _set_active_dataset(dataset_name)
+    try:
+        download_data(dataset_name)
+        print()
+        train_tokenizer(dataset_name)
+        _set_active_dataset(dataset_name)
+    except (DatasetTransportError, DatasetIntegrityError, DatasetPlacementError) as exc:
+        print(f"Error: {exc}")
+        return 1
+
     print()
     print(f"Done! Ready to train. Active dataset is now '{dataset_name}'.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -116,6 +116,65 @@ class CheckpointTestCase(unittest.TestCase):
         self.assertEqual(left, right, f"{path} value mismatch")
 
 
+class TrainValidationTests(CheckpointTestCase):
+    def _make_config(self, **overrides):
+        config = train.GPTConfig(
+            sequence_len=8,
+            vocab_size=16,
+            n_layer=2,
+            n_head=2,
+            n_kv_head=2,
+            n_embd=32,
+            window_pattern="SL",
+            attention_backend="sdpa",
+            use_activation_checkpointing=False,
+            compute_dtype=torch.float32,
+        )
+        for key, value in overrides.items():
+            setattr(config, key, value)
+        return config
+
+    def test_apply_rotary_emb_rejects_rank_mismatch(self):
+        x = torch.zeros(2, 3, 4)
+        cos = torch.zeros(1, 1, 1, 2)
+        sin = torch.zeros(1, 1, 1, 2)
+
+        with self.assertRaisesRegex(ValueError, r"x\.ndim == 4"):
+            train.apply_rotary_emb(x, cos, sin)
+
+    def test_causal_self_attention_rejects_invalid_head_layout(self):
+        cases = [
+            (
+                {"n_embd": 30, "n_head": 4, "n_kv_head": 2},
+                r"n_embd \(30\) must be divisible by n_head \(4\)\.",
+            ),
+            (
+                {"n_embd": 32, "n_head": 2, "n_kv_head": 3},
+                r"n_kv_head \(3\) must be <= n_head \(2\) and divide it evenly\.",
+            ),
+        ]
+
+        for overrides, expected_message in cases:
+            with self.subTest(overrides=overrides):
+                config = self._make_config(**overrides)
+                with self.assertRaisesRegex(ValueError, expected_message):
+                    train.CausalSelfAttention(config, layer_idx=0)
+
+    def test_gpt_rejects_invalid_window_pattern(self):
+        config = self._make_config(window_pattern="SX")
+
+        with self.assertRaisesRegex(ValueError, r"window_pattern"):
+            train.GPT(config)
+
+    def test_gpt_forward_rejects_sequences_longer_than_rotary_cache(self):
+        config = self._make_config(sequence_len=8)
+        model = train.GPT(config)
+        inputs = torch.zeros((1, config.sequence_len + 1), dtype=torch.long)
+
+        with self.assertRaisesRegex(ValueError, r"Sequence length"):
+            model(inputs)
+
+
 class CheckpointRoundTripTests(CheckpointTestCase):
     def test_checkpoint_round_trip_preserves_model_and_optimizer_state(self):
         runtime = self._make_runtime()

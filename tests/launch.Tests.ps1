@@ -29,7 +29,95 @@ exit 0
     exit $LASTEXITCODE
 }
 
-$script:HarnessRoot = Split-Path -Parent $PSScriptRoot
+function script:Get-LaunchFixtureState {
+    $state = [ordered]@{}
+    foreach ($name in @(
+        'LogDir',
+        'AggregateLog',
+        'RunLogPath',
+        'LogRetentionCount',
+        'LogRetentionDays',
+        'TaskLaunchStatePath',
+        'RepoRoot',
+        'CanonicalScript',
+        'Provider',
+        'Model',
+        'OllamaHost',
+        'SchedulerPolicy',
+        'MaxLoopMinutes',
+        'PerRunTimeoutMinutes',
+        'NoAiEdit',
+        'TaskName',
+        'TaskPath',
+        'ScheduledTaskAuthor',
+        'TaskFixtureRoot',
+        'ScheduleFrequency',
+        'ScheduleTime',
+        'captured',
+        'historyCount',
+        'installCalls',
+        'rollbackCalls',
+        'smokeCalls',
+        'pathRefreshCount',
+        'registerCount',
+        'registeredTaskProbes',
+        'startProcessArgs',
+        'steps',
+        'unregisterCount'
+    )) {
+        $variable = Get-Variable -Scope Script -Name $name -ErrorAction SilentlyContinue
+        $state[$name] = if ($null -ne $variable) { $variable.Value } else { $null }
+    }
+
+    return [pscustomobject]$state
+}
+
+function script:Set-LaunchFixtureState {
+    param([Parameter(Mandatory)][psobject]$State)
+
+    foreach ($property in $State.PSObject.Properties) {
+        Set-Variable -Scope Script -Name $property.Name -Value $property.Value -Force
+    }
+}
+
+function script:Initialize-LaunchFixtureState {
+    param([Parameter(Mandatory)][string]$LaunchScriptPath)
+
+    $logDir = Join-Path (Join-Path $env:HOMEDRIVE 'myTech.Today') 'logs'
+    $script:LogDir = $logDir
+    $script:AggregateLog = Join-Path $logDir 'autoresearch.jsonl'
+    $script:RunLogPath = $null
+    $script:LogRetentionCount = 25
+    $script:LogRetentionDays = 14
+    $script:TaskLaunchStatePath = Join-Path $logDir 'autoresearch-task-launch.json'
+    $script:RepoRoot = Split-Path -Parent $PSScriptRoot
+    $script:CanonicalScript = (Resolve-Path -LiteralPath $LaunchScriptPath).Path
+    $script:Provider = 'ollama'
+    $script:Model = 'qwen2.5-coder:latest'
+    $script:OllamaHost = 'http://127.0.0.1:11434'
+    $script:SchedulerPolicy = 'IdleOnly'
+    $script:TaskName = 'Autoresearch-Train'
+    $script:TaskPath = '\myTech.Today\'
+    $script:ScheduledTaskAuthor = 'myTech.Today (sales@mytech.today)'
+    $script:TaskFixtureRoot = $null
+    $script:ScheduleFrequency = 'Daily'
+    $script:ScheduleTime = $null
+    $script:MaxLoopMinutes = 0
+    $script:PerRunTimeoutMinutes = 10
+    $script:NoAiEdit = $false
+    $script:captured = @()
+    $script:historyCount = 0
+    $script:installCalls = @()
+    $script:rollbackCalls = @()
+    $script:smokeCalls = @()
+    $script:pathRefreshCount = 0
+    $script:registerCount = 0
+    $script:registeredTaskProbes = 0
+    $script:startProcessArgs = $null
+    $script:steps = @()
+    $script:unregisterCount = 0
+    $script:previousLaunchScope = Get-LaunchFixtureState
+}
 
 BeforeAll {
     $scriptPath = Join-Path $PSScriptRoot '..\scripts\launch.ps1'
@@ -41,8 +129,14 @@ BeforeAll {
     # script's top-level main flow (preflight, GUI, task registration) does
     # not execute when the test file loads.
     $wanted = @(
+        'ConvertTo-SingleQuotedLiteral',
+        'Format-CommandLine',
+        'Format-CommandLineArgumentList',
         'ConvertTo-WeekdayMask',
         'Get-ComputerIdleState',
+        'Get-CurrentProcessCommandLine',
+        'Get-RedactedTaskLaunchCommandLine',
+        'Get-RedactedTaskLaunchState',
         'Get-PwshExePath',
         'Get-ScheduleTriggerSpec',
         'Get-ScheduleTimeOptions',
@@ -51,10 +145,42 @@ BeforeAll {
         'Get-ScheduledTaskDescription',
         'Get-TaskLauncherPlan',
         'Get-TaskXml',
+        'Invoke-TaskLaunchSupervisor',
         'Test-ScheduleTime',
         'Get-TaskTrigger',
         'Invoke-IdlePolicyGate',
+        'Get-VersionToken',
+        'ConvertTo-VersionObject',
+        'Get-ToolVersion',
+        'Get-CompatibleVersionFromList',
+        'Get-UvReleaseVersions',
+        'Get-UvCompatibleTargetVersion',
+        'Get-WingetPackageVersions',
+        'Get-OllamaCompatibleTargetVersion',
+        'Get-NpmGlobalPackageVersion',
+        'Get-PinnedAiPoweredVersion',
+        'Update-SessionPath',
+        'Start-OllamaServer',
+        'Sync-OllamaModel',
+        'Add-RunLogReason',
+        'Get-RunLogMetadata',
+        'Get-RunLogRetentionPlan',
+        'Limit-RunLogs',
+        'Invoke-UvSelfUpdate',
+        'Test-UvSmoke',
+        'Invoke-OllamaUpgrade',
+        'Test-OllamaSmoke',
+        'Invoke-AiPoweredInstall',
+        'Test-AiPoweredSmoke',
+        'Invoke-CompatibilityCheckedUpdateStep',
+        'Invoke-UvUpdate',
+        'Invoke-OllamaUpdate',
+        'Invoke-AiPoweredUpdate',
+        'Invoke-Update',
         'Write-Json',
+        'Write-TaskLaunchState',
+        'New-Dir',
+        'Get-TaskLaunchStatePath',
         'Register-LauncherTask',
         'Unregister-LauncherTask',
         'Get-RegisteredLauncherTask',
@@ -87,12 +213,50 @@ BeforeAll {
             )
         }
     }
+
+    Initialize-LaunchFixtureState -LaunchScriptPath $scriptPath
 }
 
 function script:New-TestRoot {
     param([string]$Name)
     $path = Join-Path $env:TEMP ("autoresearch-$Name-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $path -Force | Out-Null
+    return $path
+}
+
+function script:Write-RunLogFixture {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [datetime]$LastWriteTimeUtc = (Get-Date).ToUniversalTime(),
+        [switch]$IncludeErrorLine
+    )
+
+    $path = Join-Path $Directory $Name
+    $lines = @(
+        ([ordered]@{
+            ts    = '2026-01-01T00:00:00.0000000Z'
+            level = 'info'
+            msg   = 'Starting workload'
+        } | ConvertTo-Json -Compress)
+    )
+    if ($IncludeErrorLine) {
+        $lines += ([ordered]@{
+            ts    = '2026-01-01T00:00:01.0000000Z'
+            level = 'error'
+            msg   = 'simulated failure'
+        } | ConvertTo-Json -Compress)
+    }
+    $lines += ([ordered]@{
+        ts       = '2026-01-01T00:00:02.0000000Z'
+        level    = 'info'
+        msg      = 'Workload finished'
+        exitCode = $ExitCode
+    } | ConvertTo-Json -Compress)
+
+    Set-Content -LiteralPath $path -Value $lines -Encoding UTF8
+    [System.IO.File]::SetLastWriteTimeUtc($path, $LastWriteTimeUtc)
     return $path
 }
 
@@ -204,7 +368,8 @@ function script:Invoke-ProviderVerificationForTest {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $output = & node (Join-Path $script:HarnessRoot 'scripts/verify-ai-provider.mjs') 2>&1
+        $harnessRoot = Split-Path -Parent $PSScriptRoot
+        $output = & node (Join-Path $harnessRoot 'scripts/verify-ai-provider.mjs') 2>&1
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = @($output) }
     }
     finally {
@@ -246,13 +411,6 @@ function Start-Process {
         HOMEDRIVE = $HomeDrive
         PATH      = "$GitBin;$env:PATH"
     }
-}
-
-function script:Decode-EncodedCommand {
-    param([Parameter(Mandatory)][string]$Arguments)
-    $match = [regex]::Match($Arguments, '-EncodedCommand\s+(?<value>[A-Za-z0-9+/=]+)')
-    if (-not $match.Success) { return $null }
-    return [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($match.Groups['value'].Value))
 }
 
 function script:Get-LaunchGuiXaml {
@@ -413,10 +571,13 @@ Describe 'Get-TaskXml' {
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:Duration', $ns).InnerText) | Should -Be 'PT5M'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:WaitTimeout', $ns).InnerText) | Should -Be 'PT1H'
         ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'Idle-only'
-        $decoded = Decode-EncodedCommand ($xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments', $ns).InnerText)
-        $decoded | Should -Match '-RunLoop'
-        $decoded | Should -Match '-SchedulerPolicy'
-        $decoded | Should -Match 'IdleOnly'
+        $arguments = $xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments', $ns).InnerText
+        $arguments | Should -Match '-NoGui'
+        $arguments | Should -Match '-TaskSupervisor'
+        $arguments | Should -Match '-SchedulerPolicy'
+        $arguments | Should -Match 'IdleOnly'
+        $arguments | Should -Not -Match '-EncodedCommand'
+        $arguments | Should -Not -Match '-RunLoop'
     }
 
     It 'emits interactive XML with zero idle window' {
@@ -511,7 +672,7 @@ Describe 'Register-LauncherTask' {
 }
 
 Describe 'Launcher plan' {
-    It 'forwards the scheduler policy into the detached launch arguments' {
+    It 'forwards the scheduler policy into the supervisor and worker launch arguments' {
         $script:SchedulerPolicy = 'Unattended'
         $script:ScheduleFrequency = 'Weekly'
         $script:ScheduleTime = 'Wednesday'
@@ -519,10 +680,430 @@ Describe 'Launcher plan' {
         $script:Model = 'qwen2.5-coder:latest'
         $script:MaxLoopMinutes = 0
         $script:PerRunTimeoutMinutes = 10
+        Mock Get-PwshExePath { return 'C:\Program Files\PowerShell\7\pwsh.exe' }
         $plan = Get-TaskLauncherPlan
         $plan.InnerArgList | Should -Contain '-SchedulerPolicy'
         $plan.InnerArgList | Should -Contain 'Unattended'
         $plan.InnerArgList | Should -Contain '-RunLoop'
+        $plan.TaskActionArguments | Should -Match '-TaskSupervisor'
+        $plan.TaskActionArguments | Should -Not -Match '-RunLoop'
+        $plan.TaskActionCommand | Should -Match '-TaskSupervisor'
+        $plan.TaskActionCommand | Should -Match "^'C:\\Program Files\\PowerShell\\7\\pwsh\.exe'"
+        $plan.WorkloadCommand | Should -Match "^'C:\\Program Files\\PowerShell\\7\\pwsh\.exe'"
+        $plan.WorkloadCommand | Should -Match '-RunLoop'
+        $plan.TaskLaunchStatePath | Should -Match 'autoresearch-task-launch\.json$'
+    }
+}
+
+Describe 'Run log retention' {
+    BeforeEach {
+        $script:previousLaunchScope = Get-LaunchFixtureState
+        $root = New-TestRoot 'run-log-retention'
+        $script:LogDir = Join-Path $root 'logs'
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $script:RunLogPath = Join-Path $script:LogDir 'session-summary.jsonl'
+    }
+
+    AfterEach {
+        Set-LaunchFixtureState -State $script:previousLaunchScope
+    }
+
+    It 'keeps the latest failure and most recent success even when older logs exceed the age window' {
+        $keptSuccess = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260907-090000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-1))
+        $keptFailure = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260906-090000.jsonl' -ExitCode 1 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-20)) -IncludeErrorLine
+        $prunedSuccess = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260905-090000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-21))
+
+        $plan = Get-RunLogRetentionPlan -LogDir $script:LogDir -LogRetentionCount 0 -LogRetentionDays 7
+
+        $plan.LatestSuccess.Name | Should -Be (Split-Path -Leaf $keptSuccess)
+        $plan.LatestFailure.Name | Should -Be (Split-Path -Leaf $keptFailure)
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $keptSuccess)
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $keptFailure)
+        @($plan.Pruned.Name) | Should -Contain (Split-Path -Leaf $prunedSuccess)
+    }
+
+    It 'respects the configured count without deleting the most recent useful diagnostic files' {
+        $recentSuccess = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260907-100000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-1))
+        $recentFailure = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260906-100000.jsonl' -ExitCode 2 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-2)) -IncludeErrorLine
+        $oldOne = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260810-100000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-20))
+        $oldTwo = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260809-100000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-21))
+        $oldThree = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260808-100000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-22))
+
+        $plan = Get-RunLogRetentionPlan -LogDir $script:LogDir -LogRetentionCount 1 -LogRetentionDays 7
+
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $recentSuccess)
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $recentFailure)
+        @($plan.Pruned.Name) | Should -Contain (Split-Path -Leaf $oldTwo)
+        @($plan.Pruned.Name) | Should -Contain (Split-Path -Leaf $oldThree)
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $oldOne)
+        $plan.Pruned.Count | Should -Be 2
+    }
+
+    It 'prunes deterministically when multiple files share the same write time' {
+        $stamp = [datetime]::UtcNow.AddDays(-30)
+        $keepD = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260801-120000-d.jsonl' -ExitCode 0 -LastWriteTimeUtc $stamp
+        $keepC = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260801-120000-c.jsonl' -ExitCode 0 -LastWriteTimeUtc $stamp
+        $pruneB = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260801-120000-b.jsonl' -ExitCode 0 -LastWriteTimeUtc $stamp
+        $pruneA = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260801-120000-a.jsonl' -ExitCode 0 -LastWriteTimeUtc $stamp
+
+        $plan = Get-RunLogRetentionPlan -LogDir $script:LogDir -LogRetentionCount 2 -LogRetentionDays 7
+
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $keepD)
+        @($plan.Kept.Name) | Should -Contain (Split-Path -Leaf $keepC)
+        @($plan.Pruned.Name) | Should -Contain (Split-Path -Leaf $pruneB)
+        @($plan.Pruned.Name) | Should -Contain (Split-Path -Leaf $pruneA)
+        $plan.Kept[0].Name | Should -Be (Split-Path -Leaf $keepD)
+        $plan.Kept[1].Name | Should -Be (Split-Path -Leaf $keepC)
+    }
+
+    It 'appends a pruning summary to the aggregate log after deleting older files' {
+        $oldOne = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260810-080000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-20))
+        $oldTwo = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260809-080000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-21))
+        $oldThree = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260808-080000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-22))
+        $recentSuccess = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260907-080000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-1))
+
+        $result = Limit-RunLogs -LogDir $script:LogDir -LogRetentionCount 1 -LogRetentionDays 7
+
+        Test-Path -LiteralPath $oldOne | Should -BeTrue
+        Test-Path -LiteralPath $oldTwo | Should -BeFalse
+        Test-Path -LiteralPath $oldThree | Should -BeFalse
+        Test-Path -LiteralPath $recentSuccess | Should -BeTrue
+        Test-Path -LiteralPath $script:AggregateLog | Should -BeTrue
+        $summary = ((Get-Content -LiteralPath $script:AggregateLog -Raw) -split "`r?`n" | Where-Object { $_ }) | Select-Object -Last 1 | ConvertFrom-Json
+        $summary.msg | Should -Match 'Run log pruning reviewed'
+        $summary.pruning.deletedCount | Should -Be 2
+        @($summary.pruning.deleted) | Should -HaveCount 2
+        $result.Summary.deletedCount | Should -Be 2
+    }
+}
+
+Describe 'Launch fixture state' {
+    It 'initializes the shared fixture from a blank script scope' {
+        $launchScriptPath = Join-Path $PSScriptRoot '..\scripts\launch.ps1'
+        $previousState = Get-LaunchFixtureState
+        $previousLaunchScopeValue = Get-Variable -Scope Script -Name previousLaunchScope -ErrorAction SilentlyContinue
+        try {
+            foreach ($name in @(
+                'LogDir',
+                'AggregateLog',
+                'RunLogPath',
+                'LogRetentionCount',
+                'LogRetentionDays',
+                'TaskLaunchStatePath',
+                'RepoRoot',
+                'CanonicalScript',
+                'Provider',
+                'Model',
+                'OllamaHost',
+                'SchedulerPolicy',
+                'MaxLoopMinutes',
+                'PerRunTimeoutMinutes',
+                'NoAiEdit',
+                'TaskName',
+                'TaskPath',
+                'ScheduledTaskAuthor',
+                'TaskFixtureRoot',
+                'ScheduleFrequency',
+                'ScheduleTime',
+                'previousLaunchScope'
+            )) {
+                Remove-Variable -Scope Script -Name $name -ErrorAction SilentlyContinue
+            }
+
+            Initialize-LaunchFixtureState -LaunchScriptPath $launchScriptPath
+
+            $expectedLogDir = Join-Path (Join-Path $env:HOMEDRIVE 'myTech.Today') 'logs'
+            $expectedAggregateLog = Join-Path $expectedLogDir 'autoresearch.jsonl'
+            $expectedTaskLaunchStatePath = Join-Path $expectedLogDir 'autoresearch-task-launch.json'
+
+            $script:LogDir | Should -Be $expectedLogDir
+            $script:AggregateLog | Should -Be $expectedAggregateLog
+            $script:RunLogPath | Should -BeNullOrEmpty
+            $script:LogRetentionCount | Should -Be 25
+            $script:LogRetentionDays | Should -Be 14
+            $script:TaskLaunchStatePath | Should -Be $expectedTaskLaunchStatePath
+            $script:Provider | Should -Be 'ollama'
+            $script:SchedulerPolicy | Should -Be 'IdleOnly'
+            $script:NoAiEdit | Should -BeFalse
+            $script:previousLaunchScope.LogDir | Should -Be $expectedLogDir
+            $script:previousLaunchScope.AggregateLog | Should -Be $expectedAggregateLog
+            $script:previousLaunchScope.TaskLaunchStatePath | Should -Be $expectedTaskLaunchStatePath
+        }
+        finally {
+            Set-LaunchFixtureState -State $previousState
+            if ($null -ne $previousLaunchScopeValue) {
+                $script:previousLaunchScope = $previousLaunchScopeValue.Value
+            } else {
+                Remove-Variable -Scope Script -Name previousLaunchScope -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+Describe 'Task launch supervisor' {
+    BeforeEach {
+        $script:previousLaunchScope = Get-LaunchFixtureState
+        $root = New-TestRoot 'task-launch-supervisor'
+        $script:LogDir = Join-Path $root 'logs'
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $script:TaskLaunchStatePath = Join-Path $script:LogDir 'autoresearch-task-launch.json'
+        $script:RepoRoot = $root
+        $script:CanonicalScript = Join-Path $root 'scripts\launch.ps1'
+        $script:Provider = 'ollama'
+        $script:Model = 'qwen2.5-coder:latest'
+        $script:OllamaHost = 'http://127.0.0.1:11434'
+        $script:SchedulerPolicy = 'IdleOnly'
+        $script:MaxLoopMinutes = 0
+        $script:PerRunTimeoutMinutes = 10
+        $script:NoAiEdit = $false
+        Mock Write-Json { }
+        Mock Get-PwshExePath { return 'C:\Program Files\PowerShell\7\pwsh.exe' }
+        Mock Get-CurrentProcessCommandLine {
+            return 'pwsh.exe -NoProfile -ExecutionPolicy Bypass -File launch.ps1 -NoGui -TaskSupervisor -ApiKey super-secret -AzureEndpoint https://example.openai.azure.com -AzureDeployment prod-deploy'
+        }
+    }
+
+    AfterEach {
+        Set-LaunchFixtureState -State $script:previousLaunchScope
+    }
+
+    It 'records the child pid and exit code when the child succeeds' {
+        $script:startProcessArgs = $null
+        Mock Start-Process {
+            param(
+                [string]$FilePath,
+                [string[]]$ArgumentList,
+                [string]$WorkingDirectory,
+                [string]$WindowStyle,
+                [switch]$PassThru,
+                [switch]$Wait
+            )
+            $script:startProcessArgs = [pscustomobject]@{
+                FilePath = $FilePath
+                ArgumentList = @($ArgumentList)
+                WorkingDirectory = $WorkingDirectory
+                WindowStyle = $WindowStyle
+                PassThru = [bool]$PassThru
+                Wait = [bool]$Wait
+            }
+            return [pscustomobject]@{ Id = 4242; ExitCode = 0 }
+        }
+
+        $exitCode = Invoke-TaskLaunchSupervisor
+
+        $exitCode | Should -Be 0
+        Test-Path -LiteralPath $script:TaskLaunchStatePath | Should -BeTrue
+        $state = Get-Content -LiteralPath $script:TaskLaunchStatePath -Raw | ConvertFrom-Json
+        $state.status | Should -Be 'succeeded'
+        $state.childPid | Should -Be 4242
+        $state.childExitCode | Should -Be 0
+        $state.parentPid | Should -Be $PID
+        $state.parentCommandLine | Should -Match 'TaskSupervisor'
+        $state.parentCommandLine | Should -Not -Match 'super-secret'
+        $state.parentCommandLine | Should -Match 'ApiKey'
+        $state.parentCommandLine | Should -Match 'AzureEndpoint'
+        $state.parentCommandLine | Should -Match 'AzureDeployment'
+        $state.childCommandLine | Should -Match '-RunLoop'
+        $state.taskActionCommand | Should -Match '-TaskSupervisor'
+        $script:startProcessArgs.FilePath | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
+        $script:startProcessArgs.WindowStyle | Should -Be 'Hidden'
+        $script:startProcessArgs.ArgumentList | Should -Contain '-RunLoop'
+        $script:startProcessArgs.ArgumentList | Should -Contain '-NoGui'
+        $stateFileContents = Get-Content -LiteralPath $script:TaskLaunchStatePath -Raw
+        $stateFileContents | Should -Not -Match 'super-secret'
+        $stateFileContents | Should -Not -Match 'https://example\.openai\.azure\.com'
+        $stateFileContents | Should -Not -Match 'prod-deploy'
+    }
+
+    It 'records the failure when the child exits non-zero' {
+        Mock Start-Process {
+            return [pscustomobject]@{ Id = 4243; ExitCode = 7 }
+        }
+
+        $exitCode = Invoke-TaskLaunchSupervisor
+
+        $exitCode | Should -Be 7
+        $state = Get-Content -LiteralPath $script:TaskLaunchStatePath -Raw | ConvertFrom-Json
+        $state.status | Should -Be 'failed'
+        $state.childPid | Should -Be 4243
+        $state.childExitCode | Should -Be 7
+    }
+}
+
+Describe 'Update compatibility' {
+    It 'keeps uv on the current minor line' {
+        Mock Get-ToolVersion { return '0.11.19' } -ParameterFilter { $Name -eq 'uv' }
+        Mock Get-UvReleaseVersions { return @('0.12.10', '0.11.33', '0.11.32') }
+
+        Get-UvCompatibleTargetVersion | Should -Be '0.11.33'
+    }
+
+    It 'keeps Ollama on the current minor line' {
+        Mock Get-ToolVersion { return '0.32.1' } -ParameterFilter { $Name -eq 'ollama' }
+        Mock Get-WingetPackageVersions { return @('0.33.3', '0.32.15', '0.32.1') }
+
+        Get-OllamaCompatibleTargetVersion | Should -Be '0.32.15'
+    }
+
+    It 'reads the pinned ai-powered version from package-lock' {
+        Get-PinnedAiPoweredVersion | Should -Be '0.3.2'
+    }
+
+    It 'rolls back a failed update before the workload can continue' {
+        $script:installCalls = @()
+        $script:rollbackCalls = @()
+        $script:smokeCalls = @()
+        $script:pathRefreshCount = 0
+        Mock Write-Json { }
+        Mock Update-SessionPath { $script:pathRefreshCount++ }
+        $install = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            $script:installCalls += "$CurrentVersion->$TargetVersion"
+        }
+        $smoke = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            $script:smokeCalls += "$CurrentVersion->$TargetVersion"
+            if ($TargetVersion -eq '0.11.33') {
+                throw 'simulated smoke failure'
+            }
+            return $TargetVersion
+        }
+        $rollback = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            $script:rollbackCalls += "$CurrentVersion->$TargetVersion"
+        }
+
+        { Invoke-CompatibilityCheckedUpdateStep -ToolName 'uv' -CurrentVersion '0.11.19' -TargetVersion '0.11.33' -InstallAction $install -SmokeAction $smoke -RollbackAction $rollback } |
+            Should -Throw -ExpectedMessage '*simulated smoke failure*'
+
+        $script:installCalls | Should -Be @('0.11.19->0.11.33')
+        $script:rollbackCalls | Should -Be @('0.11.33->0.11.19')
+        $script:smokeCalls | Should -Be @('0.11.19->0.11.33', '0.11.19->0.11.19')
+        $script:pathRefreshCount | Should -Be 2
+    }
+
+    It 'returns a structured summary when the smoke check passes' {
+        $script:installCalls = @()
+        $script:smokeCalls = @()
+        Mock Write-Json { }
+        Mock Update-SessionPath { }
+        $install = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            $script:installCalls += "$CurrentVersion->$TargetVersion"
+        }
+        $smoke = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            $script:smokeCalls += "$CurrentVersion->$TargetVersion"
+            return $TargetVersion
+        }
+        $rollback = {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            throw 'rollback should not run on success'
+        }
+
+        $result = Invoke-CompatibilityCheckedUpdateStep -ToolName 'ai-powered' -CurrentVersion '0.3.1' -TargetVersion '0.3.2' -InstallAction $install -SmokeAction $smoke -RollbackAction $rollback
+
+        $result.tool | Should -Be 'ai-powered'
+        $result.before | Should -Be '0.3.1'
+        $result.target | Should -Be '0.3.2'
+        $result.after | Should -Be '0.3.2'
+        $result.updated | Should -BeTrue
+        $result.rolledBack | Should -BeFalse
+        $script:installCalls | Should -Be @('0.3.1->0.3.2')
+        $script:smokeCalls | Should -Be @('0.3.1->0.3.2')
+    }
+}
+
+Describe 'Update orchestration' {
+    BeforeEach {
+        $script:steps = @()
+        Mock Write-Json { }
+    }
+
+    It 'reports upgraded and left-alone steps and keeps Ollama post-update behavior intact' {
+        $script:Provider = 'ollama'
+        Mock Invoke-UvUpdate {
+            $script:steps += 'uv'
+            return [pscustomobject]@{
+                tool = 'uv'
+                before = '0.11.19'
+                target = '0.11.33'
+                after = '0.11.33'
+                updated = $true
+                rolledBack = $false
+            }
+        }
+        Mock Invoke-OllamaUpdate {
+            $script:steps += 'ollama'
+            return [pscustomobject]@{
+                tool = 'ollama'
+                before = '0.32.1'
+                target = '0.32.15'
+                after = '0.32.15'
+                updated = $true
+                rolledBack = $false
+            }
+        }
+        Mock Invoke-AiPoweredUpdate {
+            $script:steps += 'ai-powered'
+            return [pscustomobject]@{
+                tool = 'ai-powered'
+                before = '0.3.2'
+                target = '0.3.2'
+                after = '0.3.2'
+                updated = $false
+                rolledBack = $false
+            }
+        }
+        Mock Start-OllamaServer { $script:steps += 'start-ollama' }
+        Mock Sync-OllamaModel { $script:steps += 'sync-model' }
+
+        $result = Invoke-Update
+
+        $result.Summary | Should -Match 'uv 0.11.19 -> 0.11.33'
+        $result.Summary | Should -Match 'ollama 0.32.1 -> 0.32.15'
+        $result.Summary | Should -Match 'ai-powered left at 0.3.2'
+        $script:steps | Should -Be @('uv', 'ollama', 'ai-powered', 'start-ollama', 'sync-model')
+        Assert-MockCalled Start-OllamaServer -Times 1
+        Assert-MockCalled Sync-OllamaModel -Times 1
+    }
+
+    It 'leaves Ollama alone when another provider is selected' {
+        $script:Provider = 'openai'
+        Mock Invoke-UvUpdate {
+            $script:steps += 'uv'
+            return [pscustomobject]@{
+                tool = 'uv'
+                before = '0.11.19'
+                target = '0.11.33'
+                after = '0.11.33'
+                updated = $true
+                rolledBack = $false
+            }
+        }
+        Mock Invoke-AiPoweredUpdate {
+            $script:steps += 'ai-powered'
+            return [pscustomobject]@{
+                tool = 'ai-powered'
+                before = '0.3.2'
+                target = '0.3.2'
+                after = '0.3.2'
+                updated = $false
+                rolledBack = $false
+            }
+        }
+        Mock Start-OllamaServer { throw 'should not be called for openai provider' }
+        Mock Sync-OllamaModel { throw 'should not be called for openai provider' }
+
+        $result = Invoke-Update
+
+        $result.Steps[1].skipped | Should -BeTrue
+        $result.Steps[1].reason | Should -Match 'does not use Ollama'
+        $script:steps | Should -Be @('uv', 'ai-powered')
+        Assert-MockCalled Start-OllamaServer -Times 0
+        Assert-MockCalled Sync-OllamaModel -Times 0
     }
 }
 

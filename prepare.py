@@ -733,13 +733,19 @@ def train_tokenizer(dataset_name=None):
     test = "Hello world! Numbers: 123. Unicode: 你好"
     encoded = enc.encode_ordinary(test)
     decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
+    if decoded != test:
+        raise RuntimeError(f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}")
     print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
+
+
+def _validate_split(split):
+    if split not in ("train", "val", "test"):
+        raise ValueError(f"Invalid split {split!r}. Expected one of ('train', 'val', 'test').")
 
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
@@ -809,7 +815,7 @@ def get_token_bytes(device="cpu", dataset=None):
 
 def _document_batches(split, dataset=None, tokenizer_batch_size=128):
     dataset_name = _resolve_dataset_name(dataset)
-    assert split in ("train", "val", "test")
+    _validate_split(split)
 
     epoch = 1
     while True:
@@ -832,9 +838,9 @@ def make_dataloader(tokenizer, B, T, split, device="cuda", dataset=None, buffer_
     100% utilization (no padding).
     """
     dataset_name = _resolve_dataset_name(dataset or getattr(tokenizer, "dataset", None))
-    if split == "test":
-        assert dataset_name == "tinystories", "Test split exists only for TinyStories."
-    assert split in ("train", "val", "test")
+    _validate_split(split)
+    if split == "test" and dataset_name != "tinystories":
+        raise ValueError("Test split exists only for TinyStories.")
 
     row_capacity = T + 1
     batches = _document_batches(split, dataset=dataset_name)

@@ -39,7 +39,8 @@
                       -MaxLoopMinutes elapses or the process is killed.
       -RegisterTask   Creates/replaces the `Autoresearch-Train` scheduled
                       task. Does NOT run training in this invocation. The
-                      task's action drives -RunLoop, not a single -RunNow.
+                      task's action drives -TaskSupervisor, which launches
+                      the hidden -RunLoop child, not a single -RunNow.
       -Unregister     Removes the scheduled task if present and exits.
       -Update         Upgrades uv, Ollama, ai-powered, and re-pulls the model.
 
@@ -82,11 +83,24 @@
     are produced:
       * <LogDir>\autoresearch.jsonl                  (append-only aggregate)
       * <LogDir>\autoresearch-run-<UTC-stamp>.jsonl  (one per invocation)
-    Per-run files older than the newest 190 are pruned automatically.
+    Per-run files are retained with a hybrid policy: keep anything newer
+    than `-LogRetentionDays`, keep up to `-LogRetentionCount` older files,
+    and always preserve the most recent success and most recent failure when
+    they exist. The aggregate log is never rotated.
     Default: "$env:HOMEDRIVE\myTech.Today\logs" (typically C:\myTech.Today\logs).
 
     Example:
         pwsh -File .\scripts\launch.ps1 -RunNow -LogDir 'D:\logs\autoresearch'
+
+.PARAMETER LogRetentionCount
+    Number of older per-run logs to keep after the age window has been
+    honored. This still preserves the most recent success and most recent
+    failure when present.
+    Default: 25.
+
+.PARAMETER LogRetentionDays
+    Age window, in days, during which per-run logs are always retained.
+    Default: 14.
 
 .PARAMETER ScheduleTime
     Polymorphic schedule slot whose meaning depends on -ScheduleFrequency:
@@ -133,10 +147,12 @@
 
 .PARAMETER RegisterTask
     Switch. When set, creates (or replaces) a Windows scheduled task named
-    `Autoresearch-Train` that re-invokes this script with `-RunLoop` on the
-    configured trigger. The selected scheduler policy controls whether the
-    task is interactive, idle-only, or unattended. An existing task with the
-    same name is unregistered first.
+    `Autoresearch-Train` that uses a first-class `-TaskSupervisor`
+    invocation on the configured trigger. The selected scheduler policy
+    controls whether the task is interactive, idle-only, or unattended. The
+    registered task action launches the hidden `-RunLoop` child, records its
+    PID/command/exit code, and mirrors the child exit status back to Task
+    Scheduler. An existing task with the same name is unregistered first.
 
     Example (schedule daily at 03:00 - the defaults):
         pwsh -File .\scripts\launch.ps1 -RegisterTask
@@ -160,11 +176,13 @@
 
 .PARAMETER Update
     Switch. When set, upgrades the toolchain in place:
-      * `uv self update`
-      * `winget upgrade --id Ollama.Ollama` (silent)
-      * `npm install -g ai-powered@latest`
-    Then restarts the Ollama daemon if needed and re-pulls -Model. Can be
-    combined with -RegisterTask and/or -RunNow.
+      * `uv self update <compatible patch on the current minor line>`
+      * `winget upgrade --id Ollama.Ollama --version <compatible patch>` (silent)
+      * `npm install -g ai-powered@<pinned package-lock version>`
+    The launcher records exact before/after versions, runs a smoke check after
+    each step, and rolls back a failed step before continuing. Then it restarts
+    the Ollama daemon if needed and re-pulls -Model. Can be combined with
+    -RegisterTask and/or -RunNow.
 
     Example (update everything, then run training once):
         pwsh -File .\scripts\launch.ps1 -Update -RunNow
@@ -190,6 +208,12 @@
     The `AUTORESEARCH_DOT_SOURCE_ONLY=1` environment variable enables
     import-only mode for test harnesses and returns immediately after loading
     helper functions.
+
+.PARAMETER TaskSupervisor
+    Internal switch used by the scheduled task action. Launches the hidden
+    `-RunLoop` child process, records the child PID, a redacted command line,
+    and exit code in the task launch state file, and exits with the child's
+    status so Task Scheduler can see the real result.
 
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1
@@ -244,22 +268,26 @@
     Exit codes:
       0  Success (preflight OK, or workload exited 0, or task registered).
       Non-zero  Either preflight failed or `uv run train.py` exited non-zero;
-                in -RunNow mode the script propagates the workload's exit code.
+                in -RunNow mode the script propagates the workload's exit code;
+                in -TaskSupervisor mode the script propagates the hidden
+                child exit code.
 
     Logs:
       Aggregate JSONL: <LogDir>\autoresearch.jsonl
       Per-run JSONL:   <LogDir>\autoresearch-run-<UTC-stamp>.jsonl
-      Per-run files are pruned to the newest 10 automatically.
+      Per-run files are pruned with a hybrid age/count policy that always
+      keeps the newest success and newest failure when present.
 
     Scheduled task:
       Name:        Autoresearch-Train
       Action:      pwsh.exe -NoProfile -ExecutionPolicy Bypass
-                            -EncodedCommand <base64-Start-Process>
-                   The encoded command runs Start-Process to spawn launch.ps1
-                   in its own detached process (-WindowStyle Hidden) with the
-                   -RunLoop switch, so the task action exits immediately and
-                   the experiment loop runs independently.
-      Workload:    The detached process drives the autoresearch loop from
+                            -File launch.ps1 -NoGui -TaskSupervisor ...
+                   The supervisor launches the hidden `-RunLoop` child and
+                   writes `%HOMEDRIVE%\myTech.Today\logs\autoresearch-task-launch.json`
+                   with the child PID, redacted command line, and exit code
+                   before exiting with the child's status so Task Scheduler
+                   sees the real result.
+      Workload:    The hidden child drives the autoresearch loop from
                    program.md: it edits train.py via `ai-powered text`, runs
                    `uv run train.py` per iteration (10-minute kill switch by
                    default), parses val_bpb/peak_vram_mb from run.log,
@@ -297,6 +325,11 @@ param(
     [string]$AzureDeployment,
     [string]$RepoRoot,
     [string]$LogDir = "$env:HOMEDRIVE\myTech.Today\logs",
+    [Alias('LogRetention')]
+    [ValidateRange(0, 2147483647)]
+    [int]$LogRetentionCount = 25,
+    [ValidateRange(0, 36500)]
+    [int]$LogRetentionDays = 14,
     [string]$ScheduleTime,
     [ValidateSet('Hourly', 'Daily', 'Weekly')]
     [string]$ScheduleFrequency = 'Daily',
@@ -311,6 +344,7 @@ param(
     [switch]$Unregister,
     [switch]$Update,
     [switch]$NoBootstrap,
+    [switch]$TaskSupervisor,
     [switch]$NoGui,
     [switch]$Debug
 )
@@ -330,7 +364,9 @@ $Script:DefaultsPath = Join-Path (Split-Path -Parent $Script:CanonicalScript) 'l
 $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
-$Script:LogRetention = 10
+$Script:TaskLaunchStatePath = Join-Path $LogDir 'autoresearch-task-launch.json'
+$Script:LogRetentionCount = $LogRetentionCount
+$Script:LogRetentionDays = $LogRetentionDays
 $Script:DebugEnabled = [bool]$Debug
 
 function ConvertTo-ForwardArgs {
@@ -345,6 +381,34 @@ function ConvertTo-ForwardArgs {
         }
     }
     return ,$out
+}
+
+function ConvertTo-SingleQuotedLiteral {
+    param([Parameter(Mandatory)][string]$Value)
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Format-CommandLineArgumentList {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    $parts = foreach ($arg in $Arguments) {
+        if ($arg -match '^-{1,2}[A-Za-z]') {
+            $arg
+        } else {
+            ConvertTo-SingleQuotedLiteral $arg
+        }
+    }
+    return ($parts -join ' ')
+}
+
+function Format-CommandLine {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][string[]]$Arguments
+    )
+    $quotedFilePath = ConvertTo-SingleQuotedLiteral $FilePath
+    $argText = Format-CommandLineArgumentList -Arguments $Arguments
+    if ([string]::IsNullOrWhiteSpace($argText)) { return $quotedFilePath }
+    return "$quotedFilePath $argText"
 }
 
 function Test-TruthyEnvValue {
@@ -471,6 +535,71 @@ function Write-DebugLog {
         Write-Json -Level debug -Message $Message -Extra $Extra
     } catch {
         # Never let debug logging derail the script.
+    }
+}
+
+function Get-CurrentProcessCommandLine {
+    if (-not $IsWindows) { return $null }
+    try {
+        $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
+        return $process.CommandLine
+    } catch {
+        return $null
+    }
+}
+
+function Get-RedactedTaskLaunchCommandLine {
+    param([AllowNull()][string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $CommandLine }
+
+    $redacted = $CommandLine
+    foreach ($parameterName in @('ApiKey', 'AzureEndpoint', 'AzureDeployment')) {
+        $pattern = "(?i)(^|\s+)(-$([regex]::Escape($parameterName)))(\s+|=|:)(?:'[^']*'|""[^""]*""|\S+)"
+        $redacted = [regex]::Replace($redacted, $pattern, '$1$2$3[REDACTED]')
+    }
+    return $redacted
+}
+
+function Get-RedactedTaskLaunchState {
+    param([Parameter(Mandatory)][hashtable]$State)
+
+    $redactedState = [ordered]@{}
+    foreach ($key in $State.Keys) {
+        $value = $State[$key]
+        if (($value -is [string]) -and ($key -match '(?i)Command(Line)?$')) {
+            $value = Get-RedactedTaskLaunchCommandLine -CommandLine $value
+        }
+        $redactedState[$key] = $value
+    }
+    return $redactedState
+}
+
+function Get-TaskLaunchStatePath {
+    if (-not [string]::IsNullOrWhiteSpace($Script:TaskLaunchStatePath)) {
+        return $Script:TaskLaunchStatePath
+    }
+    $logRoot = $LogDir
+    if ([string]::IsNullOrWhiteSpace($logRoot)) {
+        $logRoot = Join-Path (Join-Path $env:TEMP 'myTech.Today') 'logs'
+    }
+    return Join-Path $logRoot 'autoresearch-task-launch.json'
+}
+
+function Write-TaskLaunchState {
+    param([Parameter(Mandatory)][hashtable]$State)
+    try {
+        $statePath = Get-TaskLaunchStatePath
+        New-Dir (Split-Path -Parent $statePath)
+        $redactedState = Get-RedactedTaskLaunchState -State $State
+        ($redactedState | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $statePath -Encoding UTF8
+    } catch {
+        try {
+            Write-Json -Level warn -Message "Task launch state write failed: $($_.Exception.Message)" -Extra @{
+                statePath = (Get-TaskLaunchStatePath)
+            }
+        } catch {
+            # Keep diagnostics best-effort only.
+        }
     }
 }
 
@@ -644,39 +773,587 @@ function Invoke-Preflight {
     Write-DebugLog "Invoke-Preflight: complete"
 }
 
+function Get-VersionToken {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Source
+    )
+    $match = [regex]::Match($Text, '(?<!\d)(?<version>\d+(?:\.\d+){1,3})(?:-[0-9A-Za-z.-]+)?')
+    if (-not $match.Success) {
+        throw "Unable to determine $Source version from output: $Text"
+    }
+    return $match.Groups['version'].Value
+}
+
+function ConvertTo-VersionObject {
+    param([Parameter(Mandatory)][string]$Version)
+    try {
+        return [version]$Version
+    } catch {
+        throw "Invalid semantic version '$Version'."
+    }
+}
+
+function Get-ToolVersion {
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not (Test-CommandOnPath $Name)) {
+        throw "$Name is required but could not be found on PATH."
+    }
+    $cmd = Get-Command $Name -ErrorAction Stop
+    $output = & $cmd.Source --version 2>&1 | Out-String
+    return Get-VersionToken -Text $output.Trim() -Source $Name
+}
+
+function Get-CompatibleVersionFromList {
+    param(
+        [Parameter(Mandatory)][version]$CurrentVersion,
+        [Parameter(Mandatory)][string[]]$Candidates
+    )
+    $compatible = foreach ($candidate in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $versionText = $null
+        try {
+            $versionText = Get-VersionToken -Text $candidate.Trim() -Source 'candidate'
+        } catch {
+            continue
+        }
+        $version = ConvertTo-VersionObject -Version $versionText
+        if ($version.Major -eq $CurrentVersion.Major -and $version.Minor -eq $CurrentVersion.Minor) {
+            [pscustomobject]@{
+                Text  = $version.ToString()
+                Value = $version
+            }
+        }
+    }
+    if (-not $compatible) { return $null }
+    return ($compatible | Sort-Object Value -Descending | Select-Object -First 1).Text
+}
+
+function Get-UvReleaseVersions {
+    $headers = @{ 'User-Agent' = 'autoresearch-win-rtx-scheduled' }
+    $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/astral-sh/uv/releases?per_page=100' -Headers $headers
+    $versions = @()
+    foreach ($release in $releases) {
+        if ($release.draft -or $release.prerelease) { continue }
+        if ([string]::IsNullOrWhiteSpace($release.tag_name)) { continue }
+        $versions += $release.tag_name
+    }
+    return $versions
+}
+
+function Get-UvCompatibleTargetVersion {
+    $current = ConvertTo-VersionObject -Version (Get-ToolVersion -Name 'uv')
+    $target = Get-CompatibleVersionFromList -CurrentVersion $current -Candidates (Get-UvReleaseVersions)
+    if ($null -eq $target) { return $current.ToString() }
+    return $target
+}
+
+function Get-WingetPackageVersions {
+    $output = & winget show --id Ollama.Ollama --versions --accept-source-agreements 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget show --id Ollama.Ollama --versions failed (exit $LASTEXITCODE)"
+    }
+    $versions = @()
+    foreach ($line in ($output -split "\r?\n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\d+(?:\.\d+){1,3}$') {
+            $versions += $trimmed
+        }
+    }
+    return $versions
+}
+
+function Get-OllamaCompatibleTargetVersion {
+    $current = ConvertTo-VersionObject -Version (Get-ToolVersion -Name 'ollama')
+    $target = Get-CompatibleVersionFromList -CurrentVersion $current -Candidates (Get-WingetPackageVersions)
+    if ($null -eq $target) { return $current.ToString() }
+    return $target
+}
+
+function Get-NpmGlobalPackageVersion {
+    param([Parameter(Mandatory)][string]$PackageName)
+    if (-not (Test-CommandOnPath 'npm')) {
+        throw 'npm is required but could not be found on PATH.'
+    }
+    $json = & npm list -g $PackageName --depth=0 --json 2>$null | Out-String
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        throw "Unable to determine installed npm package version for '$PackageName'."
+    }
+    $parsed = $json | ConvertFrom-Json
+    $dependencies = $parsed.dependencies
+    if ($null -eq $dependencies) {
+        throw "Unable to determine installed npm package version for '$PackageName'."
+    }
+    $entry = $dependencies.PSObject.Properties[$PackageName]
+    if ($null -eq $entry -or $null -eq $entry.Value -or [string]::IsNullOrWhiteSpace($entry.Value.version)) {
+        throw "Unable to determine installed npm package version for '$PackageName'."
+    }
+    return $entry.Value.version
+}
+
+function Get-PinnedAiPoweredVersion {
+    $lockPath = Join-Path $RepoRoot 'package-lock.json'
+    if (-not (Test-Path -LiteralPath $lockPath)) {
+        throw "package-lock.json not found at $lockPath"
+    }
+    $text = Get-Content -LiteralPath $lockPath -Raw
+    $match = [regex]::Match($text, '"node_modules/ai-powered"\s*:\s*\{\s*"version"\s*:\s*"(?<version>[^"]+)"', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    if (-not $match.Success) {
+        throw "Unable to determine pinned ai-powered version from $lockPath"
+    }
+    return $match.Groups['version'].Value
+}
+
+function Invoke-UvSelfUpdate {
+    param([Parameter(Mandatory)][string]$TargetVersion)
+    Write-DebugLog "Invoke-UvSelfUpdate: target=$TargetVersion"
+    & uv self update $TargetVersion
+    if ($LASTEXITCODE -ne 0) {
+        throw "uv self update $TargetVersion failed (exit $LASTEXITCODE)"
+    }
+}
+
+function Test-UvSmoke {
+    param([Parameter(Mandatory)][string]$ExpectedVersion)
+    $actual = Get-ToolVersion -Name 'uv'
+    if ($actual -ne $ExpectedVersion) {
+        throw "uv smoke validation found version $actual, expected $ExpectedVersion"
+    }
+    & uv run --help 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "uv run --help failed (exit $LASTEXITCODE)"
+    }
+    return $actual
+}
+
+function Invoke-OllamaUpgrade {
+    param([Parameter(Mandatory)][string]$TargetVersion)
+    Write-DebugLog "Invoke-OllamaUpgrade: target=$TargetVersion"
+    $ok = Invoke-Winget @('upgrade', '--id', 'Ollama.Ollama', '--version', $TargetVersion,
+        '--source', 'winget',
+        '--silent', '--accept-package-agreements', '--accept-source-agreements',
+        '--disable-interactivity')
+    if (-not $ok) {
+        throw "winget upgrade --id Ollama.Ollama --version $TargetVersion failed"
+    }
+}
+
+function Test-OllamaSmoke {
+    param([Parameter(Mandatory)][string]$ExpectedVersion)
+    $actual = Get-ToolVersion -Name 'ollama'
+    if ($actual -ne $ExpectedVersion) {
+        throw "ollama smoke validation found version $actual, expected $ExpectedVersion"
+    }
+    Start-OllamaServer
+    return $actual
+}
+
+function Invoke-AiPoweredInstall {
+    param([Parameter(Mandatory)][string]$TargetVersion)
+    Write-DebugLog "Invoke-AiPoweredInstall: target=$TargetVersion"
+    & npm install -g "ai-powered@$TargetVersion" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "npm install -g ai-powered@$TargetVersion failed (exit $LASTEXITCODE)"
+    }
+}
+
+function Test-AiPoweredSmoke {
+    param([Parameter(Mandatory)][string]$ExpectedVersion)
+    $actual = Get-NpmGlobalPackageVersion -PackageName 'ai-powered'
+    if ($actual -ne $ExpectedVersion) {
+        throw "ai-powered smoke validation found version $actual, expected $ExpectedVersion"
+    }
+    & ai-powered text --mock --quiet 'launcher update smoke' 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "ai-powered text --mock smoke failed (exit $LASTEXITCODE)"
+    }
+    return $actual
+}
+
+function Invoke-CompatibilityCheckedUpdateStep {
+    param(
+        [Parameter(Mandatory)][string]$ToolName,
+        [Parameter(Mandatory)][string]$CurrentVersion,
+        [Parameter(Mandatory)][string]$TargetVersion,
+        [Parameter(Mandatory)][scriptblock]$InstallAction,
+        [Parameter(Mandatory)][scriptblock]$SmokeAction,
+        [Parameter(Mandatory)][scriptblock]$RollbackAction
+    )
+
+    $currentInfo = ConvertTo-VersionObject -Version $CurrentVersion
+    $changed = ($CurrentVersion -ne $TargetVersion)
+    $actionText = if ($changed) { "updating to $TargetVersion" } else { "already at compatible version $TargetVersion" }
+    Write-Json -Level info -Message "$ToolName $actionText" -Extra @{
+        tool = $ToolName
+        before = $CurrentVersion
+        target = $TargetVersion
+        compatibilityLine = "$($currentInfo.Major).$($currentInfo.Minor).x"
+    }
+
+    try {
+        if ($changed) {
+            & $InstallAction $TargetVersion $CurrentVersion
+            Update-SessionPath
+        }
+        $afterVersion = & $SmokeAction $TargetVersion $CurrentVersion
+        if ([string]::IsNullOrWhiteSpace($afterVersion)) {
+            $afterVersion = $TargetVersion
+        }
+        if ($afterVersion -ne $TargetVersion) {
+            throw "$ToolName smoke validation reported version $afterVersion, expected $TargetVersion"
+        }
+        $result = [pscustomobject]@{
+            tool = $ToolName
+            before = $CurrentVersion
+            target = $TargetVersion
+            after = $afterVersion
+            updated = $changed
+            rolledBack = $false
+        }
+        Write-Json -Level info -Message "$ToolName update step validated" -Extra @{
+            tool = $ToolName
+            before = $CurrentVersion
+            target = $TargetVersion
+            after = $afterVersion
+            updated = $changed
+            rolledBack = $false
+        }
+        return $result
+    } catch {
+        if ($changed) {
+            Write-Json -Level warn -Message "$ToolName update failed; rolling back to $CurrentVersion" -Extra @{
+                tool = $ToolName
+                before = $CurrentVersion
+                target = $TargetVersion
+                error = $_.Exception.Message
+            }
+            try {
+                & $RollbackAction $CurrentVersion $TargetVersion
+                Update-SessionPath
+                $rolledBackVersion = & $SmokeAction $CurrentVersion $CurrentVersion
+                if ([string]::IsNullOrWhiteSpace($rolledBackVersion)) {
+                    $rolledBackVersion = $CurrentVersion
+                }
+                if ($rolledBackVersion -ne $CurrentVersion) {
+                    throw "$ToolName rollback smoke validation reported version $rolledBackVersion, expected $CurrentVersion"
+                }
+                Write-Json -Level warn -Message "$ToolName rolled back to $CurrentVersion after failed update" -Extra @{
+                    tool = $ToolName
+                    before = $CurrentVersion
+                    target = $TargetVersion
+                    after = $rolledBackVersion
+                    rolledBack = $true
+                }
+            } catch {
+                throw "$ToolName update to $TargetVersion failed and rollback to $CurrentVersion was not clean: $($_.Exception.Message)"
+            }
+        }
+        throw
+    }
+}
+
+function Invoke-UvUpdate {
+    $current = Get-ToolVersion -Name 'uv'
+    $target = Get-UvCompatibleTargetVersion
+    return Invoke-CompatibilityCheckedUpdateStep -ToolName 'uv' -CurrentVersion $current -TargetVersion $target `
+        -InstallAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-UvSelfUpdate -TargetVersion $TargetVersion
+        } `
+        -SmokeAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Test-UvSmoke -ExpectedVersion $TargetVersion
+        } `
+        -RollbackAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-UvSelfUpdate -TargetVersion $CurrentVersion
+        }
+}
+
+function Invoke-OllamaUpdate {
+    $current = Get-ToolVersion -Name 'ollama'
+    $target = Get-OllamaCompatibleTargetVersion
+    return Invoke-CompatibilityCheckedUpdateStep -ToolName 'ollama' -CurrentVersion $current -TargetVersion $target `
+        -InstallAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-OllamaUpgrade -TargetVersion $TargetVersion
+        } `
+        -SmokeAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Test-OllamaSmoke -ExpectedVersion $TargetVersion
+        } `
+        -RollbackAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-OllamaUpgrade -TargetVersion $CurrentVersion
+        }
+}
+
+function Invoke-AiPoweredUpdate {
+    $current = Get-NpmGlobalPackageVersion -PackageName 'ai-powered'
+    $target = Get-PinnedAiPoweredVersion
+    return Invoke-CompatibilityCheckedUpdateStep -ToolName 'ai-powered' -CurrentVersion $current -TargetVersion $target `
+        -InstallAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-AiPoweredInstall -TargetVersion $TargetVersion
+        } `
+        -SmokeAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Test-AiPoweredSmoke -ExpectedVersion $TargetVersion
+        } `
+        -RollbackAction {
+            param([string]$TargetVersion, [string]$CurrentVersion)
+            Invoke-AiPoweredInstall -TargetVersion $CurrentVersion
+        }
+}
+
 function Invoke-Update {
-    Write-Json -Level info -Message 'Upgrading uv via self update'
-    if (Test-CommandOnPath 'uv') {
-        & uv self update 2>&1 | Out-Null
-    }
+    $results = @()
+
+    Write-Json -Level info -Message 'Updating uv on its current compatibility line'
+    $results += Invoke-UvUpdate
+
     if ($Provider -eq 'ollama') {
-        Write-Json -Level info -Message 'Upgrading Ollama via winget'
-        Invoke-Winget @('upgrade', '--id', 'Ollama.Ollama', '--silent',
-            '--accept-package-agreements', '--accept-source-agreements',
-            '--disable-interactivity') | Out-Null
+        Write-Json -Level info -Message 'Updating Ollama on its current compatibility line'
+        $results += Invoke-OllamaUpdate
+    } else {
+        $results += [pscustomobject]@{
+            tool = 'ollama'
+            before = $null
+            target = $null
+            after = $null
+            updated = $false
+            rolledBack = $false
+            skipped = $true
+            reason = "Provider '$Provider' does not use Ollama"
+        }
+        Write-Json -Level info -Message "Skipping Ollama update because provider '$Provider' does not use Ollama" -Extra @{
+            tool = 'ollama'
+            provider = $Provider
+        }
     }
-    Write-Json -Level info -Message 'Upgrading ai-powered via npm -g'
-    if (Test-CommandOnPath 'npm') {
-        & npm install -g ai-powered@latest | Out-Null
-    }
-    Update-SessionPath
+
+    Write-Json -Level info -Message 'Updating ai-powered to the pinned package-lock version'
+    $results += Invoke-AiPoweredUpdate
+
     if ($Provider -eq 'ollama') {
         Start-OllamaServer
         Write-Json -Level info -Message "Re-pulling model $Model"
-        & ollama pull $Model
-        if ($LASTEXITCODE -ne 0) {
-            throw "ollama pull $Model failed (exit $LASTEXITCODE)"
+        Sync-OllamaModel
+    }
+
+    $summary = ($results | ForEach-Object {
+        if ($_.PSObject.Properties.Match('skipped').Count -gt 0 -and $_.skipped) {
+            "ollama skipped ($($_.reason))"
+        } elseif ($_.updated) {
+            "$($_.tool) $($_.before) -> $($_.after)"
+        } else {
+            "$($_.tool) left at $($_.after)"
         }
+    }) -join '; '
+    Write-Json -Level info -Message "Update summary: $summary" -Extra @{
+        summary = $summary
+        steps = $results
+    }
+    return [pscustomobject]@{ Summary = $summary; Steps = $results }
+}
+
+function Add-RunLogReason {
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][string]$Property,
+        [Parameter(Mandatory)][string]$Reason
+    )
+    $current = @($Entry.$Property)
+    if ($current -notcontains $Reason) {
+        $Entry.$Property = @($current + $Reason)
+    }
+}
+
+function Get-RunLogMetadata {
+    param([Parameter(Mandatory)][System.IO.FileInfo]$FileInfo)
+    $exitCode = $null
+    try {
+        foreach ($line in Get-Content -LiteralPath $FileInfo.FullName -Encoding UTF8 -ErrorAction Stop) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try {
+                $record = $line | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                continue
+            }
+            if ($record.PSObject.Properties['msg'] -and $record.msg -eq 'Workload finished' -and
+                $record.PSObject.Properties['exitCode']) {
+                $exitCode = [int]$record.exitCode
+            }
+        }
+    } catch {
+        # Missing or partial logs should be treated as failures so the
+        # diagnostic evidence stays available for triage.
+    }
+    $outcome = if ($null -eq $exitCode -or $exitCode -ne 0) { 'failure' } else { 'success' }
+    return [pscustomobject]@{
+        Name             = $FileInfo.Name
+        FullName         = $FileInfo.FullName
+        LastWriteTimeUtc = $FileInfo.LastWriteTimeUtc
+        ExitCode         = $exitCode
+        Outcome          = $outcome
+    }
+}
+
+function Get-RunLogRetentionPlan {
+    param(
+        [string]$LogDir = $Script:LogDir,
+        [int]$LogRetentionCount = $Script:LogRetentionCount,
+        [int]$LogRetentionDays = $Script:LogRetentionDays
+    )
+    $cutoffUtc = (Get-Date).ToUniversalTime().AddDays(-$LogRetentionDays)
+    $files = @()
+    if (Test-Path -LiteralPath $LogDir) {
+        $files = Get-ChildItem -LiteralPath $LogDir -Filter 'autoresearch-run-*.jsonl' -File -ErrorAction SilentlyContinue |
+            Sort-Object `
+                @{ Expression = 'LastWriteTimeUtc'; Descending = $true }, `
+                @{ Expression = 'Name'; Descending = $true }
+    }
+
+    $entries = foreach ($file in @($files)) {
+        $meta = Get-RunLogMetadata -FileInfo $file
+        [pscustomobject]@{
+            Name             = $meta.Name
+            Path             = $meta.FullName
+            LastWriteTimeUtc = $meta.LastWriteTimeUtc
+            ExitCode         = $meta.ExitCode
+            Outcome          = $meta.Outcome
+            KeepReasons      = @()
+            DeleteReasons    = @()
+        }
+    }
+
+    if (-not $entries) {
+        return [pscustomobject]@{
+            LogDir         = $LogDir
+            CutoffUtc      = $cutoffUtc
+            RetentionCount = $LogRetentionCount
+            RetentionDays  = $LogRetentionDays
+            Entries        = @()
+            Kept           = @()
+            Pruned         = @()
+            LatestSuccess  = $null
+            LatestFailure  = $null
+        }
+    }
+
+    $recentEntries = @($entries | Where-Object { $_.LastWriteTimeUtc -ge $cutoffUtc })
+    $olderEntries = @($entries | Where-Object { $_.LastWriteTimeUtc -lt $cutoffUtc })
+    $olderKept = @($olderEntries | Select-Object -First $LogRetentionCount)
+    $latestSuccess = $entries | Where-Object { $_.Outcome -eq 'success' } | Select-Object -First 1
+    $latestFailure = $entries | Where-Object { $_.Outcome -eq 'failure' } | Select-Object -First 1
+
+    foreach ($entry in $recentEntries) {
+        Add-RunLogReason -Entry $entry -Property 'KeepReasons' -Reason 'within-age-window'
+    }
+    foreach ($entry in $olderKept) {
+        Add-RunLogReason -Entry $entry -Property 'KeepReasons' -Reason 'within-old-log-cap'
+    }
+    if ($latestSuccess) {
+        Add-RunLogReason -Entry $latestSuccess -Property 'KeepReasons' -Reason 'latest-success'
+    }
+    if ($latestFailure) {
+        Add-RunLogReason -Entry $latestFailure -Property 'KeepReasons' -Reason 'latest-failure'
+    }
+
+    foreach ($entry in $entries) {
+        if (@($entry.KeepReasons).Count -eq 0) {
+            Add-RunLogReason -Entry $entry -Property 'DeleteReasons' -Reason 'older-than-age-window'
+            Add-RunLogReason -Entry $entry -Property 'DeleteReasons' -Reason 'beyond-old-log-cap'
+        }
+    }
+
+    return [pscustomobject]@{
+        LogDir         = $LogDir
+        CutoffUtc      = $cutoffUtc
+        RetentionCount = $LogRetentionCount
+        RetentionDays  = $LogRetentionDays
+        Entries        = @($entries)
+        Kept           = @($entries | Where-Object { @($_.KeepReasons).Count -gt 0 })
+        Pruned         = @($entries | Where-Object { @($_.KeepReasons).Count -eq 0 })
+        LatestSuccess  = $latestSuccess
+        LatestFailure  = $latestFailure
     }
 }
 
 function Limit-RunLogs {
-    if (-not (Test-Path -LiteralPath $LogDir)) { return }
-    $files = Get-ChildItem -LiteralPath $LogDir -Filter 'autoresearch-run-*.jsonl' -File -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTimeUtc -Descending
-    if (-not $files -or $files.Count -le $Script:LogRetention) { return }
-    $files | Select-Object -Skip $Script:LogRetention | ForEach-Object {
-        Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+    param(
+        [string]$LogDir = $Script:LogDir,
+        [int]$LogRetentionCount = $Script:LogRetentionCount,
+        [int]$LogRetentionDays = $Script:LogRetentionDays
+    )
+    $plan = Get-RunLogRetentionPlan -LogDir $LogDir -LogRetentionCount $LogRetentionCount -LogRetentionDays $LogRetentionDays
+    if (-not $plan.Pruned -or $plan.Pruned.Count -eq 0) { return $plan }
+
+    $deleted = New-Object System.Collections.Generic.List[object]
+    $failed = New-Object System.Collections.Generic.List[object]
+
+    foreach ($entry in $plan.Pruned) {
+        try {
+            Remove-Item -LiteralPath $entry.Path -Force -ErrorAction Stop
+            $deleted.Add($entry) | Out-Null
+        } catch {
+            $failed.Add([pscustomobject]@{
+                Name    = $entry.Name
+                Path    = $entry.Path
+                Reasons = @($entry.DeleteReasons)
+                Error   = $_.Exception.Message
+            }) | Out-Null
+        }
+    }
+
+    $deletedSummary = @()
+    foreach ($item in $deleted) {
+        $deletedSummary += [pscustomobject]@{
+            name    = $item.Name
+            reasons = @($item.DeleteReasons)
+        }
+    }
+
+    $failedSummary = @()
+    foreach ($item in $failed) {
+        $failedSummary += $item
+    }
+
+    $summary = [pscustomobject]@{
+        eligibleCount  = $plan.Pruned.Count
+        deletedCount   = $deleted.Count
+        failedCount    = $failed.Count
+        retentionCount = $LogRetentionCount
+        retentionDays  = $LogRetentionDays
+        cutoffUtc      = $plan.CutoffUtc.ToString('o')
+        latestSuccess  = if ($plan.LatestSuccess) { $plan.LatestSuccess.Name } else { $null }
+        latestFailure  = if ($plan.LatestFailure) { $plan.LatestFailure.Name } else { $null }
+        deleted        = $deletedSummary
+        failed         = $failedSummary
+    }
+
+    $summaryLevel = if ($failed.Count -gt 0) { 'warn' } else { 'info' }
+    $summaryMessage = "Run log pruning reviewed $($plan.Entries.Count) file(s); deleted $($deleted.Count) and failed to delete $($failed.Count)."
+    if ($plan.LatestSuccess -or $plan.LatestFailure) {
+        $anchorBits = @()
+        if ($plan.LatestSuccess) { $anchorBits += "latest success=$($plan.LatestSuccess.Name)" }
+        if ($plan.LatestFailure) { $anchorBits += "latest failure=$($plan.LatestFailure.Name)" }
+        $summaryMessage += " Anchors kept: $($anchorBits -join '; ')."
+    }
+
+    try {
+        Write-Json -Level $summaryLevel -Message $summaryMessage -Extra @{
+            pruning = $summary
+        }
+    } catch {
+        Write-Host "[$summaryLevel] $summaryMessage"
+    }
+
+    return [pscustomobject]@{
+        Plan    = $plan
+        Deleted = $deletedSummary
+        Failed  = $failedSummary
+        Summary = $summary
     }
 }
 
@@ -1165,34 +1842,139 @@ function ConvertTo-WeekdayMask {
 function Get-TaskLauncherPlan {
     $pwshPath = Get-PwshExePath
     $scriptPath = $Script:CanonicalScript
+    $commonArgs = @(
+        '-Provider', $Provider,
+        '-Model', $Model,
+        '-SchedulerPolicy', $SchedulerPolicy,
+        '-MaxLoopMinutes', $MaxLoopMinutes,
+        '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes
+    )
+    if ($Provider -eq 'ollama') {
+        $commonArgs += @('-OllamaHost', $OllamaHost)
+    }
+    if ($NoAiEdit) {
+        $commonArgs += '-NoAiEdit'
+    }
 
-    # Build the inner argument list for the autoresearch loop invocation. Using
-    # an array literal avoids quoting ambiguity when embedded inside the
-    # base64-encoded Start-Process command below.
-    $innerArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
-                      '-NoGui', '-RunLoop', '-Provider', $Provider, '-Model', $Model,
-                      '-SchedulerPolicy', $SchedulerPolicy,
-                      '-MaxLoopMinutes', $MaxLoopMinutes,
-                      '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes)
-    if ($Provider -eq 'ollama') { $innerArgList += @('-OllamaHost', $OllamaHost) }
-    if ($NoAiEdit) { $innerArgList += '-NoAiEdit' }
-    $innerArgArray = ($innerArgList | ForEach-Object { "'$_'" }) -join ','
-
-    # Wrap the invocation in Start-Process so the task action exits immediately
-    # and the training script runs in its own detached process.
-    $spCommand = "Start-Process -FilePath '$pwshPath' -ArgumentList @($innerArgArray) -WindowStyle Hidden"
-    $spBytes   = [System.Text.Encoding]::Unicode.GetBytes($spCommand)
-    $spEncoded = [Convert]::ToBase64String($spBytes)
-    $argument  = "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $spEncoded"
+    $childArgList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
+                      '-NoGui', '-RunLoop') + $commonArgs
+    $taskArgList  = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $scriptPath,
+                      '-NoGui', '-TaskSupervisor') + $commonArgs
+    $childArgs = Format-CommandLineArgumentList -Arguments $childArgList
+    $taskArgs  = Format-CommandLineArgumentList -Arguments $taskArgList
 
     return [pscustomobject]@{
-        PwshPath        = $pwshPath
-        ScriptPath      = $scriptPath
-        InnerArgList    = $innerArgList
-        StartProcess    = $spCommand
-        EncodedArgument = $argument
-        WorkloadCommand = "$pwshPath $($innerArgList -join ' ')"
+        PwshPath               = $pwshPath
+        ScriptPath             = $scriptPath
+        InnerArgList           = $childArgList
+        TaskActionArgList      = $taskArgList
+        TaskActionArguments    = $taskArgs
+        TaskActionCommand      = Format-CommandLine -FilePath $pwshPath -Arguments $taskArgList
+        WorkloadArguments      = $childArgs
+        WorkloadCommand        = Format-CommandLine -FilePath $pwshPath -Arguments $childArgList
+        TaskLaunchStatePath    = (Get-TaskLaunchStatePath)
     }
+}
+
+function Invoke-TaskLaunchSupervisor {
+    $plan = Get-TaskLauncherPlan
+    $parentCommandLine = Get-CurrentProcessCommandLine
+    if ([string]::IsNullOrWhiteSpace($parentCommandLine)) {
+        $parentCommandLine = $plan.TaskActionCommand
+    }
+    $parentCommandLine = Get-RedactedTaskLaunchCommandLine -CommandLine $parentCommandLine
+
+    $state = [ordered]@{
+        schemaVersion      = 1
+        startedUtc         = (Get-Date).ToUniversalTime().ToString('o')
+        status             = 'starting'
+        parentPid          = $PID
+        parentCommandLine  = $parentCommandLine
+        childPid           = $null
+        childCommandLine   = $plan.WorkloadCommand
+        taskActionCommand  = $plan.TaskActionCommand
+        childExitCode      = $null
+        finishedUtc        = $null
+        provider           = $Provider
+        model              = $Model
+        schedulerPolicy    = $SchedulerPolicy
+        repoRoot           = $RepoRoot
+        logDir             = $LogDir
+        statePath          = $plan.TaskLaunchStatePath
+    }
+    Write-TaskLaunchState -State $state
+    Write-Json -Level info -Message 'Task supervisor launching hidden run-loop child' -Extra @{
+        parentPid         = $PID
+        childCommand      = $plan.WorkloadCommand
+        taskActionCommand = $plan.TaskActionCommand
+        statePath         = $plan.TaskLaunchStatePath
+        schedulerPolicy   = $SchedulerPolicy
+    }
+
+    try {
+        $child = Start-Process -FilePath $plan.PwshPath -ArgumentList $plan.InnerArgList `
+            -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru -Wait
+    } catch {
+        $state.status = 'spawn-failed'
+        $state.finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $state.failure = $_.Exception.Message
+        Write-TaskLaunchState -State $state
+        Write-Json -Level error -Message "Task supervisor failed to start hidden child: $($_.Exception.Message)" -Extra @{
+            statePath       = $plan.TaskLaunchStatePath
+            childCommand    = $plan.WorkloadCommand
+            taskActionCommand = $plan.TaskActionCommand
+        }
+        return 1
+    }
+
+    $state.childPid = $child.Id
+    $state.status = 'running'
+    $state.startedChildUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Write-TaskLaunchState -State $state
+    Write-Json -Level info -Message 'Task supervisor child started' -Extra @{
+        childPid        = $child.Id
+        childCommand    = $plan.WorkloadCommand
+        statePath       = $plan.TaskLaunchStatePath
+    }
+
+    $exitCode = 1
+    try {
+        try { $child.Refresh() } catch { }
+        $exitCode = [int]$child.ExitCode
+    } catch {
+        $state.status = 'wait-failed'
+        $state.finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        $state.failure = $_.Exception.Message
+        Write-TaskLaunchState -State $state
+        Write-Json -Level error -Message "Task supervisor could not read hidden child exit code: $($_.Exception.Message)" -Extra @{
+            childPid      = $child.Id
+            statePath     = $plan.TaskLaunchStatePath
+            childCommand  = $plan.WorkloadCommand
+        }
+        return 1
+    }
+
+    $state.childExitCode = $exitCode
+    $state.finishedUtc = (Get-Date).ToUniversalTime().ToString('o')
+    $state.status = if ($exitCode -eq 0) { 'succeeded' } else { 'failed' }
+    Write-TaskLaunchState -State $state
+    if ($exitCode -eq 0) {
+        Write-Json -Level info -Message 'Task supervisor child exited successfully' -Extra @{
+            childPid     = $child.Id
+            exitCode     = $exitCode
+            childCommand = $plan.WorkloadCommand
+            statePath    = $plan.TaskLaunchStatePath
+        }
+    } else {
+        Write-Json -Level error -Message 'Task supervisor child exited with failure' -Extra @{
+            childPid     = $child.Id
+            exitCode     = $exitCode
+            childCommand = $plan.WorkloadCommand
+            statePath    = $plan.TaskLaunchStatePath
+        }
+    }
+
+    return $exitCode
 }
 
 function Get-ScheduledTaskDescription {
@@ -1361,7 +2143,7 @@ function Get-TaskXml {
 
     $action = $task.Actions.Create(0)
     $action.Path = $plan.PwshPath
-    $action.Arguments = $plan.EncodedArgument
+    $action.Arguments = $plan.TaskActionArguments
     $action.WorkingDirectory = $RepoRoot
 
     return $task.XmlText
@@ -1416,8 +2198,9 @@ function Register-LauncherTask {
         idleMinutes          = if ($policy.UsesIdleGate) { 5 } else { $null }
         idleWaitMinutes      = if ($policy.UsesIdleGate) { 60 } else { $null }
         ownProcess           = $true
-        launcherCommand      = "$($plan.PwshPath) $($plan.EncodedArgument)"
+        launcherCommand      = $plan.TaskActionCommand
         workloadCommand      = $plan.WorkloadCommand
+        taskLaunchState      = $plan.TaskLaunchStatePath
     }
 }
 
@@ -1848,7 +2631,10 @@ try {
             $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
         }
     }
-    $actionGiven = ($RegisterTask -or $RunNow -or $RunLoop -or $Unregister -or $Update)
+    $actionGiven = ($RegisterTask -or $RunNow -or $RunLoop -or $Unregister -or $Update -or $TaskSupervisor)
+    if ($TaskSupervisor -and ($RegisterTask -or $RunNow -or $RunLoop -or $Unregister -or $Update)) {
+        throw '-TaskSupervisor cannot be combined with other action switches.'
+    }
     if (-not $NoGui -and -not $actionGiven) {
         $gui = Show-LaunchGui
         if (-not $gui) { exit 0 }
@@ -1865,6 +2651,10 @@ try {
     if ($Unregister) {
         Unregister-LauncherTask
         exit 0
+    }
+    if ($TaskSupervisor) {
+        $code = Invoke-TaskLaunchSupervisor
+        exit ([int]$code)
     }
     Invoke-Preflight
     if ($Update) {

@@ -450,7 +450,8 @@ def has_ve(layer_idx, n_layer):
 
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
+    if x.ndim != 4:
+        raise ValueError(f"Expected x.ndim == 4 for rotary embeddings, got shape {tuple(x.shape)}.")
     d = x.shape[3] // 2
     x1, x2 = x[..., :d], x[..., d:]
     y1 = x1 * cos + x2 * sin
@@ -464,10 +465,20 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
         self.attention_backend = config.attention_backend
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        if self.n_head <= 0:
+            raise ValueError(f"n_head must be positive, got {self.n_head}.")
+        if self.n_kv_head <= 0:
+            raise ValueError(f"n_kv_head must be positive, got {self.n_kv_head}.")
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(
+                f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})."
+            )
+        if self.n_kv_head > self.n_head or self.n_head % self.n_kv_head != 0:
+            raise ValueError(
+                f"n_kv_head ({self.n_kv_head}) must be <= n_head ({self.n_head}) and divide it evenly."
+            )
+        self.head_dim = self.n_embd // self.n_head
         self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -618,7 +629,10 @@ class GPT(nn.Module):
 
     def _compute_window_sizes(self, config):
         pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
+        if not pattern or any(c not in "SL" for c in pattern):
+            raise ValueError(
+                f"window_pattern must be a non-empty string containing only 'S' and 'L', got {config.window_pattern!r}."
+            )
         long_window = config.sequence_len
         short_window = long_window // 2
         char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
@@ -714,7 +728,10 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, reduction="mean"):
         B, T = idx.size()
-        assert T <= self.cos.size(1)
+        if T > self.cos.size(1):
+            raise ValueError(
+                f"Sequence length {T} exceeds rotary embedding limit {self.cos.size(1)}."
+            )
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
         x = self.transformer.wte(idx)

@@ -18,31 +18,27 @@ The idea: give an AI agent a small but real LLM training setup and let it experi
 - The original Linux/H100-oriented path from upstream is removed in this fork and is not supported here.
 - If you need the upstream Linux/H100 path, use [karpathy/autoresearch](https://github.com/karpathy/autoresearch).
 
-## Quick Start: `launch.ps1` GUI (remote one-liner)
+## Quick Start: `launch.ps1` GUI (recommended local clone)
 
-Either command below installs this repo to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\` and immediately runs `scripts\launch.ps1` from that location, **opening the WPF GUI launcher** (the easiest way to pick a provider, model, schedule, policy, and action). Any extra CLI arguments are forwarded verbatim to the relaunched script; pass `-NoGui` with explicit action switches for CLI-only use, and add `-SchedulerPolicy Unattended` when you want the registered task to run without an active desktop session (see [How `launch.ps1` Works](#how-launchps1-works)).
+Clone the repo locally, inspect `scripts\launch.ps1`, and launch from your checkout. That gives you the same WPF GUI and the same canonical install path `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\`, but only after the launcher is already on your machine and visible for review. Any extra CLI arguments are forwarded verbatim to the launched script; pass `-NoGui` with explicit action switches for CLI-only use, and add `-SchedulerPolicy Unattended` when you want the registered task to run without an active desktop session (see [How `launch.ps1` Works](#how-launchps1-works)).
 
-- **PowerShell:**
+- **Local clone and launch:**
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1 | iex"
-  ```
-
-- **CMD:**
-
-  ```cmd
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr 'https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1' | iex"
+  git clone https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git
+  cd autoresearch-win-rtx-scheduled
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch.ps1
   ```
 
 See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-Powered Features](#ai-powered-features) for provider/model configuration.
 
 ## How `launch.ps1` Works
 
-- **Self-installing.** On every invocation, `launch.ps1` checks whether it is running from the canonical install path `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.ps1`. If not (including when sourced via `iwr ... | iex`), it ensures `git` is on PATH (installing via `winget install --id Git.Git` if missing), clones (or `git pull --ff-only` updates) the repo into the canonical path, then re-launches itself from there forwarding all CLI arguments.
+- **Self-installing from a local launch.** On every invocation, `launch.ps1` checks whether it is running from the canonical install path `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.ps1`. If not, it ensures `git` is on PATH (installing via `winget install --id Git.Git` if missing), clones (or `git pull --ff-only` updates) the repo into the canonical path, then re-launches itself from there forwarding all CLI arguments. The recommended first run is a local checkout so you can inspect the launcher before any self-install or update work happens.
 - **Interactive WPF GUI (default).** With no action switch and without `-NoGui`, a WPF launcher window appears with radio buttons for the action (Preflight only, Run training now, Register scheduled task, Register task and run now, Unregister scheduled task, Update toolchain), an [AI Provider](#ai-powered-features) group (Ollama, OpenAI, Anthropic, Azure OpenAI) and a dependent model dropdown, an editable Ollama-host combo (enabled only for Ollama), a scheduler policy group with explicit interactive / idle-only / unattended choices, Azure endpoint/deployment fields (shown only for Azure), schedule frequency/time dropdowns (Weekly switches the time dropdown to weekday names), a masked `PasswordBox` for API keys, an "Enable Task Scheduler history" checkbox, and **OK / Cancel / Save as Defaults** buttons. Save-as-Defaults persists selections (excluding the API key) to `%HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\scripts\launch.json`. This file is human-readable JSON and is auto-created with current values on first run if missing; both the GUI and `-NoGui` CLI read it so the two surfaces behave identically (explicit CLI parameters always override stored values).
-- **Headless / preflight modes.** Pass `-NoGui` with explicit action switches (`-RunNow`, `-RunLoop`, `-RegisterTask`, `-Unregister`, `-Update`) plus provider/model/schedule/policy parameters to run from the CLI without the WPF window. `-NoGui` with **no** action switch performs preflight only (verify tools, install if missing, ensure `.venv` via `uv sync`, start Ollama and pull the model when Ollama is selected), prints next-step hints, and exits 0. `-RegisterTask` and `-RunNow` can be combined to both schedule and run immediately. `-Unregister` removes the task and exits before preflight. The scheduled task invokes the script in `-NoGui -RunLoop` form with the chosen provider, model, and scheduler policy; `-SchedulerPolicy Unattended` uses S4U logon so the task can run without an active desktop session, while `-SchedulerPolicy IdleOnly` keeps the logged-on idle wait window and logs skips if the window expires.
-- **`-Update` action.** Runs `uv self update`, `winget upgrade --id Ollama.Ollama` (Ollama provider only), and `npm install -g ai-powered@latest`, refreshes the session `PATH`, then restarts the Ollama daemon and re-pulls `-Model` when Ollama is selected. Combinable with `-RegisterTask` and/or `-RunNow`.
-- **Per-run logs with pruning.** Each Python run writes to `%HOMEDRIVE%\myTech.Today\logs\autoresearch-run-<yyyyMMdd-HHmmss>.jsonl` (local time). After each run, only the **10 newest** `autoresearch-run-*.jsonl` files are retained; older ones are deleted. The aggregate append-only log `%HOMEDRIVE%\myTech.Today\logs\autoresearch.jsonl` is never rotated. Both surfaces capture timestamped `info`/`warn`/`error`/`stdout`/`stderr` JSON lines (UTC `ts`).
+- **Headless / preflight modes.** Pass `-NoGui` with explicit action switches (`-RunNow`, `-RunLoop`, `-RegisterTask`, `-Unregister`, `-Update`) plus provider/model/schedule/policy parameters to run from the CLI without the WPF window. `-NoGui` with **no** action switch performs preflight only (verify tools, install if missing, ensure `.venv` via `uv sync`, start Ollama and pull the model when Ollama is selected), prints next-step hints, and exits 0. `-RegisterTask` and `-RunNow` can be combined to both schedule and run immediately. `-Unregister` removes the task and exits before preflight. The scheduled task now invokes the script in `-NoGui -TaskSupervisor` form; that supervisor launches the hidden `-RunLoop` child, records the child PID, redacted command line, and exit code in `%HOMEDRIVE%\myTech.Today\logs\autoresearch-task-launch.json`, and exits with the child code. `-SchedulerPolicy Unattended` uses S4U logon so the task can run without an active desktop session, while `-SchedulerPolicy IdleOnly` keeps the logged-on idle wait window and logs skips if the window expires.
+- **`-Update` action.** Runs compatibility-checked updates in place: `uv self update` stays on the current minor line, `winget upgrade --id Ollama.Ollama --version <compatible patch>` stays on the current Ollama line when the provider is Ollama, and `npm install -g ai-powered@<package-lock pin>` installs the pinned CLI version. The launcher refreshes the session `PATH`, runs a smoke check after each step, rolls back a failed step before continuing, then restarts the Ollama daemon and re-pulls `-Model` when Ollama is selected. Combinable with `-RegisterTask` and/or `-RunNow`.
+- **Per-run logs with pruning.** Each Python run writes to `%HOMEDRIVE%\myTech.Today\logs\autoresearch-run-<yyyyMMdd-HHmmss>.jsonl` (local time). Retention is hybrid: keep anything newer than 14 days, keep up to 25 older `autoresearch-run-*.jsonl` files, and always preserve the most recent successful run plus the most recent failure when available. The aggregate append-only log `%HOMEDRIVE%\myTech.Today\logs\autoresearch.jsonl` is never rotated, so it remains a companion diagnostic stream rather than the only record. Both surfaces capture timestamped `info`/`warn`/`error`/`stdout`/`stderr` JSON lines (UTC `ts`).
 - **Scheduled task is a first-class object.** The task is registered via `Register-ScheduledTask` into the visible `\myTech.Today\` folder as `Autoresearch-Train`, with `-SchedulerPolicy` controlling whether the principal is interactive, idle-only, or unattended. `Interactive` and `IdleOnly` use `InteractiveToken`, while `Unattended` uses `S4U`; `IdleOnly` keeps the launcher-enforced 5-minute idle gate with a 1-hour wait window and logs the skip reason if the window expires. The task uses only GUI-roundtrippable `New-ScheduledTaskSettingsSet` options: `-StartWhenAvailable`, `-AllowStartIfOnBatteries`, `-DontStopIfGoingOnBatteries`, `-RestartCount 3`, `-RestartInterval 5m`, `-MultipleInstances IgnoreNew`. `-ScheduleTime` is polymorphic: in `Hourly` mode it is a minute-of-hour offset (`':00'`..`':50'` in 10-minute steps, default `':00'`); in `Daily` mode it is a local 24-hour time-of-day (`'00:00'`..`'23:45'` in 15-minute steps, default `'18:00'`); in `Weekly` mode it is a weekday name (`'Sunday'`..`'Saturday'`, default `'Sunday'`) and the trigger fires that day at 03:00 local. The GUI repurposes the time dropdown and its label to match. The task is not hidden, is fully editable in `taskschd.msc` (no greyed-out controls), and the trigger/action/principal reflect the GUI/CLI selections. Task history is enabled by default via `wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true` (requires elevation; a warning is logged if elevation is unavailable).
 
 ### `launch.ps1` parameter reference
@@ -55,7 +51,9 @@ See [How `launch.ps1` Works](#how-launchps1-works) for behavior details and [AI-
 | `-ApiKey` | string | _(empty)_ | Provider key; mapped to `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `AZURE_OPENAI_API_KEY`. Never persisted. |
 | `-AzureEndpoint` / `-AzureDeployment` | string | _(empty)_ | Azure-only; exported as `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_DEPLOYMENT`. |
 | `-RepoRoot` | path | parent of `scripts\` | Repo containing `train.py`; `.venv` is auto-created via `uv sync` if missing. |
-| `-LogDir` | path | `%HOMEDRIVE%\myTech.Today\logs` | Destination for aggregate + per-run JSONL logs. |
+| `-LogDir` | path | `%HOMEDRIVE%\myTech.Today\logs` | Destination for aggregate + per-run JSONL logs. Hybrid pruning is controlled by `-LogRetentionDays` and `-LogRetentionCount`. |
+| `-LogRetentionDays` | number | `14` | Keeps recent per-run logs for this many days before count-based rotation applies. |
+| `-LogRetentionCount` | number | `25` | Keeps this many older per-run logs, while always preserving the latest success and latest failure. |
 | `-ScheduleFrequency` | `Hourly` \| `Daily` \| `Weekly` | `Daily` | Trigger cadence for `-RegisterTask`. |
 | `-ScheduleTime` | depends on `-ScheduleFrequency` (see [Scheduling](#scheduling)) | frequency-specific (`':00'` / `'18:00'` / `'Sunday'`) | Polymorphic schedule slot; validated against the active frequency at runtime. |
 | `-SchedulerPolicy` | `Interactive` \| `IdleOnly` \| `Unattended` | `IdleOnly` | Chooses the task logon mode and idle behavior. |
@@ -129,7 +127,7 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 ```powershell
 
 # 1. Install uv project manager (if you don't already have it)
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+winget install --id=astral-sh.uv -e
 
 # 2. Install dependencies
 uv sync
@@ -169,6 +167,9 @@ After that, run the test file directly with the same host:
 powershell -NoProfile -File tests/launch.Tests.ps1
 pwsh -NoProfile -File tests/launch.Tests.ps1
 ```
+
+You can also run the same suite through npm with `npm run test:powershell`,
+or include it in the standard aggregated check with `npm test`.
 
 If the module is still wrong or missing, the test file now prints a setup
 message that names the required version and the exact install command.

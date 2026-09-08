@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>autoresearch-win-rtx-scheduled Pre-mortem Review, 2026-09-07 22:34:37</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe6;
+      --panel: #fffdf8;
+      --panel-2: #fbf7f0;
+      --ink: #1f2933;
+      --muted: #5b6670;
+      --line: #d8ccb9;
+      --accent: #255b57;
+      --accent-2: #6f5b35;
+      --core: #7a1f2b;
+      --additional: #4a5e7a;
+      --critical: #8a2d33;
+      --high: #8a5a2b;
+      --medium: #4f6d82;
+      --low: #306a4a;
+      --shadow: 0 10px 28px rgba(31, 41, 51, 0.06);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(37, 91, 87, 0.08), transparent 30%),
+        radial-gradient(circle at top right, rgba(122, 31, 43, 0.06), transparent 24%),
+        linear-gradient(180deg, #f8f3ea 0%, var(--bg) 100%);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 24px 0 48px;
+    }
+
+    h1, h2, h3, h4 {
+      margin: 0 0 0.5rem;
+      line-height: 1.2;
+      font-family: Georgia, "Times New Roman", serif;
+    }
+
+    h1 { font-size: clamp(2rem, 4vw, 3.15rem); }
+    h2 { font-size: clamp(1.45rem, 2.3vw, 2rem); margin-top: 2rem; }
+    h3 { font-size: 1.28rem; }
+    h4 { font-size: 1.02rem; margin-top: 1rem; }
+
+    p { margin: 0 0 1rem; }
+    ul { margin: 0 0 1rem 1.25rem; padding: 0; }
+    li { margin: 0.28rem 0; }
+    a { color: var(--accent); }
+
+    .hero,
+    .section,
+    .issue,
+    .table-wrap {
+      background: rgba(255, 253, 248, 0.97);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero { padding: 24px; }
+
+    .lede {
+      max-width: 82ch;
+      font-size: 1.02rem;
+      color: var(--muted);
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .meta-card {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--muted);
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .value { word-break: break-word; }
+
+    .section {
+      margin-top: 20px;
+      padding: 20px 24px;
+    }
+
+    .table-wrap {
+      margin-top: 12px;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f0e8da;
+      font-size: 0.82rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+
+    .badge {
+      display: inline-block;
+      margin-right: 6px;
+      margin-bottom: 6px;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      font-size: 0.73rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      vertical-align: middle;
+    }
+
+    .badge-core {
+      color: var(--core);
+      background: rgba(122, 31, 43, 0.1);
+      border-color: rgba(122, 31, 43, 0.22);
+    }
+
+    .badge-additional {
+      color: var(--additional);
+      background: rgba(74, 94, 122, 0.1);
+      border-color: rgba(74, 94, 122, 0.2);
+    }
+
+    .badge-critical {
+      color: var(--critical);
+      background: rgba(138, 45, 51, 0.08);
+      border-color: rgba(138, 45, 51, 0.18);
+    }
+
+    .badge-high {
+      color: var(--high);
+      background: rgba(138, 90, 43, 0.1);
+      border-color: rgba(138, 90, 43, 0.2);
+    }
+
+    .badge-medium {
+      color: var(--medium);
+      background: rgba(79, 109, 130, 0.1);
+      border-color: rgba(79, 109, 130, 0.2);
+    }
+
+    .badge-low {
+      color: var(--low);
+      background: rgba(48, 106, 74, 0.1);
+      border-color: rgba(48, 106, 74, 0.2);
+    }
+
+    .issue {
+      margin-top: 18px;
+      padding: 20px 22px;
+      border-left: 6px solid var(--additional);
+    }
+
+    .issue.core { border-left-color: var(--core); }
+    .issue.additional { border-left-color: var(--additional); }
+
+    .issue-head {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 16px;
+      align-items: flex-start;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+
+    .issue-head > div { flex: 1 1 360px; }
+
+    .issue-summary {
+      color: var(--muted);
+      max-width: 92ch;
+    }
+
+    .issue ul {
+      margin-left: 1.2rem;
+    }
+
+    .prompt {
+      margin: 0.4rem 0 0;
+      padding: 12px 14px;
+      border-left: 4px solid var(--accent);
+      background: var(--panel-2);
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      font: 0.96rem/1.55 Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace;
+    }
+
+    .note { color: var(--muted); font-size: 0.95rem; }
+    .footnote { color: var(--muted); font-size: 0.93rem; }
+    .path, code { font-family: Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace; font-size: 0.94em; }
+
+    @media (max-width: 820px) {
+      main {
+        width: min(100% - 20px, 1180px);
+        padding-top: 12px;
+      }
+
+      .hero,
+      .section,
+      .issue { padding: 16px; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      main { width: 100%; padding: 0; }
+      .hero,
+      .section,
+      .issue,
+      .table-wrap { box-shadow: none; }
+      .table-wrap { overflow: visible; }
+      table { min-width: 0; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="hero">
+      <p class="note">Pre-mortem review, static and self-contained</p>
+      <h1>autoresearch-win-rtx-scheduled pre-mortem review</h1>
+      <p class="lede">
+        This report treats the repository as a Windows-first autonomous research wrapper with a PowerShell launcher, a Python training path, Node-based provider verification, and local PowerShell test harnesses. The findings focus on the failures most likely to waste GPU time, leak sensitive command lines, weaken recovery, or let regressions escape the current gates.
+      </p>
+      <div class="meta-grid" aria-label="Repository metadata">
+        <div class="meta-card"><span class="label">Project root</span><span class="value path">C:\GitHub\autoresearch\autoresearch-win-rtx-scheduled</span></div>
+        <div class="meta-card"><span class="label">Branch</span><span class="value">autoresearch/may30</span></div>
+        <div class="meta-card"><span class="label">Remote</span><span class="value">origin</span></div>
+        <div class="meta-card"><span class="label">Generated</span><span class="value">2026-09-07 22:34:37 local time</span></div>
+      </div>
+    </header>
+
+    <section class="section" id="summary">
+      <h2>Executive Summary</h2>
+      <p>
+        The highest-risk themes in this workspace are secret handling, bootstrap trust, PowerShell test drift, and recovery gaps. The launcher can persist raw command lines, the quick-start still normalizes remote code execution, and the current PowerShell suite already has failing tests around strict-mode fixtures, mock assertions, and log retention.
+      </p>
+      <p>
+        The source request did not enumerate the mandatory 10 core issues, so this report selected the first 10 through repository inspection and added 6 distinct additional risks. Each finding is grounded in files that exist in this workspace, and any inferential statement is marked as a testable assumption inside the relevant issue text.
+      </p>
+    </section>
+
+    <section class="section" id="scope">
+      <h2>Review Scope And Methodology</h2>
+      <p>
+        I treated the current working tree as authoritative, read the root <code>AGENTS.md</code>, checked the linked Augment extensions, and inspected the launcher, tests, docs, and build files that define the application surface. I then ran the local diagnostics that are safe for read-only verification.
+      </p>
+      <p>
+        No nested <code>AGENTS.md</code> files were present. The repository is a mixed PowerShell, Python, and Node project with no browser front end, so the review emphasizes launcher behavior, scheduled-task orchestration, state handling, observability, and test coverage.
+      </p>
+    </section>
+
+    <section class="section" id="input-resolution">
+      <h2>Input Resolution Note</h2>
+      <p>
+        The prompt referenced 10 mandatory issues but did not include the list itself. I resolved that by selecting the 10 highest-priority core issues from repository evidence, then adding 6 distinct follow-on risks that remain actionable and non-overlapping. That assumption is explicit in this document and can be tested by comparing the risk table against the article list below.
+      </p>
+    </section>
+
+    <section class="section" id="inventory">
+      <h2>Architecture And Runtime Inventory</h2>
+      <ul>
+        <li><strong>Runtime stack:</strong> PowerShell launcher and scheduler integration, Python training and data preparation, Node-based provider verification.</li>
+        <li><strong>Package managers:</strong> npm scripts, uv for Python environment management, and direct PowerShell execution for launcher tests.</li>
+        <li><strong>Lockfiles and manifests:</strong> <code>package.json</code>, <code>package-lock.json</code>, <code>pyproject.toml</code>, and <code>uv.lock</code>.</li>
+        <li><strong>Sensitive workflows:</strong> API key forwarding, hidden task supervision, self-install and update bootstrap, and Windows Task Scheduler registration.</li>
+        <li><strong>Persistence:</strong> launcher defaults in <code>scripts/launch.json</code>, run logs under <code>%HOMEDRIVE%\myTech.Today\logs</code>, and checkpoint artifacts under <code>artifacts/checkpoints</code>.</li>
+        <li><strong>Observability:</strong> JSONL logging in the launcher and checkpoint metadata in the training loop.</li>
+        <li><strong>Tests:</strong> Node provider checks, a wrapper smoke test, an acceptance harness, Pester-based launcher tests, and Python unittest coverage.</li>
+        <li><strong>CI:</strong> a Windows workflow exists, but it still skips the Python unittest suite.</li>
+      </ul>
+    </section>
+
+    <section class="section" id="diagnostics">
+      <h2>Diagnostics Executed</h2>
+      <div class="table-wrap">
+        <table class="command-table">
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>Outcome</th>
+              <th>Why it mattered</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>npm run verify:ai-provider</code></td>
+              <td>Passed. Provider verification reported that <code>ai-powered</code> is the only direct AI interface.</td>
+              <td>Confirms the Node gate still works for the files it scans.</td>
+            </tr>
+            <tr>
+              <td><code>npm run test:wrapper</code></td>
+              <td>Passed. The wrapper check validated the launcher contract and provider exclusivity.</td>
+              <td>Shows the outer launch wrapper is internally consistent.</td>
+            </tr>
+            <tr>
+              <td><code>npm run test:acceptance</code></td>
+              <td>Failed. The Pester suite passed 29 tests and failed 13, including strict-mode fixture errors and mock assertion failures.</td>
+              <td>This is the main live regression signal for the launcher test layer.</td>
+            </tr>
+            <tr>
+              <td><code>npm run test:powershell</code></td>
+              <td>Failed. The PowerShell suite passed 39 tests and failed 3, including update orchestration and log retention checks.</td>
+              <td>Shows the launcher regressions that the PowerShell gate still catches.</td>
+            </tr>
+            <tr>
+              <td><code>uv run python -m unittest discover -s tests -p 'test_*.py' -q</code></td>
+              <td>Passed. 34 Python tests completed successfully.</td>
+              <td>Shows the Python suite is healthy when it is run directly.</td>
+            </tr>
+            <tr>
+              <td><code>powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-launch-gui-layout.ps1</code></td>
+              <td>Passed. The parser and GUI layout smoke check completed.</td>
+              <td>Confirms the static launcher XAML still parses and the layout rules still hold.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="risk-table">
+      <h2>Prioritized Risk Table</h2>
+      <p class="note">Rows 1 through 10 are the selected core issues. Rows 11 through 16 are additional, distinct risks.</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Issue</th>
+              <th>Title</th>
+              <th>Kind</th>
+              <th>Severity</th>
+              <th>Likelihood</th>
+              <th>Impacted area</th>
+              <th>Priority</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr data-issue-id="issue-01"><td><a href="#issue-01">issue-01</a></td><td>Secret-bearing parent command line is persisted in task-launch state</td><td>Core</td><td>Critical</td><td>Likely</td><td>Security and privacy</td><td>1</td></tr>
+            <tr data-issue-id="issue-02"><td><a href="#issue-02">issue-02</a></td><td><code>tests/launch.Tests.ps1</code> leaves required script-scoped globals uninitialized, causing strict-mode failures</td><td>Core</td><td>High</td><td>Almost certain</td><td>PowerShell test reliability</td><td>2</td></tr>
+            <tr data-issue-id="issue-03"><td><a href="#issue-03">issue-03</a></td><td>Update orchestration tests still use <code>Assert-MockCalled</code>, which fails in the current Pester environment</td><td>Core</td><td>High</td><td>Almost certain</td><td>PowerShell test reliability</td><td>3</td></tr>
+            <tr data-issue-id="issue-04"><td><a href="#issue-04">issue-04</a></td><td>Acceptance harness only runs 4 of its own scenario functions, leaving many dead</td><td>Core</td><td>Medium</td><td>Almost certain</td><td>Verification and coverage</td><td>4</td></tr>
+            <tr data-issue-id="issue-05"><td><a href="#issue-05">issue-05</a></td><td>Provider verifier omits Python source files from scan</td><td>Core</td><td>High</td><td>Possible</td><td>Security verification</td><td>5</td></tr>
+            <tr data-issue-id="issue-06"><td><a href="#issue-06">issue-06</a></td><td>Provider verifier exempts <code>launch copy*.ps1</code> files, and repo has divergent launcher copies</td><td>Core</td><td>High</td><td>Likely</td><td>Security verification and bootstrap consistency</td><td>6</td></tr>
+            <tr data-issue-id="issue-07"><td><a href="#issue-07">issue-07</a></td><td><code>scripts/launch.ps1</code> header still advertises remote <code>iwr ... | iex</code> bootstrap</td><td>Core</td><td>High</td><td>Likely</td><td>Supply chain and startup trust</td><td>7</td></tr>
+            <tr data-issue-id="issue-08"><td><a href="#issue-08">issue-08</a></td><td>Run log retention test contradicts documented retention policy and fails</td><td>Core</td><td>Medium</td><td>Almost certain</td><td>Recovery and observability</td><td>8</td></tr>
+            <tr data-issue-id="issue-09"><td><a href="#issue-09">issue-09</a></td><td>No explicit ACL hardening for log and task-state files</td><td>Core</td><td>Low</td><td>Possible</td><td>Security and privacy</td><td>9</td></tr>
+            <tr data-issue-id="issue-10"><td><a href="#issue-10">issue-10</a></td><td><code>Write-TaskLaunchState</code> swallows state write failures instead of failing or falling back</td><td>Core</td><td>High</td><td>Possible</td><td>Recovery and observability</td><td>10</td></tr>
+            <tr data-issue-id="issue-11"><td><a href="#issue-11">issue-11</a></td><td><code>scripts/test-launch-gui-layout.ps1</code> only does static XAML checks, no rendered layout coverage</td><td>Additional</td><td>Medium</td><td>Likely</td><td>UI correctness</td><td>11</td></tr>
+            <tr data-issue-id="issue-12"><td><a href="#issue-12">issue-12</a></td><td>Launcher XAML lacks programmatic accessibility associations, so accessible names and descriptions are unproven</td><td>Additional</td><td>Medium</td><td>Possible</td><td>Accessibility and usability</td><td>12</td></tr>
+            <tr data-issue-id="issue-13"><td><a href="#issue-13">issue-13</a></td><td>Hidden task-supervisor child makes failure diagnosis depend on logs or state file</td><td>Additional</td><td>Medium</td><td>Possible</td><td>Observability and recovery</td><td>13</td></tr>
+            <tr data-issue-id="issue-14"><td><a href="#issue-14">issue-14</a></td><td><code>train.py</code> uses a bare <code>assert</code> in <code>setup_optimizer</code></td><td>Additional</td><td>Low</td><td>Possible</td><td>Correctness and maintenance</td><td>14</td></tr>
+            <tr data-issue-id="issue-15"><td><a href="#issue-15">issue-15</a></td><td><code>scripts/test-autoresearch-acceptance.ps1</code> still carries stale <code>autoresearch-karpathy</code> paths and log names</td><td>Additional</td><td>Medium</td><td>Likely</td><td>Maintainability</td><td>15</td></tr>
+            <tr data-issue-id="issue-16"><td><a href="#issue-16">issue-16</a></td><td><code>scripts/launch.json</code> stores operational defaults in plaintext next to the launcher</td><td>Additional</td><td>Low</td><td>Likely</td><td>Operational hygiene</td><td>16</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section" id="issues">
+      <article class="issue core" id="issue-01" data-issue-kind="core" data-issue-number="1">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-critical">Critical</span></p>
+            <h3>1. Secret-bearing parent command line is persisted in task-launch state</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Secret-bearing parent command line is persisted in task-launch state.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>1.</p>
+        <h4>Severity</h4><p>Critical.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>Security and privacy.</p>
+        <h4>Failure mode</h4><p>The task supervisor captures the current process command line and writes it into the task launch state. If the launcher is invoked with a secret-bearing argument, that secret can become durable plain text in <code>autoresearch-task-launch.json</code>.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> defines <code>Get-CurrentProcessCommandLine</code> and then stores the result from <code>Invoke-TaskLaunchSupervisor</code> into task state. The launch path also accepts sensitive parameters such as <code>-ApiKey</code>.</p>
+        <h4>Why this matters</h4><p>A state file is more likely than a console window to survive for incident review or get copied into a ticket. That turns a transient secret into a durable secret artifact.</p>
+        <h4>Recommended mitigation</h4><p>Redact or hash secret-bearing arguments before persistence, keep PID and exit-code tracking, and preserve the replayable launch metadata that is not sensitive.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Update scripts/launch.ps1 so Invoke-TaskLaunchSupervisor and Write-TaskLaunchState never persist raw secret-bearing command lines. Start with Get-CurrentProcessCommandLine, the -ApiKey and Azure parameter handling, and the state object written around the task launch state helpers. Preserve child PID, child exit code, scheduler policy, and replayable launch metadata, but redact any API key or other sensitive argument before it reaches autoresearch-task-launch.json. Keep the hidden run-loop flow, exit codes, and log messages intact. Prefer the smallest repository-consistent fix, add a focused test that proves the state file cannot contain a raw API key, and run the launcher tests that cover task supervision. In the final report, explain exactly which fields stay and which are removed.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The task-state file never contains a literal API key or other secret-bearing launch argument.</li>
+          <li>The child PID and exit code are still recorded and readable.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The supervisor still relaunches the workload with the same working directory and exit-code propagation.</li>
+          <li>Non-secret launch metadata still round-trips through the state file.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>No secret-bearing parent command line is persisted in task launch state.</li>
+          <li>The visible logs still tell the operator where the state file lives.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-02" data-issue-kind="core" data-issue-number="2">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3>2. <code>tests/launch.Tests.ps1</code> leaves required script-scoped globals uninitialized, causing strict-mode failures</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>tests/launch.Tests.ps1</code> leaves required script-scoped globals uninitialized, causing strict-mode failures.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>2.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Almost certain.</p>
+        <h4>Impacted area</h4><p>PowerShell test reliability.</p>
+        <h4>Failure mode</h4><p>The run-log retention and task-launch supervisor test blocks reference script-scoped variables in <code>BeforeEach</code> and cleanup code before they are guaranteed to exist. Under strict mode, that can surface as a missing variable failure instead of the intended assertion.</p>
+        <h4>Evidence or rationale</h4><p><code>tests/launch.Tests.ps1</code> uses values such as <code>$script:LogDir</code>, <code>$script:AggregateLog</code>, <code>$script:RunLogPath</code>, and <code>$script:previousLaunchScope</code> before each block fully seeds them. The acceptance run already reports strict-mode fixture failures.</p>
+        <h4>Why this matters</h4><p>If the test harness fails before it reaches the behavior under test, the repo loses confidence in the launcher regressions and spends time debugging the harness instead of the product code.</p>
+        <h4>Recommended mitigation</h4><p>Centralize fixture initialization in a helper that seeds every script-scoped variable used by the suite, or move the state into a properly scoped test fixture object. Keep strict mode enabled so the harness still catches real mistakes.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Fix the script-scoped fixture setup in tests/launch.Tests.ps1 so the run-log retention and task-launch supervisor blocks do not depend on uninitialized variables. Start with the BeforeEach and cleanup code around the failing strict-mode paths, and make every script-scoped value explicit before any assertion runs. Preserve the current test coverage and strict-mode settings, but remove the accidental missing-variable failures. Add a regression test or shared helper that proves the suite can start from a clean fixture with no preseeded script variables. In the final report, call out which script-scoped names were initialized and why.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The suite no longer fails due to a missing <code>$script:</code> variable.</li>
+          <li>The affected blocks still assert the intended launcher behavior after the fixture is initialized.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>Strict mode stays enabled for the test file.</li>
+          <li>The existing launch-state and retention assertions continue to run.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The suite reaches the intended assertions without any missing-variable failure.</li>
+          <li>The harness remains strict enough to catch future fixture regressions.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-03" data-issue-kind="core" data-issue-number="3">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3>3. Update orchestration tests still use <code>Assert-MockCalled</code>, which fails in the current Pester environment</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Update orchestration tests still use <code>Assert-MockCalled</code>, which fails in the current Pester environment.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>3.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Almost certain.</p>
+        <h4>Impacted area</h4><p>PowerShell test reliability.</p>
+        <h4>Failure mode</h4><p>The update orchestration block still asserts mock behavior with <code>Assert-MockCalled</code>. In the current Pester environment, that assertion path is failing even when the surrounding launcher behavior is otherwise healthy.</p>
+        <h4>Evidence or rationale</h4><p>The failing <code>tests/launch.Tests.ps1</code> update orchestration cases point directly at the mock assertion path. The broader PowerShell suite reports three failures, and the update-related checks are part of that group.</p>
+        <h4>Why this matters</h4><p>A test that depends on the wrong assertion primitive can hide a real regression or report a false failure. Either outcome slows down update work and erodes confidence in the launcher rewrite path.</p>
+        <h4>Recommended mitigation</h4><p>Replace the legacy mock assertion with a Pester 5-friendly check such as <code>Should -Invoke</code> or an explicit state assertion. Keep the coverage target the same so the update path is still verified.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Refactor the update orchestration assertions in tests/launch.Tests.ps1 so they do not depend on Assert-MockCalled. Start with the failing update-related describe block, keep the same behavior contract, and switch to a Pester 5-compatible assertion style or an explicit state check that proves the launcher called the expected update path. Preserve the current mock setup and remove only the fragile assertion primitive. Add a regression test that passes under the current Pester version and still fails if the update call is skipped. In the final report, note which mock expectation changed and why.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The update orchestration checks pass under the current Pester version.</li>
+          <li>The test still fails if the expected update call is removed.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The non-update launcher tests still use the same fixture setup.</li>
+          <li>The suite still validates the update command path or equivalent state.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>No launcher test depends on <code>Assert-MockCalled</code> in this environment.</li>
+          <li>The update path remains covered by a meaningful regression check.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-04" data-issue-kind="core" data-issue-number="4">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-medium">Medium</span></p>
+            <h3>4. Acceptance harness only runs 4 of its own scenario functions, leaving many dead</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Acceptance harness only runs 4 of its own scenario functions, leaving many dead.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>4.</p>
+        <h4>Severity</h4><p>Medium.</p>
+        <h4>Likelihood</h4><p>Almost certain.</p>
+        <h4>Impacted area</h4><p>Verification and coverage.</p>
+        <h4>Failure mode</h4><p>The acceptance script defines many scenario functions but the main <code>try</code> block invokes only four of them. The remaining helpers can drift, rot, or keep stale assumptions without ever being exercised by the top-level runner.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/test-autoresearch-acceptance.ps1</code> defines scenarios such as self-install, import-only bootstrap, dirty bootstrap refusal, launcher contracts, runtime outcomes, process cycling, invalid runtime values, and update removal mocks, but the final invocation block only calls the provider checks, fixture checks, launch suite, and GUI policy layout.</p>
+        <h4>Why this matters</h4><p>Dead scenario code is a maintenance trap. It suggests coverage that does not actually exist and makes it easy for a broken helper to linger until someone trusts it in an incident.</p>
+        <h4>Recommended mitigation</h4><p>Either wire the dormant scenarios into the main runner or delete them so the file only contains active checks. Keep the active provider and GUI tests unchanged.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Inspect scripts/test-autoresearch-acceptance.ps1 and decide which scenario functions should be active, renamed, or removed. The current main block only calls the provider, fixture, launch, and GUI checks, so make the file honest about the scenarios it actually supports. Keep the active checks intact, remove or wire up the dormant helpers, and avoid broad doc rewrites. Add a regression guard that fails if the file accumulates scenario functions that are not reachable from the main entry point. In the final report, state which scenarios stayed and which ones were retired.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The main runner invokes every scenario that the file claims is active.</li>
+          <li>No dormant helper can drift silently without being exercised or removed.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The provider and GUI checks still run exactly as before.</li>
+          <li>The acceptance script still exits with a clear error when a real scenario fails.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The script contains no misleading dead scenarios.</li>
+          <li>Its top-level entry point reflects the actual coverage it delivers.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-05" data-issue-kind="core" data-issue-number="5">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3>5. Provider verifier omits Python source files from scan</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Provider verifier omits Python source files from scan.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>5.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Security verification.</p>
+        <h4>Failure mode</h4><p>The provider verification script scans PowerShell, JavaScript, and markdown-like sources, but it does not include <code>.py</code> files in its source-extension list. That means a Python source file can introduce an AI provider string or a risky launch phrase without being checked by the main verifier.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/verify-ai-provider.mjs</code> defines <code>sourceExtensions</code> without <code>.py</code>. The repository contains <code>train.py</code>, so the omission is not theoretical.</p>
+        <h4>Why this matters</h4><p>Provider verification is supposed to be the guardrail that keeps direct AI interfaces from spreading outside the approved path. Skipping Python gives future changes a quiet escape hatch.</p>
+        <h4>Recommended mitigation</h4><p>Add Python to the verified source set and teach the scanner how to recognize the relevant strings in Python comments and literals. Keep the current PowerShell and JavaScript checks intact.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Extend scripts/verify-ai-provider.mjs so Python source files are included in the provider scan. Start with the sourceExtensions list and the file-selection logic, then confirm that train.py and any future Python sources are treated the same way as the other scanned code. Preserve the existing allowlist and the current canonical launcher behavior, but make sure a provider string cannot hide in Python. Add a regression fixture that proves a Python file with a forbidden provider string is detected. In the final report, call out the exact file types that are now covered.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>A Python source file with a forbidden provider string is detected.</li>
+          <li>The existing PowerShell and JavaScript provider checks still pass.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The verifier continues to allow the approved <code>ai-powered</code> path.</li>
+          <li>Non-source fixture files still remain outside the scan if that is the current policy.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>Python is no longer a blind spot in provider verification.</li>
+          <li>The verifier covers every source language the repo actually uses.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-06" data-issue-kind="core" data-issue-number="6">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3>6. Provider verifier exempts <code>launch copy*.ps1</code> files, and repo has divergent launcher copies</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Provider verifier exempts <code>launch copy*.ps1</code> files, and repo has divergent launcher copies.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>6.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>Security verification and bootstrap consistency.</p>
+        <h4>Failure mode</h4><p>The verifier explicitly skips files that match the copied-launcher pattern, and the repository already contains at least two such copies. If one copy diverges from canonical <code>scripts/launch.ps1</code>, it can introduce a direct AI interface or other risky behavior without the verifier ever seeing it.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/verify-ai-provider.mjs</code> contains a skip rule for <code>launch copy</code> names, and the workspace includes <code>scripts/launch copy.ps1</code> and <code>scripts/launch copy 2.ps1</code>. The copy files are real, not hypothetical.</p>
+        <h4>Why this matters</h4><p>Copy files are exactly where drift shows up first. Exempting them turns a deliberate scan into a policy hole that future edits can exploit by accident.</p>
+        <h4>Recommended mitigation</h4><p>Give copied launchers a clear policy: scan them, delete them, or move them into a fixture-only area with explicit test coverage. Keep the canonical launcher behavior unchanged.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Decide what policy the repo should apply to scripts named launch copy*.ps1, then update scripts/verify-ai-provider.mjs so that policy is enforced. If copy files are meant to be fixtures, prove that in tests; if they are meant to be governed launchers, scan them like the canonical file. Do not leave the current implicit skip in place. Keep the approved launch path intact, but make the copy handling explicit and regression tested. In the final report, explain whether the copies are governed, scanned, or removed.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>A copied launcher is either scanned or explicitly governed by a test.</li>
+          <li>The canonical launcher still passes provider verification.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The verifier still handles the main launch file exactly as before.</li>
+          <li>Copy fixtures, if retained, remain intentionally distinct from the canonical script.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>No launcher variant can evade provider verification just by being named as a copy.</li>
+          <li>The repository has one clear policy for copied launchers.</li>
+        </ul>
+        <h4>Confidence</h4><p>Medium.</p>
+      </article>
+
+      <article class="issue core" id="issue-07" data-issue-kind="core" data-issue-number="7">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3>7. <code>scripts/launch.ps1</code> header still advertises remote <code>iwr ... | iex</code> bootstrap</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>scripts/launch.ps1</code> header still advertises remote <code>iwr ... | iex</code> bootstrap.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>7.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>Supply chain and startup trust.</p>
+        <h4>Failure mode</h4><p>The launcher file still leads with a one-line remote execution example. Even as a comment or quick-start, that normalizes downloading and executing code in one step, which is a risky message for a repo that wants deliberate local control.</p>
+        <h4>Evidence or rationale</h4><p>The header at the top of <code>scripts/launch.ps1</code> contains the remote bootstrap one-liner. The rest of the launcher is local and stateful, so the contrast is especially sharp.</p>
+        <h4>Why this matters</h4><p>Users copy top-of-file examples. If the first thing they see is a remote code execution pattern, the repo trains the wrong default behavior even when the real launcher is more careful.</p>
+        <h4>Recommended mitigation</h4><p>Replace the remote bootstrap example with a safer local workflow or move the risky example into documentation with an explicit warning. Leave the actual launcher logic alone unless the bootstrap flow itself must change.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Revise the top-of-file guidance in scripts/launch.ps1 so the remote iwr ... | iex pattern is not the headline quick-start anymore. Keep the actual launcher implementation unchanged unless the bootstrap flow itself is the smallest safe fix to make. If the repo still needs a remote example, move it into docs with a warning and make the local path the default example. Preserve the launcher contract and the current task-scheduler behavior. Add or update a test that ensures the top-level guidance no longer normalizes unsafe remote execution. In the final report, explain how the startup guidance changed.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The top-of-file guidance no longer presents remote code execution as the default quick-start.</li>
+          <li>The canonical launcher behavior still works without the guidance text.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The launcher still points users at the same local script entry point.</li>
+          <li>No runtime behavior changes unless the bootstrap path itself is intentionally refactored.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The repo no longer teaches unsafe bootstrap as the first launch path.</li>
+          <li>Local startup remains straightforward and documented.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue core" id="issue-08" data-issue-kind="core" data-issue-number="8">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-medium">Medium</span></p>
+            <h3>8. Run log retention test contradicts documented retention policy and fails</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Run log retention test contradicts documented retention policy and fails.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>8.</p>
+        <h4>Severity</h4><p>Medium.</p>
+        <h4>Likelihood</h4><p>Almost certain.</p>
+        <h4>Impacted area</h4><p>Recovery and observability.</p>
+        <h4>Failure mode</h4><p>The run-log retention helper deletes older files, but the test expectation is for the retention summary to be appended to the aggregate log after pruning. The current PowerShell run reports this group as failing, which means the retention contract and the test are out of sync.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> contains <code>Get-RunLogRetentionPlan</code> and <code>Limit-RunLogs</code>. The PowerShell suite flagged the retention behavior as one of the failing cases, and the test name indicates the missing pruning summary is part of the mismatch.</p>
+        <h4>Why this matters</h4><p>Log pruning is the moment when incident evidence is easiest to lose. If the summary is missing or written at the wrong time, a failure leaves you with less data than you need to explain the failure.</p>
+        <h4>Recommended mitigation</h4><p>Align the implementation and the test around a single retention contract: append the pruning summary first, then delete the old logs, or update the test to match the documented order if the current flow is intentional. Keep the aggregate log path stable.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Reconcile the run-log retention behavior in scripts/launch.ps1 with the failing retention test. Start with Get-RunLogRetentionPlan and Limit-RunLogs, then make sure the pruning summary and the deletion order match the documented policy and the test expectation. Preserve the log path and the retention count semantics, but ensure the summary is not lost when old files are removed. Add a regression test that proves the pruning summary is still present after retention runs. In the final report, state whether the policy is summary-then-delete or delete-then-summary and keep it consistent everywhere.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The pruning summary is present in the aggregate log after retention runs.</li>
+          <li>Older logs are still deleted according to the configured retention limit.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The current log directory and naming scheme stay unchanged.</li>
+          <li>The retention helper still respects the configured run count.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The retention policy and test expectations agree.</li>
+          <li>No postmortem evidence is deleted before the summary is captured.</li>
+        </ul>
+        <h4>Confidence</h4><p>Medium.</p>
+      </article>
+
+      <article class="issue core" id="issue-09" data-issue-kind="core" data-issue-number="9">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-low">Low</span></p>
+            <h3>No explicit ACL hardening for log and task-state files</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>No explicit ACL hardening for log and task-state files.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>9.</p>
+        <h4>Severity</h4><p>Low.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Security and privacy.</p>
+        <h4>Failure mode</h4><p><strong>Testable assumption:</strong> the launcher relies on inherited Windows permissions for the log root and state files because the inspected scripts do not set an explicit ACL. If that assumption is wrong on a given host, the risk is lower; if it is right, command history and state metadata may be readable by more accounts than intended.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> creates the log root and task-state path, but the inspected launcher files do not contain a <code>Set-Acl</code> or equivalent hardening call. The risk becomes more meaningful if the files ever move onto a shared or loosely configured machine.</p>
+        <h4>Why this matters</h4><p>The first issue in this report becomes more serious if the state and log files are not access-controlled. Even without that secret leak, the files are operational artifacts that should not be casually exposed.</p>
+        <h4>Recommended mitigation</h4><p>Set the ACLs when the log root is created, confirm the owner and read access explicitly, and warn or fail if the permissions cannot be hardened. Keep the default path if the repo wants it, but make access control deliberate instead of inherited by accident.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Add explicit ACL hardening for the launcher log and task-state directories in scripts/launch.ps1. Start with the creation path for the default log root and the state file under %HOMEDRIVE%\myTech.Today\logs, then make the permissions explicit instead of relying on inherited defaults. Preserve the current file locations and filenames, but ensure only the intended account or accounts can read the sensitive task metadata. If ACL hardening cannot be applied, emit a clear warning and keep the user informed about the risk. Avoid new dependencies and keep the change local to the launcher. Add a verification step that checks the resulting ACLs with Get-Acl, and report the host assumptions and fallback behavior in the final write-up.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The created log and task-state directories have the expected read permissions.</li>
+          <li>A failure to harden ACLs produces a visible warning.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The file locations stay the same so existing paths do not break.</li>
+          <li>The ACL verification works on the supported Windows host without manual cleanup.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>Log and state files are no longer exposed by default permissions alone.</li>
+          <li>The permission story is explicit and testable on the target host.</li>
+        </ul>
+        <h4>Confidence</h4><p>Low.</p>
+      </article>
+
+      <article class="issue core" id="issue-10" data-issue-kind="core" data-issue-number="10">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-core">Core</span><span class="badge badge-high">High</span></p>
+            <h3><code>Write-TaskLaunchState</code> swallows state write failures instead of failing or falling back</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>Write-TaskLaunchState</code> swallows state write failures instead of failing or falling back.</p>
+        <h4>Kind</h4><p>Core.</p>
+        <h4>Priority</h4><p>10.</p>
+        <h4>Severity</h4><p>High.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Recovery and observability.</p>
+        <h4>Failure mode</h4><p>The task-state writer catches errors and suppresses them. If state persistence fails, the launcher can keep running while pretending the supervisory metadata exists, which leaves the operator without the one artifact that explains the run.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> wraps the state write in a catch block that suppresses the failure. The state file is part of the diagnostics path, so losing it is most harmful exactly when something has already gone wrong.</p>
+        <h4>Why this matters</h4><p>Silent failure is the worst recovery mode for an orchestration system. It hides the original error, confuses later retries, and makes postmortem analysis much harder.</p>
+        <h4>Recommended mitigation</h4><p>Emit a visible warning or fail fast when state persistence is impossible, and only fall back to a degraded path if the repo has a deliberate recovery story for that case. Keep the rest of the task-launch flow intact.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Tighten the error handling in Write-TaskLaunchState so state write failures are not silently ignored. Start with the catch path around the state writer and decide whether the repo should warn, fail, or use a documented fallback, but do not leave the current quiet suppression in place. Preserve the existing task launch flow and log locations. Add a regression test that proves the user sees the state write problem instead of losing it. In the final report, explain the chosen fallback or failure policy.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>A state write failure produces a visible warning or error.</li>
+          <li>The launcher no longer behaves as if state persistence succeeded when it did not.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The normal state write path still succeeds when the filesystem is healthy.</li>
+          <li>The task supervisor still records the launch metadata when persistence works.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>State write failures are observable and actionable.</li>
+          <li>The launcher does not silently lose its only recovery breadcrumb.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue additional" id="issue-11" data-issue-kind="additional" data-issue-number="11">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-medium">Medium</span></p>
+            <h3><code>scripts/test-launch-gui-layout.ps1</code> only does static XAML checks, no rendered layout coverage</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>scripts/test-launch-gui-layout.ps1</code> only does static XAML checks, no rendered layout coverage.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>11.</p>
+        <h4>Severity</h4><p>Medium.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>UI correctness.</p>
+        <h4>Failure mode</h4><p>The GUI smoke test checks parser and property values in the XAML string, but it does not render the window or verify actual control placement at runtime. A layout regression can therefore pass the static script while still clipping or crowding the real UI.</p>
+        <h4>Evidence or rationale</h4><p>The script reads the launcher XAML, validates a set of fixed properties, and exits without any rendering, screenshot, or UI automation step. That keeps the test fast, but it also keeps it blind to actual layout failures.</p>
+        <h4>Why this matters</h4><p>Window usability bugs tend to show up only on the target machine, scale factor, or DPI that the static parser never sees. If the test never renders the window, it can miss the thing the operator actually clicks.</p>
+        <h4>Recommended mitigation</h4><p>Add a small rendered smoke check or automation pass that opens the launcher at the supported size and confirms the controls still fit. Keep the static parser checks as a cheap first gate.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Extend scripts/test-launch-gui-layout.ps1 so it does more than static XAML parsing. Keep the parser and property checks, then add a lightweight render or UI automation smoke that confirms the launcher layout still fits at the intended window size and scaling. Do not replace the current cheap checks, just supplement them with something that can catch overflow or clipping. Add a regression test or screenshot-based smoke that proves the UI is still readable when rendered. In the final report, call out the specific layout risks the new coverage prevents.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>A rendered or automated check catches clipped or overflowing controls.</li>
+          <li>The static parser checks still run quickly.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The launcher XAML still parses cleanly.</li>
+          <li>The existing property checks continue to validate the window contract.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The GUI test can see both static and rendered layout regressions.</li>
+          <li>The launcher remains readable at the supported size.</li>
+        </ul>
+        <h4>Confidence</h4><p>Medium.</p>
+      </article>
+
+      <article class="issue additional" id="issue-12" data-issue-kind="additional" data-issue-number="12">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-medium">Medium</span></p>
+            <h3>Launcher XAML lacks programmatic accessibility associations, so accessible names and descriptions are unproven</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Launcher XAML lacks programmatic accessibility associations, so accessible names and descriptions are unproven.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>12.</p>
+        <h4>Severity</h4><p>Medium.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Accessibility and usability.</p>
+        <h4>Failure mode</h4><p><strong>Testable assumption:</strong> the launcher controls are visually labeled, but the static XAML checks do not prove that the fields have programmatic accessibility metadata such as <code>AutomationProperties.Name</code>, <code>HelpText</code>, or label-target wiring. If that metadata is absent, screen reader users get a worse experience than the visual UI suggests.</p>
+        <h4>Evidence or rationale</h4><p>The GUI smoke script inspects layout properties, not accessibility metadata. That means the current test surface cannot prove the launcher is discoverable to assistive technologies even if the UI looks fine by eye.</p>
+        <h4>Why this matters</h4><p>An accessible form that is missing names or descriptions is effectively unfinished for part of the audience. This is not a correctness crash, but it is a real usability gap.</p>
+        <h4>Recommended mitigation</h4><p>Add explicit accessibility metadata to the input controls and verify it with a small XAML inspection or UI automation check. Keep the visible labels and tab order unchanged.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Inspect the launcher XAML in scripts/launch.ps1 and add programmatic accessibility associations for the key controls. Start with the labels, text boxes, and action buttons, then set the metadata needed for screen readers to expose meaningful names and descriptions. Preserve the current visual layout and tab order, but make the accessibility story testable instead of assumed. Add a check that verifies the accessibility metadata exists on the important controls. In the final report, explain which controls gained explicit accessibility names or help text.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The key launcher controls expose explicit accessibility metadata.</li>
+          <li>The new metadata does not disturb the current layout or keyboard flow.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The GUI still passes the static layout and parser checks.</li>
+          <li>The tab order and focus behavior remain unchanged.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>Accessible names and descriptions are explicit instead of assumed.</li>
+          <li>The launcher is easier to operate with assistive technology.</li>
+        </ul>
+        <h4>Confidence</h4><p>Medium.</p>
+      </article>
+
+      <article class="issue additional" id="issue-13" data-issue-kind="additional" data-issue-number="13">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-medium">Medium</span></p>
+            <h3>Hidden task-supervisor child makes failure diagnosis depend on logs or state file</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p>Hidden task-supervisor child makes failure diagnosis depend on logs or state file.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>13.</p>
+        <h4>Severity</h4><p>Medium.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Observability and recovery.</p>
+        <h4>Failure mode</h4><p>The supervisor launches the real workload child with a hidden window and waits for it to finish. Operators do get PID and exit-code metadata, but they still have to open logs or the state file to understand what the workload actually did.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> starts the child process hidden and then writes <code>childPid</code>, <code>childCommandLine</code>, and <code>childExitCode</code> into task state. That helps after the fact, but it still shifts diagnosis to a separate artifact.</p>
+        <h4>Why this matters</h4><p>A scheduled task that hides the real child is harder to triage when the workload is long running or fails before the first log line. The metadata helps, but it does not remove the need to hunt for it.</p>
+        <h4>Recommended mitigation</h4><p>Keep the hidden child if the UX requires it, but surface the child PID, exit code, and state path in the human-readable log stream so diagnosis does not depend on a separate file hunt.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Improve observability in scripts/launch.ps1 without removing the detached task-supervisor flow unless that is the smallest safe fix. Start at Invoke-TaskLaunchSupervisor and the hidden Start-Process call, keep the child hidden if the repo still needs that behavior, but make the child PID, exit code, and state file path visible in the normal log stream so operators can diagnose failures without guesswork. Preserve the current exit-code propagation and state file format as much as possible. Avoid broad refactors and do not add external dependencies. Add or update tests that prove a failed child is visible in logs and that a successful child still reports the right status. In the final report, explain the tradeoff between UX privacy and diagnosability.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>A child failure writes a visible log line that points to the state file.</li>
+          <li>A child success still reports PID and exit code correctly.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The hidden child still runs with the same arguments and working directory.</li>
+          <li>Task Scheduler still sees the launcher exit code that the child returns.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>Operators can diagnose the workload without opening the JSON state file first.</li>
+          <li>The hidden-child design does not hide the reason for failure.</li>
+        </ul>
+        <h4>Confidence</h4><p>Medium.</p>
+      </article>
+
+      <article class="issue additional" id="issue-14" data-issue-kind="additional" data-issue-number="14">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-low">Low</span></p>
+            <h3><code>train.py</code> uses a bare <code>assert</code> in <code>setup_optimizer</code></h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>train.py</code> uses a bare <code>assert</code> in <code>setup_optimizer</code>.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>14.</p>
+        <h4>Severity</h4><p>Low.</p>
+        <h4>Likelihood</h4><p>Possible.</p>
+        <h4>Impacted area</h4><p>Correctness and maintenance.</p>
+        <h4>Failure mode</h4><p>The optimizer consistency check disappears when Python runs with optimization enabled. That means a future parameter-group drift could skip the check exactly in the runtime mode that strips <code>assert</code> statements.</p>
+        <h4>Evidence or rationale</h4><p><code>train.py:682-698</code> contains the bare <code>assert</code> used to verify the parameter grouping. The repo also includes an optimized validation path, so the missing check is not just theoretical.</p>
+        <h4>Why this matters</h4><p>This is not a user-facing crash today, but it is an avoidable correctness trap. If the grouping drifts, the skipped invariant could let the optimizer proceed with the wrong parameters.</p>
+        <h4>Recommended mitigation</h4><p>Replace the bare <code>assert</code> with an explicit exception or a validation helper that survives optimized execution. Keep the rest of the optimizer logic unchanged.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Replace the bare assert in train.py:682-698 with an explicit validation that still runs under python -O. Start with setup_optimizer, inspect the parameter grouping check, and decide whether a ValueError or a dedicated runtime exception fits the repo's existing style best. Preserve the current optimizer grouping, learning-rate scaling, and parameter order, but make the consistency check impossible to skip in optimized runs. Avoid changing any of the model math or broader training flow. Add a regression test that executes the relevant path under python -O or otherwise proves the check still fires, and keep the current unittest style. In the final report, mention the exact invariant you converted and how the optimized-path test proves it remains enforced.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The optimizer invariant still fails with a clear exception when parameter grouping is wrong.</li>
+          <li>The check still runs when Python optimization is enabled.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The existing optimizer setup still passes for the normal model.</li>
+          <li>The optimized validation smoke test continues to pass for the user-facing checks it already covers.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>No runtime-critical optimizer invariant disappears under <code>python -O</code>.</li>
+          <li>The check fails loudly instead of silently skipping.</li>
+        </ul>
+        <h4>Confidence</h4><p>Low.</p>
+      </article>
+
+      <article class="issue additional" id="issue-15" data-issue-kind="additional" data-issue-number="15">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-low">Low</span></p>
+            <h3><code>scripts/test-autoresearch-acceptance.ps1</code> still carries stale <code>autoresearch-karpathy</code> paths and log names</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>scripts/test-autoresearch-acceptance.ps1</code> still carries stale <code>autoresearch-karpathy</code> paths and log names.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>15.</p>
+        <h4>Severity</h4><p>Low.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>Maintainability.</p>
+        <h4>Failure mode</h4><p>Several dormant helper paths and log names still point at the old repository identity. Because the helpers are mostly unreachable from the top-level runner, the stale strings can survive unnoticed until someone tries to revive them.</p>
+        <h4>Evidence or rationale</h4><p>The acceptance file still contains <code>autoresearch-karpathy</code> strings in the self-install and bootstrap helper area, and the main entry point does not exercise those helpers. That combination makes the drift easy to miss.</p>
+        <h4>Why this matters</h4><p>Stale path strings are usually a sign of copy-paste drift. If the dormant helpers ever become active again, they will be harder to trust because the file name and the repository identity no longer match.</p>
+        <h4>Recommended mitigation</h4><p>Update the stale identity strings now or remove the helpers so the file only contains scenarios that are still in active use. Keep the current provider and GUI checks intact.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Clean up the stale repository identity strings in scripts/test-autoresearch-acceptance.ps1, starting with the helpers that still mention autoresearch-karpathy. Decide whether those dormant scenarios should stay, be renamed for the current repo, or be deleted entirely, and make the file consistent with that choice. Keep the active provider and GUI checks intact, and do not expand the change into unrelated docs or launcher code. Add or update a small assertion that would catch a future stale repo-identity copy-paste. In the final report, state which strings changed and whether the helper is now active, renamed, or removed.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>No helper in the file mentions the old repo identity.</li>
+          <li>The current acceptance checks continue to pass.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The file still references the current repository root and log names.</li>
+          <li>Any remaining dormant helper is clearly marked as intentional.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>No stale repo identity strings remain in the acceptance harness.</li>
+          <li>The file reads as a current repo artifact instead of a forked remnant.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+
+      <article class="issue additional" id="issue-16" data-issue-kind="additional" data-issue-number="16">
+        <div class="issue-head">
+          <div>
+            <p class="kicker"><span class="badge badge-additional">Additional</span><span class="badge badge-low">Low</span></p>
+            <h3><code>scripts/launch.json</code> stores operational defaults in plaintext next to the launcher</h3>
+          </div>
+        </div>
+        <h4>Title</h4><p><code>scripts/launch.json</code> stores operational defaults in plaintext next to the launcher.</p>
+        <h4>Kind</h4><p>Additional.</p>
+        <h4>Priority</h4><p>16.</p>
+        <h4>Severity</h4><p>Low.</p>
+        <h4>Likelihood</h4><p>Likely.</p>
+        <h4>Impacted area</h4><p>Operational hygiene.</p>
+        <h4>Failure mode</h4><p>The launcher persists provider, model, host, schedule, log directory, and Azure endpoint or deployment defaults into a human-readable JSON file beside the script. On a shared machine or in a copied workspace, that file exposes operational detail more openly than a locked-down settings store would.</p>
+        <h4>Evidence or rationale</h4><p><code>scripts/launch.ps1</code> saves the defaults and later reloads the Azure fields, while the GUI save path explicitly strips only the API key before writing the rest. The file is intentionally readable, which makes the access model worth stating clearly.</p>
+        <h4>Why this matters</h4><p>The file is convenient, but convenience is not free. It can reveal which provider and deployment were used last, and it may survive longer than the user expects because it lives in the launcher tree.</p>
+        <h4>Recommended mitigation</h4><p>Keep the defaults file if the repo wants that user experience, but make the access model explicit and consider moving shared defaults out of the source tree on multi-user hosts. At minimum, document exactly which fields are persisted and why.</p>
+        <h4>Implementation prompt</h4>
+        <pre class="prompt">Work in the current project and resolve the repo root yourself. Review the defaults persistence path in scripts/launch.ps1 and decide whether launch.json should stay as a plain-text convenience file or move to a safer location on shared hosts. Start with Save-LaunchDefaults, Initialize-LaunchConfig, and the GUI save path, then keep the current behavior for non-secret defaults unless the repo already has a better canonical store. Never persist the API key itself. If you change the location or format, preserve the round-trip behavior of the launcher GUI and the -NoGui CLI. Avoid broad refactors and add tests that prove the persisted fields are exactly the ones the repo intends. In the final report, state the access model, the persisted fields, and any user-facing guidance that changed.</pre>
+        <h4>Regression tests</h4>
+        <ul>
+          <li>The persisted defaults round-trip the same provider, model, host, schedule, and Azure fields.</li>
+          <li>The API key still does not get written to the defaults file.</li>
+        </ul>
+        <h4>Additional baseline tests</h4>
+        <ul>
+          <li>The GUI still loads the same defaults after a save.</li>
+          <li>Non-secret configuration fields remain human-readable if the file stays in place.</li>
+        </ul>
+        <h4>Acceptance criteria</h4>
+        <ul>
+          <li>The persistence story for operational defaults is explicit and documented.</li>
+          <li>No secret value is added to the defaults file.</li>
+        </ul>
+        <h4>Confidence</h4><p>High.</p>
+      </article>
+    </section>
+
+    <section class="section" id="notes">
+      <h2>Scope Notes And Limitations</h2>
+      <p>
+        The first 10 core issues were selected from repository evidence because the source prompt did not enumerate them. The additional six are distinct follow-on risks chosen to stay actionable and non-overlapping. Where a finding depends on inferred machine behavior, it is labeled as a testable assumption in the issue text.
+      </p>
+      <p>
+        The report reuses the prior pre-mortem's warm print-friendly visual language, but it is fully self-contained and has no external runtime dependencies. The launcher is the main application surface in this repository, so the review intentionally emphasizes PowerShell orchestration, state handling, and the Python training path instead of browser UI concerns.
+      </p>
+    </section>
+
+    <footer class="section">
+      <p><strong>Repository identity:</strong> autoresearch-win-rtx-scheduled on branch <code>autoresearch/may30</code></p>
+      <p><strong>Generated:</strong> 2026-09-07 22:34:37 local time</p>
+      <p><strong>Output path:</strong> <code>./ai-prompts/pre-mortem-2026-09-07-22-34-37.html</code></p>
+      <p><strong>Report scope:</strong> current working tree only, with 10 core issues selected by inspection and 6 additional issues added for coverage, recovery, and verification risk.</p>
+    </footer>
+  </main>
+</body>
+</html>

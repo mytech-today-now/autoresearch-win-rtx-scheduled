@@ -3,6 +3,7 @@ import hashlib
 import io
 import os
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -247,6 +248,47 @@ class PrepareTokenizerCacheTests(PrepareTestCase):
 
         mock_train.assert_called_once_with("tinystories")
         self.assertTrue(torch.equal(loaded.cpu(), token_bytes))
+
+
+class PrepareValidationTests(PrepareTestCase):
+    def test_train_tokenizer_raises_on_roundtrip_mismatch(self):
+        fake_tokenizer = mock.Mock()
+        fake_tokenizer.train_from_iterator.return_value = None
+        fake_tokenizer.get_pattern.return_value = prepare.SPLIT_PATTERN
+        fake_tokenizer.get_mergeable_ranks.return_value = [(b"a", 0)]
+
+        fake_encoding = mock.Mock()
+        fake_encoding.n_vocab = len(prepare.SPECIAL_TOKENS) + 1
+        fake_encoding.encode_ordinary.return_value = [0]
+        fake_encoding.decode.return_value = "not-a-roundtrip"
+
+        with mock.patch.object(prepare, "list_parquet_files", return_value=["dummy.parquet"]):
+            with mock.patch.object(prepare.rustbpe, "Tokenizer", return_value=fake_tokenizer):
+                with mock.patch.object(prepare.tiktoken, "Encoding", return_value=fake_encoding):
+                    with self.assertRaisesRegex(RuntimeError, r"Tokenizer roundtrip failed: .* -> .*"):
+                        self._quiet_call(prepare.train_tokenizer, "tinystories")
+
+    def test_document_batches_rejects_invalid_split(self):
+        with self.assertRaisesRegex(ValueError, r"Invalid split 'bogus'"):
+            next(prepare._document_batches("bogus", dataset="tinystories"))
+
+    def test_make_dataloader_rejects_test_split_for_non_tinystories_dataset(self):
+        tokenizer = types.SimpleNamespace(
+            dataset="other",
+            get_bos_token_id=lambda: 0,
+        )
+
+        with mock.patch.object(prepare, "_resolve_dataset_name", return_value="other"):
+            with mock.patch.object(
+                prepare,
+                "_document_batches",
+                side_effect=AssertionError("_document_batches should not be reached"),
+            ) as mock_batches:
+                loader = prepare.make_dataloader(tokenizer, 1, 8, "test", device="cpu")
+                with self.assertRaisesRegex(ValueError, "Test split exists only for TinyStories."):
+                    next(loader)
+
+        mock_batches.assert_not_called()
 
 
 class PrepareDownloadTests(PrepareTestCase):

@@ -3,7 +3,8 @@
     "verify:ai-provider": "node scripts/verify-ai-provider.mjs",
     "test:wrapper": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-autoresearch-wrapper.ps1",
     "test:acceptance": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-autoresearch-acceptance.ps1",
-    "test": "npm run verify:ai-provider && npm run test:wrapper && npm run test:acceptance"
+    "test:powershell": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/launch.Tests.ps1",
+    "test": "npm run verify:ai-provider && npm run test:wrapper && npm run test:acceptance && npm run test:powershell"
   },
   "dependencies": {
     "@mytechtoday/augment-extensions": "^3.1.2",

@@ -174,6 +174,29 @@ class TrainValidationTests(CheckpointTestCase):
         with self.assertRaisesRegex(ValueError, r"Sequence length"):
             model(inputs)
 
+    def test_setup_optimizer_rejects_parameter_group_drift(self):
+        config = self._make_config()
+        model = train.GPT(config)
+        model.init_weights(embed_dtype=torch.float32)
+
+        original_parameters = train.GPT.parameters
+
+        def fake_parameters(self):
+            params = list(original_parameters(self))
+            params.append(torch.nn.Parameter(torch.zeros(1)))
+            return iter(params)
+
+        with mock.patch.object(train.GPT, "parameters", fake_parameters):
+            with self.assertRaisesRegex(train.OptimizerSetupError, r"parameter grouping mismatch"):
+                self._quiet_call(
+                    model.setup_optimizer,
+                    unembedding_lr=0.001,
+                    embedding_lr=0.002,
+                    scalar_lr=0.003,
+                    matrix_lr=0.004,
+                    weight_decay=0.0,
+                )
+
 
 class CheckpointRoundTripTests(CheckpointTestCase):
     def test_checkpoint_round_trip_preserves_model_and_optimizer_state(self):

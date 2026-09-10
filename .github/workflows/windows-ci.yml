@@ -111,3 +111,4 @@ jobs:
           path: |
             ${{ runner.temp }}/autoresearch-ci/**/*.jsonl
             ${{ runner.temp }}/autoresearch-ci/**/*.log
+            ${{ runner.temp }}/autoresearch-ci/**/*.png

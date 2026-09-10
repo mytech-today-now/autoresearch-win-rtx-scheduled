@@ -98,6 +98,65 @@ class OptimizedValidationSmokeTests(unittest.TestCase):
             self.assertEqual(seen[name][0], exc_type)
             self.assertIn(message_fragment, seen[name][1])
 
+    def test_optimized_python_rejects_optimizer_parameter_drift(self):
+        lines = self._run_optimized(
+            """
+            import contextlib
+            import io
+            from unittest import mock
+
+            import torch
+
+            import train
+
+            model = train.GPT(
+                train.GPTConfig(
+                    sequence_len=8,
+                    vocab_size=16,
+                    n_layer=2,
+                    n_head=2,
+                    n_kv_head=2,
+                    n_embd=32,
+                    window_pattern="SL",
+                    attention_backend="sdpa",
+                    use_activation_checkpointing=False,
+                    compute_dtype=torch.float32,
+                )
+            )
+            model.init_weights(embed_dtype=torch.float32)
+
+            original_parameters = train.GPT.parameters
+
+            def fake_parameters(self):
+                params = list(original_parameters(self))
+                params.append(torch.nn.Parameter(torch.zeros(1)))
+                return iter(params)
+
+            message = None
+            with mock.patch.object(train.GPT, "parameters", fake_parameters):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        model.setup_optimizer(
+                            unembedding_lr=0.001,
+                            embedding_lr=0.002,
+                            scalar_lr=0.003,
+                            matrix_lr=0.004,
+                            weight_decay=0.0,
+                        )
+                    except Exception as exc:
+                        message = f"optimizer:{type(exc).__name__}:{exc}"
+
+            if message is not None:
+                print(message)
+            """
+        )
+
+        self.assertEqual(len(lines), 1, msg=f"Unexpected optimized output: {lines!r}")
+        name, exc_type, message = lines[0].split(":", 2)
+        self.assertEqual(name, "optimizer")
+        self.assertEqual(exc_type, "OptimizerSetupError")
+        self.assertIn("parameter grouping mismatch", message)
+
 
 if __name__ == "__main__":
     unittest.main()

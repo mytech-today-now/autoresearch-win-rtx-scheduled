@@ -1,0 +1,13 @@
+# Versions
+
+This snapshot uses the following explicit versions and minimums:
+
+- `autoresearch`: `0.1.0`
+- Python: `>=3.10`
+- PyTorch: `2.9.1`
+- `ai-powered`: `0.3.2`
+- `@mytechtoday/augment-extensions`: `3.1.2`
+- Pester: `5.0.0`
+- Node.js in CI: `22`
+
+Launcher-managed tools such as `uv` and Ollama are kept on compatible update lines by `scripts\launch.ps1` rather than being hard-pinned here.

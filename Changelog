@@ -1,0 +1,10 @@
+# Changelog
+
+## 2026-09-10
+
+- Launcher defaults now persist only non-secret operational settings under `%LOCALAPPDATA%\myTech.Today\autoresearch-win-rtx-scheduled\launch.json`, while the legacy `scripts\launch.json` path remains read for compatibility only.
+- Scheduled task launches now use a first-class `-TaskSupervisor` flow that starts the hidden `-RunLoop` child, writes `autoresearch-task-launch.json`, and propagates the child exit code.
+- Added `Unattended` scheduler policy support via S4U logon and exposed Task Scheduler history enablement in the launcher GUI.
+- Run-log pruning now records a pruning plan before deletion and a completion summary after deletion.
+- `train.py` now raises `OptimizerSetupError` when optimizer parameter grouping drifts, which keeps the invariant enforced even when Python optimization strips `assert` statements.
+- Windows CI now uploads GUI layout PNG artifacts alongside JSONL and log files on failure.

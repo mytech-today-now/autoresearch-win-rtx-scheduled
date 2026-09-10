@@ -561,6 +561,10 @@ class Block(nn.Module):
         return x
 
 
+class OptimizerSetupError(RuntimeError):
+    pass
+
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -688,7 +692,8 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (
+        expected_param_count = len(list(self.parameters()))
+        grouped_param_count = (
             len(matrix_params)
             + len(embedding_params)
             + len(lm_head_params)
@@ -696,6 +701,11 @@ class GPT(nn.Module):
             + len(resid_params)
             + len(x0_params)
         )
+        if expected_param_count != grouped_param_count:
+            raise OptimizerSetupError(
+                "Optimizer parameter grouping mismatch: "
+                f"expected {expected_param_count} parameters, got {grouped_param_count}."
+            )
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [

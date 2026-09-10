@@ -38,6 +38,7 @@ function script:Get-LaunchFixtureState {
         'LogRetentionCount',
         'LogRetentionDays',
         'TaskLaunchStatePath',
+        'LauncherAclStatus',
         'RepoRoot',
         'CanonicalScript',
         'Provider',
@@ -90,6 +91,7 @@ function script:Initialize-LaunchFixtureState {
     $script:LogRetentionCount = 25
     $script:LogRetentionDays = 14
     $script:TaskLaunchStatePath = Join-Path $logDir 'autoresearch-task-launch.json'
+    $script:LauncherAclStatus = @{}
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
     $script:CanonicalScript = (Resolve-Path -LiteralPath $LaunchScriptPath).Path
     $script:Provider = 'ollama'
@@ -159,6 +161,9 @@ BeforeAll {
         'Get-OllamaCompatibleTargetVersion',
         'Get-NpmGlobalPackageVersion',
         'Get-PinnedAiPoweredVersion',
+        'Read-LaunchDefaults',
+        'Save-LaunchDefaults',
+        'Initialize-LaunchConfig',
         'Update-SessionPath',
         'Start-OllamaServer',
         'Sync-OllamaModel',
@@ -180,6 +185,13 @@ BeforeAll {
         'Write-Json',
         'Write-TaskLaunchState',
         'New-Dir',
+        'Test-WindowsHost',
+        'Get-LauncherAclPrincipals',
+        'ConvertTo-LauncherSidValue',
+        'Test-LauncherDirectoryAcl',
+        'Set-LauncherDirectoryAcl',
+        'Ensure-LauncherDirectoryAcl',
+        'Initialize-LauncherStorage',
         'Get-TaskLaunchStatePath',
         'Register-LauncherTask',
         'Unregister-LauncherTask',
@@ -695,6 +707,63 @@ Describe 'Launcher plan' {
     }
 }
 
+Describe 'Launcher ACL hardening' {
+    BeforeEach {
+        $script:LauncherAclStatus = @{}
+    }
+
+    It 'creates log and task-state directories with explicit readable ACLs' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'The launcher ACL policy is Windows-specific.'
+            return
+        }
+
+        $root = New-TestRoot 'launcher-acl'
+        $script:LogDir = Join-Path $root 'logs'
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $stateDirectory = Join-Path $root 'task-state'
+        $script:TaskLaunchStatePath = Join-Path $stateDirectory 'autoresearch-task-launch.json'
+
+        Initialize-LauncherStorage
+
+        foreach ($directory in @($script:LogDir, $stateDirectory)) {
+            $verification = Test-LauncherDirectoryAcl -Path $directory
+            $verification.IsHardened | Should -BeTrue
+            $verification.InheritanceLocked | Should -BeTrue
+            $verification.MissingPrincipals | Should -HaveCount 0
+            $verification.UnexpectedRules | Should -HaveCount 0
+
+            $acl = Get-Acl -LiteralPath $directory
+            $acl.AreAccessRulesProtected | Should -BeTrue
+            foreach ($principal in @(Get-LauncherAclPrincipals)) {
+                $readRules = @($acl.Access | Where-Object {
+                    (ConvertTo-LauncherSidValue -IdentityReference $_.IdentityReference) -eq $principal.Value -and
+                        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                        (([int]$_.FileSystemRights -band [int][System.Security.AccessControl.FileSystemRights]::Read) -eq [int][System.Security.AccessControl.FileSystemRights]::Read)
+                })
+                $readRules.Count | Should -BeGreaterThan 0
+            }
+        }
+    }
+
+    It 'emits a visible warning and preserves fallback behavior when hardening fails' {
+        $root = New-TestRoot 'launcher-acl-warning'
+        $script:aclWarnings = @()
+        Mock Test-WindowsHost { return $false }
+        Mock Write-Warning {
+            param([string]$Message)
+            $script:aclWarnings += $Message
+        }
+
+        $result = Set-LauncherDirectoryAcl -Path (Join-Path $root 'logs') -Purpose 'launcher log root'
+
+        $result.IsHardened | Should -BeFalse
+        $script:aclWarnings | Should -HaveCount 1
+        $script:aclWarnings[0] | Should -Match 'ACL hardening failed'
+        $script:aclWarnings[0] | Should -Match 'may be readable by other accounts'
+    }
+}
+
 Describe 'Run log retention' {
     BeforeEach {
         $script:previousLaunchScope = Get-LaunchFixtureState
@@ -772,9 +841,62 @@ Describe 'Run log retention' {
         Test-Path -LiteralPath $script:AggregateLog | Should -BeTrue
         $summary = ((Get-Content -LiteralPath $script:AggregateLog -Raw) -split "`r?`n" | Where-Object { $_ }) | Select-Object -Last 1 | ConvertFrom-Json
         $summary.msg | Should -Match 'Run log pruning reviewed'
+        $summary.pruning.phase | Should -Be 'completed'
+        $summary.pruning.plannedDeleteCount | Should -Be 2
         $summary.pruning.deletedCount | Should -Be 2
         @($summary.pruning.deleted) | Should -HaveCount 2
         $result.Summary.deletedCount | Should -Be 2
+    }
+
+    It 'captures the pruning plan before deleting older files' {
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260810-070000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-20)) | Out-Null
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260809-070000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-21)) | Out-Null
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260808-070000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-22)) | Out-Null
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260907-070000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-1)) | Out-Null
+
+        $events = New-Object System.Collections.Generic.List[string]
+        Mock Write-Json {
+            $events.Add('summary') | Out-Null
+        }
+        Mock Remove-Item {
+            param(
+                [string]$LiteralPath,
+                [switch]$Force,
+                [System.Management.Automation.ActionPreference]$ErrorAction
+            )
+            $events.Add("delete:$([System.IO.Path]::GetFileName($LiteralPath))") | Out-Null
+        }
+
+        $result = Limit-RunLogs -LogDir $script:LogDir -LogRetentionCount 1 -LogRetentionDays 7
+
+        $events[0] | Should -Be 'summary'
+        @($events | Where-Object { $_ -like 'delete:*' }) | Should -HaveCount 2
+        $events[-1] | Should -Be 'summary'
+        $result.Summary.phase | Should -Be 'completed'
+        $result.Summary.deletedCount | Should -Be 2
+    }
+
+    It 'does not delete older files when the pre-delete summary cannot be written' {
+        $oldOne = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260810-060000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-20))
+        $oldTwo = Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260809-060000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-21))
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260808-060000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-22)) | Out-Null
+        Write-RunLogFixture -Directory $script:LogDir -Name 'autoresearch-run-20260907-060000.jsonl' -ExitCode 0 -LastWriteTimeUtc ([datetime]::UtcNow.AddDays(-1)) | Out-Null
+
+        $deleteAttempts = 0
+        Mock Write-Json {
+            throw 'simulated aggregate log write failure'
+        }
+        Mock Remove-Item {
+            $deleteAttempts++
+        }
+
+        {
+            Limit-RunLogs -LogDir $script:LogDir -LogRetentionCount 1 -LogRetentionDays 7
+        } | Should -Throw '*could not be recorded before deletion*'
+
+        $deleteAttempts | Should -Be 0
+        Test-Path -LiteralPath $oldOne | Should -BeTrue
+        Test-Path -LiteralPath $oldTwo | Should -BeTrue
     }
 }
 
@@ -838,6 +960,86 @@ Describe 'Launch fixture state' {
                 Remove-Variable -Scope Script -Name previousLaunchScope -ErrorAction SilentlyContinue
             }
         }
+    }
+}
+
+Describe 'Launcher defaults persistence' {
+    BeforeEach {
+        $defaultsPathVariable = Get-Variable -Scope Script -Name DefaultsPath -ErrorAction SilentlyContinue
+        $legacyDefaultsPathVariable = Get-Variable -Scope Script -Name LegacyDefaultsPath -ErrorAction SilentlyContinue
+        $script:previousDefaultsPath = $defaultsPathVariable
+        $script:previousLegacyDefaultsPath = $legacyDefaultsPathVariable
+        $root = New-TestRoot 'launch-defaults'
+        $script:DefaultsPath = Join-Path $root 'local-app-data\myTech.Today\autoresearch-win-rtx-scheduled\launch.json'
+        $script:LegacyDefaultsPath = Join-Path $root 'canonical\scripts\launch.json'
+    }
+
+    AfterEach {
+        if ($null -ne $script:previousDefaultsPath) {
+            Set-Variable -Scope Script -Name DefaultsPath -Value $script:previousDefaultsPath.Value -Force
+        } else {
+            Remove-Variable -Scope Script -Name DefaultsPath -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $script:previousLegacyDefaultsPath) {
+            Set-Variable -Scope Script -Name LegacyDefaultsPath -Value $script:previousLegacyDefaultsPath.Value -Force
+        } else {
+            Remove-Variable -Scope Script -Name LegacyDefaultsPath -ErrorAction SilentlyContinue
+        }
+        Remove-Variable -Scope Script -Name previousDefaultsPath -ErrorAction SilentlyContinue
+        Remove-Variable -Scope Script -Name previousLegacyDefaultsPath -ErrorAction SilentlyContinue
+    }
+
+    It 'round-trips only documented non-secret fields' {
+        $expected = [ordered]@{
+            Provider          = 'azure'
+            Model             = 'gpt-4o'
+            OllamaHost        = 'http://127.0.0.1:11434'
+            AzureEndpoint     = 'https://example.openai.azure.com/'
+            AzureDeployment   = 'research'
+            LogDir            = 'C:\myTech.Today\logs'
+            ScheduleFrequency = 'Weekly'
+            ScheduleTime      = 'Wednesday'
+            SchedulerPolicy   = 'Unattended'
+        }
+        $values = @{} + $expected
+        $values.ApiKey = 'must-not-be-written'
+        $values.EnableHistory = $true
+        $values.Action = 'RunNow'
+
+        Save-LaunchDefaults -Values $values
+
+        $persisted = Get-Content -LiteralPath $script:DefaultsPath -Raw | ConvertFrom-Json
+        @($persisted.PSObject.Properties.Name | Sort-Object) | Should -Be @($expected.Keys | Sort-Object)
+        $persisted.PSObject.Properties['ApiKey'] | Should -BeNullOrEmpty
+        $persisted.PSObject.Properties['EnableHistory'] | Should -BeNullOrEmpty
+        $persisted.PSObject.Properties['Action'] | Should -BeNullOrEmpty
+
+        $loaded = Read-LaunchDefaults
+        foreach ($key in $expected.Keys) {
+            $loaded.$key | Should -Be $expected[$key]
+        }
+    }
+
+    It 'reads legacy adjacent defaults without writing them back' {
+        $legacyValues = [ordered]@{
+            Provider          = 'openai'
+            Model             = 'gpt-4o-mini'
+            OllamaHost        = 'http://localhost:11434'
+            AzureEndpoint     = ''
+            AzureDeployment   = ''
+            LogDir            = 'C:\logs\autoresearch'
+            ScheduleFrequency = 'Daily'
+            ScheduleTime      = '18:00'
+            SchedulerPolicy   = 'IdleOnly'
+        }
+        New-Dir -Path (Split-Path -Parent $script:LegacyDefaultsPath)
+        ($legacyValues | ConvertTo-Json) | Set-Content -LiteralPath $script:LegacyDefaultsPath -Encoding UTF8
+
+        $loaded = Read-LaunchDefaults
+
+        $loaded.Provider | Should -Be 'openai'
+        $loaded.Model | Should -Be 'gpt-4o-mini'
+        Test-Path -LiteralPath $script:DefaultsPath | Should -BeFalse
     }
 }
 
@@ -929,6 +1131,39 @@ Describe 'Task launch supervisor' {
         $state.status | Should -Be 'failed'
         $state.childPid | Should -Be 4243
         $state.childExitCode | Should -Be 7
+    }
+}
+
+Describe 'Task launch state persistence' {
+    BeforeEach {
+        $script:previousLaunchScope = Get-LaunchFixtureState
+        $root = New-TestRoot 'task-launch-state-writer'
+        $script:LogDir = Join-Path $root 'logs'
+        New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $script:TaskLaunchStatePath = Join-Path $script:LogDir 'autoresearch-task-launch.json'
+        Mock New-Dir { }
+        Mock Ensure-LauncherDirectoryAcl { }
+        Mock Write-Json { }
+    }
+
+    AfterEach {
+        Set-LaunchFixtureState -State $script:previousLaunchScope
+    }
+
+    It 'warns and throws when the state file cannot be written' {
+        Mock Set-Content {
+            throw 'simulated state write failure'
+        }
+
+        { Write-TaskLaunchState -State @{ status = 'starting'; parentPid = 1234 } } |
+            Should -Throw '*simulated state write failure*'
+
+        Should -Invoke Write-Json -Times 1 -Exactly -Scope It -ParameterFilter {
+            $Level -eq 'warn' -and
+            $Message -like 'Task launch state write failed*'
+        }
+        Test-Path -LiteralPath $script:TaskLaunchStatePath | Should -BeFalse
     }
 }
 
@@ -1066,8 +1301,8 @@ Describe 'Update orchestration' {
         $result.Summary | Should -Match 'ollama 0.32.1 -> 0.32.15'
         $result.Summary | Should -Match 'ai-powered left at 0.3.2'
         $script:steps | Should -Be @('uv', 'ollama', 'ai-powered', 'start-ollama', 'sync-model')
-        Assert-MockCalled Start-OllamaServer -Times 1
-        Assert-MockCalled Sync-OllamaModel -Times 1
+        Should -Invoke Start-OllamaServer -Times 1 -Exactly -Scope It
+        Should -Invoke Sync-OllamaModel -Times 1 -Exactly -Scope It
     }
 
     It 'leaves Ollama alone when another provider is selected' {
@@ -1102,8 +1337,8 @@ Describe 'Update orchestration' {
         $result.Steps[1].skipped | Should -BeTrue
         $result.Steps[1].reason | Should -Match 'does not use Ollama'
         $script:steps | Should -Be @('uv', 'ai-powered')
-        Assert-MockCalled Start-OllamaServer -Times 0
-        Assert-MockCalled Sync-OllamaModel -Times 0
+        Should -Invoke Start-OllamaServer -Times 0 -Scope It
+        Should -Invoke Sync-OllamaModel -Times 0 -Scope It
     }
 }
 
@@ -1193,6 +1428,21 @@ function Unregister-ScheduledTask {
     }
 }
 
+Describe 'Launcher quick-start guidance' {
+    It 'defaults to a local checkout workflow instead of remote execution' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+        $headerEnd = $source.IndexOf('<#')
+        $headerEnd | Should -BeGreaterThan 0
+        $header = $source.Substring(0, $headerEnd)
+
+        $header | Should -Match '(?m)^# Local Quick Start\.'
+        $header | Should -Match '(?m)^#\s+git clone https://github\.com/mytech-today-now/autoresearch-win-rtx-scheduled\.git$'
+        $header | Should -Match '(?m)^#\s+powershell -NoProfile -ExecutionPolicy Bypass -File \.\\scripts\\launch\.ps1$'
+        $header | Should -Not -Match '(?is)\biwr\b.*\biex\b'
+        $source | Should -Not -Match '(?is)\biwr\b.*\biex\b'
+    }
+}
+
 Describe 'Pester bootstrap' {
     It 'reports a clear setup error when only an older Pester version is visible' {
         $root = New-TestRoot 'pester-bootstrap'
@@ -1243,6 +1493,29 @@ if ($ApiKey) {
 import OpenAI from "$providerPackage";
 export const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 "@ -Encoding ASCII
+        $result = Invoke-ProviderVerificationForTest -Root $root
+        $result.ExitCode | Should -Not -Be 0
+        ($result.Output -join "`n") | Should -Match 'disallowed direct provider usage'
+    }
+
+    It 'fails on a copied launcher with direct provider usage' {
+        $root = New-TestRoot 'provider-launch-copy'
+        Write-ProviderVerificationFixture -Root $root
+        $providerPackage = 'open' + 'ai'
+        Set-Content -LiteralPath (Join-Path $root 'scripts\launch copy 2.ps1') -Value @"
+# import OpenAI from "$providerPackage";
+"@ -Encoding ASCII
+        $result = Invoke-ProviderVerificationForTest -Root $root
+        $result.ExitCode | Should -Not -Be 0
+        ($result.Output -join "`n") | Should -Match 'disallowed direct provider usage'
+    }
+
+    It 'fails on a Python provider literal' {
+        $root = New-TestRoot 'provider-python'
+        Write-ProviderVerificationFixture -Root $root
+        Set-Content -LiteralPath (Join-Path $root 'train.py') -Value @'
+provider_name = "openai"
+'@ -Encoding ASCII
         $result = Invoke-ProviderVerificationForTest -Root $root
         $result.ExitCode | Should -Not -Be 0
         ($result.Output -join "`n") | Should -Match 'disallowed direct provider usage'

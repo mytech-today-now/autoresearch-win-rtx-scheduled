@@ -1,17 +1,17 @@
 #Requires -Version 5.1
-# Quick Start (remote one-liner). Either form installs this repo to
-# %HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\ and runs launch.ps1
-# from there, forwarding any CLI arguments verbatim.
+# Local Quick Start. Clone the repository, review this script, then run it
+# from the checkout. The launcher will keep using its canonical install path
+# for subsequent runs and forwards any CLI arguments verbatim.
 #   PowerShell:
-#     powershell -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1 | iex"
-#   CMD:
-#     powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr 'https://raw.githubusercontent.com/mytech-today-now/autoresearch-win-rtx-scheduled/refs/heads/main/scripts/launch.ps1' | iex"
+#     git clone https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git
+#     Set-Location autoresearch-win-rtx-scheduled
+#     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\launch.ps1
 <#
 .SYNOPSIS
     Runs `uv run train.py` via the `ai-powered` CLI against a selected AI
     provider, optionally executed by a Windows Scheduled Task. Self-installs
     to %HOMEDRIVE%\myTech.Today\autoresearch-win-rtx-scheduled\ when invoked
-    from anywhere else (including via `iwr ... | iex`). Presents a WPF GUI
+    from anywhere else. Presents a WPF GUI
     by default; pass -NoGui for unattended/headless invocations. The GUI and
     CLI now expose an explicit scheduler policy so the task can be registered
     as interactive, idle-only, or unattended.
@@ -21,6 +21,14 @@
     streams stdout/stderr as JSON lines to a per-invocation log, and manages
     a Scheduled Task named Autoresearch-Train. Pure non-interactive workflow.
     Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+
+    Persisted launcher defaults are human-readable, non-secret convenience
+    settings stored per user under %LOCALAPPDATA%\myTech.Today\autoresearch-
+    win-rtx-scheduled\launch.json. The file contains provider, model, Ollama
+    host, Azure endpoint/deployment, log directory, schedule, and scheduler
+    policy values only. It is not encrypted; the API key is never written.
+    A legacy launch.json beside the canonical script is read for compatibility
+    but is never written by the current launcher.
 
     USAGE OVERVIEW
     --------------
@@ -86,7 +94,9 @@
     Per-run files are retained with a hybrid policy: keep anything newer
     than `-LogRetentionDays`, keep up to `-LogRetentionCount` older files,
     and always preserve the most recent success and most recent failure when
-    they exist. The aggregate log is never rotated.
+    they exist. Before deleting any eligible files, the aggregate log receives
+    a pruning plan; a completion summary is appended after the delete
+    attempts. The aggregate log is never rotated.
     Default: "$env:HOMEDRIVE\myTech.Today\logs" (typically C:\myTech.Today\logs).
 
     Example:
@@ -360,11 +370,17 @@ $Script:ScheduledTaskAuthor = 'myTech.Today (sales@mytech.today)'
 $Script:InstallRoot = Join-Path $env:HOMEDRIVE 'myTech.Today'
 $Script:CanonicalRepo = Join-Path $Script:InstallRoot 'autoresearch-win-rtx-scheduled'
 $Script:CanonicalScript = Join-Path $Script:CanonicalRepo 'scripts\launch.ps1'
-$Script:DefaultsPath = Join-Path (Split-Path -Parent $Script:CanonicalScript) 'launch.json'
+$Script:LegacyDefaultsPath = Join-Path (Split-Path -Parent $Script:CanonicalScript) 'launch.json'
+$Script:DefaultsPath = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    Join-Path $env:LOCALAPPDATA 'myTech.Today\autoresearch-win-rtx-scheduled\launch.json'
+} else {
+    $Script:LegacyDefaultsPath
+}
 $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
 $Script:TaskLaunchStatePath = Join-Path $LogDir 'autoresearch-task-launch.json'
+$Script:LauncherAclStatus = @{}
 $Script:LogRetentionCount = $LogRetentionCount
 $Script:LogRetentionDays = $LogRetentionDays
 $Script:DebugEnabled = [bool]$Debug
@@ -497,6 +513,214 @@ function New-Dir {
     }
 }
 
+function Test-WindowsHost {
+    return [System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+}
+
+function Get-LauncherAclPrincipals {
+    if (-not (Test-WindowsHost)) {
+        throw 'Windows ACLs are only available on Windows hosts.'
+    }
+
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $principals = @(
+        $currentUser
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18')     # LocalSystem
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')  # Built-in Administrators
+    )
+
+    $seen = @{}
+    return @($principals | Where-Object {
+        if ($seen.ContainsKey($_.Value)) { return $false }
+        $seen[$_.Value] = $true
+        return $true
+    })
+}
+
+function ConvertTo-LauncherSidValue {
+    param([Parameter(Mandatory)]$IdentityReference)
+    if ($IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+        return $IdentityReference.Value
+    }
+    try {
+        return $IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return [string]$IdentityReference
+    }
+}
+
+function Test-LauncherDirectoryAcl {
+    param(
+        [Parameter(Mandatory)][string]$Path
+    )
+
+    $result = [ordered]@{
+        Path              = $Path
+        IsHardened        = $false
+        Owner             = $null
+        ExpectedOwner    = $null
+        MissingPrincipals = @()
+        UnexpectedRules   = @()
+        InheritanceLocked = $false
+        Reason            = $null
+    }
+
+    if (-not (Test-WindowsHost)) {
+        $result.Reason = 'Windows ACL verification is unavailable on this host.'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $principals = @(Get-LauncherAclPrincipals)
+        $allowedSids = @($principals | ForEach-Object { $_.Value })
+        $result.ExpectedOwner = $principals[0].Value
+        $result.Owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+
+        $readRight = [int][System.Security.AccessControl.FileSystemRights]::Read
+        $missing = New-Object System.Collections.Generic.List[string]
+        foreach ($principal in $principals) {
+            $rules = @($acl.Access | Where-Object {
+                $sid = ConvertTo-LauncherSidValue -IdentityReference $_.IdentityReference
+                $hasRead = (([int]$_.FileSystemRights -band $readRight) -eq $readRight)
+                $sid -eq $principal.Value -and
+                    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                    $hasRead
+            })
+            $denyRules = @($acl.Access | Where-Object {
+                (ConvertTo-LauncherSidValue -IdentityReference $_.IdentityReference) -eq $principal.Value -and
+                    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny
+            })
+            if ($rules.Count -eq 0 -or $denyRules.Count -gt 0) {
+                $missing.Add($principal.Value) | Out-Null
+            }
+        }
+
+        $unexpected = @($acl.Access | Where-Object {
+            $sid = ConvertTo-LauncherSidValue -IdentityReference $_.IdentityReference
+            $sid -notin $allowedSids
+        } | ForEach-Object {
+            '{0}:{1}:{2}' -f (ConvertTo-LauncherSidValue -IdentityReference $_.IdentityReference),
+                $_.AccessControlType, $_.FileSystemRights
+        })
+
+        $result.MissingPrincipals = @($missing)
+        $result.UnexpectedRules = @($unexpected)
+        $result.InheritanceLocked = [bool]$acl.AreAccessRulesProtected
+        $ownerMatches = $result.Owner -eq $result.ExpectedOwner
+        $result.IsHardened = $ownerMatches -and
+            $result.InheritanceLocked -and
+            $result.MissingPrincipals.Count -eq 0 -and
+            $result.UnexpectedRules.Count -eq 0
+
+        if (-not $result.IsHardened) {
+            $result.Reason = 'The owner, protected inheritance, or explicit allow rules did not match the launcher ACL policy.'
+        }
+    } catch {
+        $result.Reason = $_.Exception.Message
+    }
+
+    return [pscustomobject]$result
+}
+
+function Set-LauncherDirectoryAcl {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+
+    try {
+        if (-not (Test-WindowsHost)) {
+            throw 'Windows ACL hardening is unavailable on this host.'
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Dir -Path $Path
+        }
+
+        $principals = @(Get-LauncherAclPrincipals)
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $acl.SetOwner($principals[0])
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($existingRule in @($acl.Access)) {
+            [void]$acl.RemoveAccessRule($existingRule)
+        }
+
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        foreach ($principal in $principals) {
+            $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $principal,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $inheritance,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $acl.AddAccessRule($rule)
+        }
+
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        $verification = Test-LauncherDirectoryAcl -Path $Path
+        if (-not $verification.IsHardened) {
+            throw "ACL verification failed: $($verification.Reason)"
+        }
+        return $verification
+    } catch {
+        $warning = "ACL hardening failed for $Purpose '$Path': $($_.Exception.Message). The launcher will continue with the existing permissions; logs and task state may be readable by other accounts."
+        Write-Warning $warning
+        return [pscustomobject]@{
+            Path       = $Path
+            IsHardened = $false
+            Reason     = $_.Exception.Message
+            Warning    = $warning
+        }
+    }
+}
+
+function Ensure-LauncherDirectoryAcl {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+
+    if ($null -eq (Get-Variable -Scope Script -Name LauncherAclStatus -ErrorAction SilentlyContinue)) {
+        $Script:LauncherAclStatus = @{}
+    }
+    try {
+        $key = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    } catch {
+        $key = $Path
+    }
+    if ($Script:LauncherAclStatus.ContainsKey($key)) {
+        return $Script:LauncherAclStatus[$key]
+    }
+
+    $verification = Test-LauncherDirectoryAcl -Path $Path
+    $result = if ($verification.IsHardened) {
+        $verification
+    } else {
+        Set-LauncherDirectoryAcl -Path $Path -Purpose $Purpose
+    }
+    $Script:LauncherAclStatus[$key] = $result
+    return $result
+}
+
+function Initialize-LauncherStorage {
+    New-Dir -Path $LogDir
+    $statePath = Get-TaskLaunchStatePath
+    $stateDirectory = Split-Path -Parent $statePath
+    if ([string]::IsNullOrWhiteSpace($stateDirectory)) {
+        $stateDirectory = $LogDir
+    }
+    New-Dir -Path $stateDirectory
+
+    Ensure-LauncherDirectoryAcl -Path $LogDir -Purpose 'launcher log root' | Out-Null
+    $logFullPath = [System.IO.Path]::GetFullPath($LogDir).TrimEnd('\', '/')
+    $stateFullPath = [System.IO.Path]::GetFullPath($stateDirectory).TrimEnd('\', '/')
+    if ($stateFullPath -ne $logFullPath) {
+        Ensure-LauncherDirectoryAcl -Path $stateDirectory -Purpose 'task launch state directory' | Out-Null
+    }
+}
+
 function Write-Json {
     param(
         [ValidateSet('info', 'warn', 'error', 'stdout', 'stderr', 'debug')][string]$Level,
@@ -512,7 +736,9 @@ function Write-Json {
         foreach ($k in $Extra.Keys) { $record[$k] = $Extra[$k] }
     }
     $line = $record | ConvertTo-Json -Compress -Depth 6
-    New-Dir (Split-Path -Parent $Script:AggregateLog)
+    $aggregateDirectory = Split-Path -Parent $Script:AggregateLog
+    New-Dir -Path $aggregateDirectory
+    Ensure-LauncherDirectoryAcl -Path $aggregateDirectory -Purpose 'launcher log root' | Out-Null
     Add-Content -LiteralPath $Script:AggregateLog -Value $line -Encoding UTF8
     if ($Script:RunLogPath) {
         Add-Content -LiteralPath $Script:RunLogPath -Value $line -Encoding UTF8
@@ -589,17 +815,22 @@ function Write-TaskLaunchState {
     param([Parameter(Mandatory)][hashtable]$State)
     try {
         $statePath = Get-TaskLaunchStatePath
-        New-Dir (Split-Path -Parent $statePath)
+        $stateDirectory = Split-Path -Parent $statePath
+        New-Dir -Path $stateDirectory
+        Ensure-LauncherDirectoryAcl -Path $stateDirectory -Purpose 'task launch state directory' | Out-Null
         $redactedState = Get-RedactedTaskLaunchState -State $State
         ($redactedState | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath $statePath -Encoding UTF8
     } catch {
+        $stateWriteError = $_
+        $message = "Task launch state write failed at '$(Get-TaskLaunchStatePath)': $($stateWriteError.Exception.Message)"
         try {
-            Write-Json -Level warn -Message "Task launch state write failed: $($_.Exception.Message)" -Extra @{
+            Write-Json -Level warn -Message $message -Extra @{
                 statePath = (Get-TaskLaunchStatePath)
             }
         } catch {
-            # Keep diagnostics best-effort only.
+            Write-Warning $message
         }
+        throw $stateWriteError.Exception
     }
 }
 
@@ -755,7 +986,7 @@ function Assert-RepoLayout {
 
 function Invoke-Preflight {
     Write-DebugLog "Invoke-Preflight: begin (Provider=$Provider Model=$Model LogDir=$LogDir)"
-    New-Dir $LogDir
+    Initialize-LauncherStorage
     Write-DebugLog "Invoke-Preflight: ensuring 'uv' present"
     Install-Tool -Name 'uv' -WingetId 'astral-sh.uv' -PipxPackage 'uv' -PipPackage 'uv'
     Write-DebugLog "Invoke-Preflight: ensuring 'ai-powered' present"
@@ -1289,6 +1520,46 @@ function Limit-RunLogs {
     $plan = Get-RunLogRetentionPlan -LogDir $LogDir -LogRetentionCount $LogRetentionCount -LogRetentionDays $LogRetentionDays
     if (-not $plan.Pruned -or $plan.Pruned.Count -eq 0) { return $plan }
 
+    # Capture the pruning plan before deleting anything. This preserves the
+    # postmortem record even if a delete attempt removes the only per-run copy
+    # of an incident's evidence. A write failure must stop pruning.
+    $plannedDeletedSummary = @($plan.Pruned | ForEach-Object {
+        [pscustomobject]@{
+            name    = $_.Name
+            reasons = @($_.DeleteReasons)
+        }
+    })
+    $plannedCount = @($plan.Pruned).Count
+    $plannedSummary = [pscustomobject]@{
+        phase              = 'planned'
+        eligibleCount      = $plannedCount
+        plannedDeleteCount = $plannedCount
+        deletedCount       = 0
+        failedCount        = 0
+        retentionCount     = $LogRetentionCount
+        retentionDays      = $LogRetentionDays
+        cutoffUtc          = $plan.CutoffUtc.ToString('o')
+        latestSuccess      = if ($plan.LatestSuccess) { $plan.LatestSuccess.Name } else { $null }
+        latestFailure      = if ($plan.LatestFailure) { $plan.LatestFailure.Name } else { $null }
+        planned            = $plannedDeletedSummary
+        deleted            = @()
+        failed             = @()
+    }
+    $plannedSummaryMessage = "Run log pruning reviewed $($plan.Entries.Count) file(s); scheduled $plannedCount for deletion."
+    if ($plan.LatestSuccess -or $plan.LatestFailure) {
+        $anchorBits = @()
+        if ($plan.LatestSuccess) { $anchorBits += "latest success=$($plan.LatestSuccess.Name)" }
+        if ($plan.LatestFailure) { $anchorBits += "latest failure=$($plan.LatestFailure.Name)" }
+        $plannedSummaryMessage += " Anchors kept: $($anchorBits -join '; ')."
+    }
+    try {
+        Write-Json -Level info -Message $plannedSummaryMessage -Extra @{
+            pruning = $plannedSummary
+        }
+    } catch {
+        throw "Run log pruning plan could not be recorded before deletion: $($_.Exception.Message)"
+    }
+
     $deleted = New-Object System.Collections.Generic.List[object]
     $failed = New-Object System.Collections.Generic.List[object]
 
@@ -1320,7 +1591,9 @@ function Limit-RunLogs {
     }
 
     $summary = [pscustomobject]@{
+        phase          = 'completed'
         eligibleCount  = $plan.Pruned.Count
+        plannedDeleteCount = $plannedCount
         deletedCount   = $deleted.Count
         failedCount    = $failed.Count
         retentionCount = $LogRetentionCount
@@ -1328,6 +1601,7 @@ function Limit-RunLogs {
         cutoffUtc      = $plan.CutoffUtc.ToString('o')
         latestSuccess  = if ($plan.LatestSuccess) { $plan.LatestSuccess.Name } else { $null }
         latestFailure  = if ($plan.LatestFailure) { $plan.LatestFailure.Name } else { $null }
+        planned        = $plannedDeletedSummary
         deleted        = $deletedSummary
         failed         = $failedSummary
     }
@@ -2222,21 +2496,40 @@ $Script:ProviderModels = @{
 }
 
 function Read-LaunchDefaults {
-    if (Test-Path -LiteralPath $Script:DefaultsPath) {
-        try { return Get-Content -LiteralPath $Script:DefaultsPath -Raw | ConvertFrom-Json } catch { return $null }
+    $paths = @($Script:DefaultsPath)
+    if ($Script:LegacyDefaultsPath -and $Script:LegacyDefaultsPath -ne $Script:DefaultsPath) {
+        $paths += $Script:LegacyDefaultsPath
+    }
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        try { return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { continue }
     }
     return $null
 }
 
 function Save-LaunchDefaults {
-    param([hashtable]$Values)
+    param([System.Collections.IDictionary]$Values)
+    $persistedKeys = @(
+        'Provider', 'Model', 'OllamaHost', 'AzureEndpoint', 'AzureDeployment',
+        'LogDir', 'ScheduleFrequency', 'ScheduleTime', 'SchedulerPolicy'
+    )
+    $persisted = [ordered]@{}
+    foreach ($key in $persistedKeys) {
+        if ($Values.Contains($key)) {
+            $persisted[$key] = $Values[$key]
+        }
+    }
     New-Dir (Split-Path -Parent $Script:DefaultsPath)
-    ($Values | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Script:DefaultsPath -Encoding UTF8
+    ($persisted | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Script:DefaultsPath -Encoding UTF8
 }
 
 function Initialize-LaunchConfig {
     param([System.Collections.IDictionary]$Bound)
-    if (Test-Path -LiteralPath $Script:DefaultsPath) {
+    $hasDefaults = Test-Path -LiteralPath $Script:DefaultsPath
+    if (-not $hasDefaults -and $Script:LegacyDefaultsPath -and $Script:LegacyDefaultsPath -ne $Script:DefaultsPath) {
+        $hasDefaults = Test-Path -LiteralPath $Script:LegacyDefaultsPath
+    }
+    if ($hasDefaults) {
         $d = Read-LaunchDefaults
         if ($d) {
             foreach ($k in 'Provider','Model','OllamaHost','AzureEndpoint','AzureDeployment','LogDir','ScheduleFrequency','ScheduleTime','SchedulerPolicy') {
@@ -2311,19 +2604,19 @@ function Show-LaunchGui {
               <RadioButton x:Name="PrvAnthropic" GroupName="prv" TabIndex="8" Margin="0,0,8,4"><TextBlock Text="Anthropic" TextWrapping="Wrap"/></RadioButton>
               <RadioButton x:Name="PrvAzure" GroupName="prv" TabIndex="9" Margin="0,0,8,4"><TextBlock Text="Azure OpenAI" TextWrapping="Wrap"/></RadioButton>
             </WrapPanel>
-            <TextBlock Text="Model" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <ComboBox x:Name="CbModel" TabIndex="10" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
-            <TextBlock Text="Ollama host (Ollama only)" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <ComboBox x:Name="CbHost" TabIndex="11" HorizontalAlignment="Stretch" MinWidth="260" IsEditable="True" Margin="0,0,0,6">
+            <TextBlock x:Name="LblModel" Text="Model" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbModel" TabIndex="10" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblModel}" AutomationProperties.HelpText="Choose the model used by the selected provider."/>
+            <TextBlock x:Name="LblHost" Text="Ollama host (Ollama only)" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbHost" TabIndex="11" HorizontalAlignment="Stretch" MinWidth="260" IsEditable="True" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblHost}" AutomationProperties.HelpText="Enter the Ollama base URL when Ollama is selected.">
           <ComboBoxItem Content="http://127.0.0.1:11434" IsSelected="True"/>
           <ComboBoxItem Content="http://localhost:11434"/>
         </ComboBox>
-            <TextBlock Text="API key (OpenAI / Anthropic / Azure)" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <PasswordBox x:Name="PbApiKey" TabIndex="12" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
+            <TextBlock x:Name="LblApiKey" Text="API key (OpenAI / Anthropic / Azure)" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <PasswordBox x:Name="PbApiKey" TabIndex="12" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblApiKey}" AutomationProperties.HelpText="Enter the provider API key. It is used in memory only and is never persisted."/>
             <TextBlock x:Name="LblAzEp" Text="Azure endpoint" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <TextBox x:Name="TxtAzEp" TabIndex="13" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed" Margin="0,0,0,6"/>
+            <TextBox x:Name="TxtAzEp" TabIndex="13" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblAzEp}" AutomationProperties.HelpText="Enter the Azure OpenAI endpoint URL."/>
             <TextBlock x:Name="LblAzDp" Text="Azure deployment" Visibility="Collapsed" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <TextBox x:Name="TxtAzDp" TabIndex="14" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed"/>
+            <TextBox x:Name="TxtAzDp" TabIndex="14" HorizontalAlignment="Stretch" MinWidth="260" Visibility="Collapsed" AutomationProperties.LabeledBy="{Binding ElementName=LblAzDp}" AutomationProperties.HelpText="Enter the Azure OpenAI deployment name."/>
           </StackPanel>
         </GroupBox>
         <GroupBox Header="Scheduler policy" Padding="6" Margin="0,0,0,6">
@@ -2336,23 +2629,23 @@ function Show-LaunchGui {
         </GroupBox>
         <GroupBox Header="Schedule" Padding="6" Margin="0,0,0,6">
           <StackPanel>
-            <TextBlock Text="Frequency" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <ComboBox x:Name="CbFreq" TabIndex="18" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6">
+            <TextBlock x:Name="LblFreq" Text="Frequency" TextWrapping="Wrap" Margin="0,0,0,2"/>
+            <ComboBox x:Name="CbFreq" TabIndex="18" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblFreq}" AutomationProperties.HelpText="Choose how often the task runs. The time field below changes with this selection.">
               <ComboBoxItem Content="Hourly"/>
               <ComboBoxItem Content="Daily" IsSelected="True"/>
               <ComboBoxItem Content="Weekly"/>
             </ComboBox>
             <TextBlock x:Name="LblTime" Text="Time (HH:mm, local)" TextWrapping="Wrap" Margin="0,0,0,2"/>
-            <ComboBox x:Name="CbTime" TabIndex="19" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6"/>
-            <CheckBox x:Name="ChkHistory" TabIndex="20" IsChecked="True" Margin="0,6,0,0"><TextBlock Text="Enable Task Scheduler history (requires elevation)" TextWrapping="Wrap"/></CheckBox>
+            <ComboBox x:Name="CbTime" TabIndex="19" HorizontalAlignment="Stretch" MinWidth="260" Margin="0,0,0,6" AutomationProperties.LabeledBy="{Binding ElementName=LblTime}" AutomationProperties.HelpText="Choose the time, minute, or weekday value for the selected frequency."/>
+            <CheckBox x:Name="ChkHistory" TabIndex="20" IsChecked="True" Margin="0,6,0,0" AutomationProperties.Name="Enable Task Scheduler history" AutomationProperties.HelpText="Requires elevation to turn on the Task Scheduler Operational log."><TextBlock Text="Enable Task Scheduler history (requires elevation)" TextWrapping="Wrap"/></CheckBox>
           </StackPanel>
         </GroupBox>
       </StackPanel>
     </ScrollViewer>
     <StackPanel Grid.Row="1" Orientation="Horizontal" HorizontalAlignment="Right">
-      <Button x:Name="BtnDefaults" TabIndex="21" MinWidth="130" Margin="0,0,6,0"><TextBlock Text="Save as Defaults" TextWrapping="Wrap"/></Button>
-      <Button x:Name="BtnCancel" TabIndex="22" MinWidth="90" Margin="0,0,6,0" IsCancel="True"><TextBlock Text="Cancel" TextWrapping="Wrap"/></Button>
-      <Button x:Name="BtnOK" TabIndex="23" MinWidth="90" IsDefault="True"><TextBlock Text="OK" TextWrapping="Wrap"/></Button>
+      <Button x:Name="BtnDefaults" TabIndex="21" MinWidth="130" Margin="0,0,6,0" AutomationProperties.Name="Save as Defaults" AutomationProperties.HelpText="Save the current launcher selections without the API key."><TextBlock Text="Save as Defaults" TextWrapping="Wrap"/></Button>
+      <Button x:Name="BtnCancel" TabIndex="22" MinWidth="90" Margin="0,0,6,0" IsCancel="True" AutomationProperties.Name="Cancel" AutomationProperties.HelpText="Close the launcher without saving changes."><TextBlock Text="Cancel" TextWrapping="Wrap"/></Button>
+      <Button x:Name="BtnOK" TabIndex="23" MinWidth="90" IsDefault="True" AutomationProperties.Name="OK" AutomationProperties.HelpText="Start with the current selections."><TextBlock Text="OK" TextWrapping="Wrap"/></Button>
     </StackPanel>
   </Grid>
 </Window>
@@ -2591,7 +2884,7 @@ if (Test-TruthyEnvValue $env:AUTORESEARCH_DOT_SOURCE_ONLY) {
 }
 
 try {
-    New-Dir $LogDir
+    Initialize-LauncherStorage
     if ($Script:DebugEnabled) {
         Write-Json -Level info -Message "Debug logging enabled" -Extra @{
             aggregateLog = $Script:AggregateLog
@@ -2623,6 +2916,9 @@ try {
         $ScheduleTime = Get-ScheduleTimeDefault -Frequency $ScheduleFrequency
     }
     Initialize-LaunchConfig -Bound $PSBoundParameters
+    # Defaults may select a custom log directory, so protect the final path
+    # after persisted configuration has been applied as well.
+    Initialize-LauncherStorage
     $scheduleOpts = Get-ScheduleTimeOptions -Frequency $ScheduleFrequency
     if ($scheduleOpts -notcontains $ScheduleTime) {
         if ($PSBoundParameters.ContainsKey('ScheduleTime')) {

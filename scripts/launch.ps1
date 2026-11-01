@@ -470,15 +470,32 @@ function Invoke-Bootstrap {
     } else {
         $status = & git -C $Script:CanonicalRepo status --porcelain 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Unable to inspect canonical install at '$Script:CanonicalRepo' before bootstrap (git status --porcelain failed with exit $LASTEXITCODE)."
+            Write-Error "Unable to inspect canonical install at '$Script:CanonicalRepo' before bootstrap (git status --porcelain failed with exit $LASTEXITCODE)." -ErrorAction Continue
             exit 4
         }
         if (-not [string]::IsNullOrWhiteSpace($status)) {
-            Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because it has local changes. Commit, stash, or clean the tree before re-running."
+            $dirtyEntries = @(
+                $status -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            )
+            Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because it has local changes. Commit, stash, or clean the tree before re-running." -ErrorAction Continue
+            foreach ($entry in $dirtyEntries) {
+                Write-BootstrapMessage "  $entry"
+            }
             exit 4
         }
+
+        $originOutput = & git -C $Script:CanonicalRepo remote get-url --all origin 2>&1 | Out-String
+        $originExitCode = $LASTEXITCODE
+        $origins = @(
+            $originOutput -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($originExitCode -ne 0 -or $origins.Count -ne 1 -or $origins[0] -cne $Script:RepoUrl) {
+            Write-Error "Refusing to update canonical install at '$Script:CanonicalRepo' because its origin could not be verified as the expected repository '$Script:RepoUrl'. Check 'git remote -v' and correct it only if this is the intended checkout." -ErrorAction Continue
+            exit 4
+        }
+
         & git -C $Script:CanonicalRepo pull --ff-only | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Error "git pull --ff-only failed for '$Script:CanonicalRepo'"; exit 3 }
+        if ($LASTEXITCODE -ne 0) { Write-Error "git pull --ff-only failed for '$Script:CanonicalRepo'" -ErrorAction Continue; exit 3 }
     }
     $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwshCmd) { $pwshCmd = Get-Command powershell.exe -ErrorAction Stop }
@@ -2652,8 +2669,8 @@ function Show-LaunchGui {
 "@
     $reader = New-Object System.Xml.XmlNodeReader $xaml
     $window = [Windows.Markup.XamlReader]::Load($reader)
-    $window.MaxWidth = [SystemParameters]::WorkArea.Width
-    $window.MaxHeight = [SystemParameters]::WorkArea.Height
+    $window.MaxWidth = [System.Windows.SystemParameters]::WorkArea.Width
+    $window.MaxHeight = [System.Windows.SystemParameters]::WorkArea.Height
     Write-DebugLog "Show-LaunchGui: XAML loaded"
     $script:C = @{}
     foreach ($n in 'ActPreflight','ActRunNow','ActRegister','ActRegisterRun','ActUnregister','ActUpdate',

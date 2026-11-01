@@ -279,8 +279,8 @@ function Test-LaunchGuiRenderedLayout {
 
 function Test-LaunchWindowBounds {
     $launch = Get-Content -Path (Join-Path $PSScriptRoot "launch.ps1") -Raw
-    Assert-True ($launch.Contains('$window.MaxWidth = [SystemParameters]::WorkArea.Width')) "Launcher must cap width to the work area."
-    Assert-True ($launch.Contains('$window.MaxHeight = [SystemParameters]::WorkArea.Height')) "Launcher must cap height to the work area."
+    Assert-True ($launch.Contains('$window.MaxWidth = [System.Windows.SystemParameters]::WorkArea.Width')) "Launcher must cap width to the work area."
+    Assert-True ($launch.Contains('$window.MaxHeight = [System.Windows.SystemParameters]::WorkArea.Height')) "Launcher must cap height to the work area."
     Assert-True ($launch.Contains('KeyboardNavigation.TabNavigation="Cycle"')) "Launcher must keep tab navigation cycling within the dialog."
     Assert-True ($launch.Contains('KeyboardNavigation.DirectionalNavigation="Contained"')) "Launcher must keep directional navigation contained."
     Assert-True ($launch.Contains('ActRunNow.Focus()')) "Launcher must set initial keyboard focus to the primary action."

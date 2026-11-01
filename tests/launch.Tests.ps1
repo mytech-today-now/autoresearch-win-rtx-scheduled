@@ -281,23 +281,114 @@ function script:New-FakeGitCommand {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$LogPath,
-        [switch]$DirtyStatus
+        [int]$PullExitCode = 0
     )
     $bin = Join-Path $Root 'bin'
     New-Item -ItemType Directory -Path $bin -Force | Out-Null
-    $statusEcho = if ($DirtyStatus) { 'echo M dirty.txt' } else { 'echo.' }
+    $gitExecutable = (Get-Command git.exe -ErrorAction Stop).Source
     $content = @"
 @echo off
 setlocal
 echo %*>>"$LogPath"
-echo %* | findstr /i "status" >nul
-if not errorlevel 1 (
-    $statusEcho
+if /i "%1"=="clone" exit /b 81
+if /i "%1"=="-C" if /i "%3"=="pull" exit /b $PullExitCode
+if /i "%1"=="-C" if /i "%3"=="status" (
+    "$gitExecutable" %*
+    exit /b %errorlevel%
+)
+if /i "%1"=="-C" if /i "%3"=="remote" (
+    "$gitExecutable" %*
+    exit /b %errorlevel%
 )
 exit /b 0
 "@
     Set-Content -LiteralPath (Join-Path $bin 'git.cmd') -Value $content -Encoding ASCII
     return $bin
+}
+
+function script:New-TemporaryGitRepository {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$OriginUrl,
+        [switch]$Dirty
+    )
+
+    New-Item -ItemType Directory -Path (Join-Path $Root 'scripts') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $Root '.gitignore') -Value 'ignored.sentinel' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Root 'tracked.txt') -Value 'tracked baseline' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Root 'scripts\launch.ps1') -Value '# canonical launcher fixture' -Encoding ASCII
+
+    & git.exe -C $Root init --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the temporary Git repository.' }
+    & git.exe -C $Root add -- .gitignore tracked.txt scripts/launch.ps1
+    if ($LASTEXITCODE -ne 0) { throw 'Could not stage the temporary Git repository fixture.' }
+    & git.exe -C $Root -c user.name=BootstrapTest -c user.email=bootstrap@example.invalid commit --quiet -m initial
+    if ($LASTEXITCODE -ne 0) { throw 'Could not commit the temporary Git repository fixture.' }
+    & git.exe -C $Root remote add origin $OriginUrl
+    if ($LASTEXITCODE -ne 0) { throw 'Could not configure the temporary Git repository origin.' }
+
+    $trackedPath = Join-Path $Root 'tracked.txt'
+    $untrackedPath = Join-Path $Root 'untracked.sentinel'
+    $ignoredPath = Join-Path $Root 'ignored.sentinel'
+    if ($Dirty) {
+        Set-Content -LiteralPath $trackedPath -Value 'tracked user edit' -Encoding ASCII
+        Set-Content -LiteralPath $untrackedPath -Value 'untracked user data' -Encoding ASCII
+    }
+    Set-Content -LiteralPath $ignoredPath -Value 'ignored user data' -Encoding ASCII
+
+    return [pscustomobject]@{
+        TrackedPath   = $trackedPath
+        UntrackedPath = $untrackedPath
+        IgnoredPath   = $ignoredPath
+        LauncherPath  = Join-Path $Root 'scripts\launch.ps1'
+    }
+}
+
+function script:Invoke-BootstrapTestFixture {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][string]$CanonicalRepo,
+        [Parameter(Mandatory)][string]$GitBin,
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$RepoUrl,
+        [string[]]$ForwardArgs = @()
+    )
+
+    $startProcessLog = Join-Path $Root 'start-process.log'
+    $removeItemLog = Join-Path $Root 'remove-item.log'
+    $command = @"
+`$ErrorActionPreference = 'Continue'
+`$env:AUTORESEARCH_DOT_SOURCE_ONLY = '1'
+function Start-Process {
+    [CmdletBinding()]
+    param(
+        [string]`$FilePath,
+        [object[]]`$ArgumentList,
+        [switch]`$NoNewWindow,
+        [switch]`$PassThru,
+        [switch]`$Wait
+    )
+    [System.IO.File]::AppendAllText($(ConvertTo-SingleQuotedLiteral $startProcessLog), (`$FilePath + '|' + (`$ArgumentList -join '|') + [Environment]::NewLine))
+    return [pscustomobject]@{ ExitCode = 0 }
+}
+function Remove-Item {
+    [CmdletBinding()]
+    param(
+        [string]`$LiteralPath,
+        [switch]`$Recurse,
+        [switch]`$Force
+    )
+    [System.IO.File]::AppendAllText($(ConvertTo-SingleQuotedLiteral $removeItemLog), (`$LiteralPath + [Environment]::NewLine))
+}
+`$env:PATH = $(ConvertTo-SingleQuotedLiteral $GitBin) + ';' + `$env:PATH
+. $(ConvertTo-SingleQuotedLiteral $ScriptPath)
+Set-Variable -Scope Script -Name CanonicalRepo -Value $(ConvertTo-SingleQuotedLiteral $CanonicalRepo) -Force
+Set-Variable -Scope Script -Name CanonicalScript -Value $(ConvertTo-SingleQuotedLiteral (Join-Path $CanonicalRepo 'scripts\launch.ps1')) -Force
+Set-Variable -Scope Script -Name RepoUrl -Value $(ConvertTo-SingleQuotedLiteral $RepoUrl) -Force
+Invoke-Bootstrap -ForwardArgs @($(($ForwardArgs | ForEach-Object { ConvertTo-SingleQuotedLiteral $_ }) -join ','))
+"@
+
+    return Invoke-PowershellCommandForTest -Command $command -Environment @{ PATH = "$GitBin;$env:PATH" }
 }
 
 function script:Write-FakePesterModule {
@@ -1393,6 +1484,113 @@ if (-not (Get-Command Invoke-Bootstrap -ErrorAction SilentlyContinue)) {
         Test-Path -LiteralPath $fakeGitLog | Should -BeFalse
     }
 
+    It 'refuses a dirty canonical install and preserves tracked, untracked, and ignored files when clone would fail' {
+        $root = New-TestRoot 'dirty-bootstrap-refusal'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $canonicalRepo = Join-Path $root 'canonical repo'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        $repoFiles = New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl -Dirty
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
+        $untrackedBefore = Get-Content -LiteralPath $repoFiles.UntrackedPath -Raw
+        $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+        $result.ExitCode | Should -Not -Be 0
+        (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
+        (Get-Content -LiteralPath $repoFiles.UntrackedPath -Raw) | Should -BeExactly $untrackedBefore
+        (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
+        $output = $result.Output -join "`n"
+        $output | Should -Match '(?s)Refusing to bootstrap canonical install .* because it has local changes'
+        $output | Should -Match 'tracked.txt'
+        $output | Should -Match 'untracked.sentinel'
+        $gitLog = Get-Content -LiteralPath $fakeGitLog -Raw
+        $gitLog | Should -Match 'status --porcelain'
+        $gitLog | Should -Not -Match '\b(pull|clone)\b'
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
+    }
+
+    It 'refuses an unexpected origin and preserves the existing canonical tree' {
+        $root = New-TestRoot 'origin-mismatch-bootstrap'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $canonicalRepo = Join-Path $root 'canonical'
+        $repoFiles = New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl 'https://wrong.invalid/other.git'
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
+        $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
+        $expectedRepoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $expectedRepoUrl
+
+        $result.ExitCode | Should -Not -Be 0
+        (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
+        (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
+        ($result.Output -join "`n") | Should -Match 'origin could not be verified as the expected repository'
+        $gitLog = Get-Content -LiteralPath $fakeGitLog -Raw
+        $gitLog | Should -Match 'remote get-url --all origin'
+        $gitLog | Should -Not -Match '\b(pull|clone)\b'
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
+    }
+
+    It 'updates a clean canonical checkout with the expected origin and forwards arguments once' {
+        $root = New-TestRoot 'clean-bootstrap-update'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $canonicalRepo = Join-Path $root 'canonical'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        $repoFiles = New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
+        $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl -ForwardArgs @('-NoGui', '--custom', 'value with spaces')
+
+        $result.ExitCode | Should -Be 0
+        (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
+        (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only$' }) | Should -HaveCount 1
+        @((Get-Content -LiteralPath (Join-Path $root 'start-process.log'))).Count | Should -Be 1
+        (Get-Content -LiteralPath (Join-Path $root 'start-process.log') -Raw) | Should -Match '-NoGui\|--custom\|value with spaces'
+        Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
+    }
+
+    It 'keeps the clean canonical tree when the mocked fast-forward update fails' {
+        $root = New-TestRoot 'failed-clean-bootstrap-update'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog -PullExitCode 82
+        $canonicalRepo = Join-Path $root 'canonical'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        $repoFiles = New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
+        $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+
+        $result.ExitCode | Should -Not -Be 0
+        (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
+        (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only$' }) | Should -HaveCount 1
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
+    }
+
     It 'skips bootstrap when -NoBootstrap is used and still reaches local entry points' {
         $root = New-TestRoot 'no-bootstrap'
         $fakeGitLog = Join-Path $root 'git-invocations.log'
@@ -1420,7 +1618,7 @@ function Unregister-ScheduledTask {
 }
 & $(ConvertTo-SingleQuotedLiteral $scriptCopy) -NoBootstrap -Debug -Unregister
 "@
-        $result = Invoke-PowershellCommandForTest -Command $command -Environment @{ PATH = "$fakeGitBin;$env:PATH" }
+        $result = Invoke-PowershellCommandForTest -Command $command -Environment @{ HOMEDRIVE = $root; PATH = "$fakeGitBin;$env:PATH" }
         $result.ExitCode | Should -Be 0
         $output = $result.Output -join "`n"
         $output | Should -Match '(-NoBootstrap was supplied|Import-only mode enabled via AUTORESEARCH_DOT_SOURCE_ONLY)'

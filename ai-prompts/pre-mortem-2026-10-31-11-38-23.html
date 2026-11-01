@@ -1,0 +1,1016 @@
+<!doctype html>
+<html lang="en" data-report-style="basic" data-color-mode="system">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autoresearch Pre-mortem Review, 2026-10-31 11:38:23 America/Chicago</title>
+<meta name="author" content="Kyle Rode, myTech.Today">
+<meta name="generator" content="myTech.Today prompt-refined report workflow">
+<meta name="report-repository" content="autoresearch-win-rtx-scheduled">
+<meta name="report-repository-url" content="https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git">
+<meta name="report-repository-author" content="Not identified from available repository evidence">
+<link rel="stylesheet" href="https://mytech.today/tools/m/config/prompts/style.css">
+<script defer src="https://mytech.today/tools/m/config/prompts/code.js"></script>
+</head>
+<body>
+<header class="report-header">
+<p class="report-kicker">Repository reliability review</p>
+<h1 class="report-title">autoresearch Pre-mortem Review</h1>
+<p class="report-lede">Evidence-based review of the Windows autoresearch launcher and training workflow. Findings describe verified code paths or clearly labeled testable assumptions. No training run, live provider request, task registration, update, or production mutation was performed.</p>
+<section class="report-meta report-attribution">
+<h2>Reviewed repository and authorship</h2>
+<p><strong>Repository:</strong> autoresearch-win-rtx-scheduled</p>
+<p><strong>Verified origin:</strong> <a href="https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git">https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git</a></p>
+<p><strong>Branch and revision:</strong> autoresearch/may30 at 21328cf. The working tree contains pre-existing modifications and an untracked report.</p>
+<p><strong>Project author or maintainer:</strong> Not identified from available repository evidence.</p>
+<p><strong>Repository owner:</strong> mytech-today-now, as shown in the configured origin path. This identifies the GitHub namespace, not project authorship.</p>
+<p><strong>Recent committer:</strong> Kyle Rode, latest local commit 21328cf dated 2026-09-10. A commit author is not proof of project authorship.</p>
+<p><strong>Attribution evidence:</strong> local git remote, branch, revision, latest commit, README.md, package.json, and root AGENTS.md. The README describes upstream projects but does not identify a maintainer.</p>
+<p><strong>Report author:</strong> Kyle Rode using myTech.Today's prompt-refined report workflow.</p>
+<p><strong>Generated:</strong> 2026-10-31 11:38:23 America/Chicago</p>
+</section>
+<section class="company-profile">
+<h2>myTech.Today</h2>
+<p>myTech.Today is a Midwestern technology company.</p>
+<ul>
+<li>Managed IT and remote support</li>
+<li>Computer and network support</li>
+<li>Backup and recovery</li>
+<li>Web development and software services</li>
+</ul>
+<p><a href="https://mytech.today">mytech.today</a> · <a href="mailto:support@mytech.today">support@mytech.today</a></p>
+</section>
+<fieldset class="report-preferences" data-report-preferences disabled>
+<legend>Report appearance</legend>
+<label for="report-style">Style</label>
+<select id="report-style" data-report-style-control>
+<option value="basic" selected>Basic</option>
+<option value="minimal">Minimal</option>
+<option value="full">Full &amp; complete style</option>
+</select>
+<label for="color-mode">Color mode</label>
+<select id="color-mode" data-color-mode-control>
+<option value="system" selected>System</option>
+<option value="light">Light</option>
+<option value="dark">Dark</option>
+</select>
+<p class="preferences-status" data-preferences-status role="status" aria-live="polite">JavaScript has not initialized appearance controls. A persistent message means the shared script did not complete initialization.</p>
+<p class="issue-progress-storage-status" data-issue-progress-status role="status" aria-live="polite">JavaScript has not initialized issue progress controls. A persistent message means the shared script did not complete initialization.</p>
+<noscript><p>JavaScript is unavailable. This report uses Basic styling and follows the system color preference when the shared stylesheet is available. Copy and progress controls require JavaScript. Report text and implementation prompts remain available and selectable.</p></noscript>
+<p>Appearance settings save only the selected style and color mode. Progress controls save only issue progress. Report content edits are not persisted.</p>
+</fieldset>
+</header>
+<main class="report-main">
+<section class="report-summary">
+<h2>Executive summary</h2>
+<p>This review identified 20 distinct risks in the current local project: 15 Core findings and 5 Additional findings. The highest risks are destructive replacement of a dirty canonical installation, hard-reset of the user's working tree during a discarded iteration, and provider API keys inherited by model-generated training code. A separate Windows command-line limit appears to prevent the current 82,281-character training source from reaching the ai-powered CLI as an argument.</p>
+<p>The requested allocation of 15 combined Priority P1 and Severity 1 findings is not supported by the evidence. Ratings are independent. Three findings meet both classifications; elevating the other twelve to Critical would misrepresent impact or likelihood. The first 15 findings are the highest-priority Core risks, not a declaration that all are critical.</p>
+<p>Local test evidence is mixed and incomplete. npm test passed provider verification and wrapper validation, then failed in the acceptance stage because the dirty-bootstrap test expected the old refusal behavior. The Pester command could not execute assertions because Pester's registry fixture was denied by the runner. The Python unittest command ended with temporary-directory permission errors. These environment and contract failures are described separately below.</p>
+</section>
+<section class="review-scope">
+<h2>Review scope and method</h2>
+<p>The active workspace resolves to the repository root containing .git, README.md, package.json, and pyproject.toml. This is the project that owns the current working tree. The review inspected current tracked files and uncommitted changes, repository instructions, local OpenSpec state, package and lock manifests, test code, CI workflow, and the newest existing pre-mortem document. Existing content in ai-prompts was not changed.</p>
+<p>The application is a Windows desktop and scheduled automation project, not a web service. The launcher is PowerShell with a WPF interface and Windows Task Scheduler integration. The training application is Python 3.10 or later with PyTorch 2.9.1 and a uv.lock file. Node.js and npm manage the ai-powered CLI package and package-lock.json. README.md describes Windows desktop NVIDIA use, dataset preparation, an autonomous five-minute experiment, model evaluation, and resumable checkpoints.</p>
+<ul>
+<li><strong>Entrypoints and runtime:</strong> scripts/launch.ps1; train.py; prepare.py; program.md. No HTTP routes, login, billing, legal, medical, or administrative web pages were found.</li>
+<li><strong>Package and dependency commands:</strong> npm test and its four script stages in package.json; Python dependencies and supported versions in pyproject.toml and uv.lock; ai-powered and Augment Extensions versions in package.json, package-lock.json, and VERSIONS.</li>
+<li><strong>Persistence:</strong> dataset and tokenizer caches in prepare.py; autotune cache in train.py; unique run checkpoints under artifacts/checkpoints; results.tsv; per-run and aggregate JSONL logs; task launch state JSON; non-secret launcher defaults in per-user JSON.</li>
+<li><strong>Credentials:</strong> the launcher accepts provider keys and maps them into process environment variables. The ignored .env file was not opened. No secret values are included in this report.</li>
+<li><strong>Operational behavior:</strong> launcher bootstrap, dependency preflight, compatible tool updates, scheduled task registration, idle gating, task supervision, log pruning, loop iteration, Git bookkeeping, and WPF layout were inspected. No actual update, task registration, provider call, or GPU training occurred.</li>
+<li><strong>Accessibility and layout:</strong> WPF code and tests include labels, keyboard navigation, focus, window bounds, and layout assertions. No screen-reader session, high-contrast mode, or human keyboard acceptance session was performed.</li>
+<li><strong>CI and tests:</strong> .github/workflows/windows-ci.yml runs provider, wrapper, acceptance, and Pester checks. Python unittest modules are present but absent from the workflow. Remote CI status was unavailable.</li>
+</ul>
+<p>Root AGENTS.md asks agents to discover linked Augment Extensions. augx list --linked and augx show were run for the linked Python, PowerShell, architecture, and ADR modules. No nested AGENTS.md was found under the inspected checkout. No connected GitHub repository tool was available, so remote issues, pull requests, Actions, branch protection, and security alerts were not inspected.</p>
+</section>
+<section class="input-resolution">
+<h2>Input resolution and risk allocation</h2>
+<p>The source request required 20 issues but supplied no named issue list. The 15 Core findings were selected through repository inspection; the five Additional findings are distinct lower-priority gaps. This is an explicit, testable input assumption. No separate issue was created for the missing list.</p>
+<p>The source also required exactly 15 findings to be both Priority P1 and Severity 1 while instructing the reviewer not to inflate ratings. The local evidence supports only three combined classifications: issue-01, issue-02, and issue-06. The report preserves the requested 20-section structure, keeps all 15 top findings marked Core, and reports the classification conflict instead of mislabeling twelve findings.</p>
+</section>
+<nav class="issue-toc" aria-label="Table of contents">
+<h2>Findings</h2>
+<a class="issue-toc-link" href="#issue-01"><span>01. A dirty canonical install is recursively deleted before replacement</span><span class="issue-toc-status" data-issue-progress-indicator="issue-01" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-02"><span>02. A discarded iteration can erase unrelated tracked work</span><span class="issue-toc-status" data-issue-progress-indicator="issue-02" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-03"><span>03. The full AI edit prompt exceeds Windows process command-line limits</span><span class="issue-toc-status" data-issue-progress-indicator="issue-03" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-04"><span>04. Git staging and commit failures are ignored before training</span><span class="issue-toc-status" data-issue-progress-indicator="issue-04" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-05"><span>05. Concurrent loops can race one repository, result file, and run log</span><span class="issue-toc-status" data-issue-progress-indicator="issue-05" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-06"><span>06. Generated training code inherits provider API credentials</span><span class="issue-toc-status" data-issue-progress-indicator="issue-06" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-07"><span>07. The advertised PowerShell 5.1 path fails in the idle gate</span><span class="issue-toc-status" data-issue-progress-indicator="issue-07" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-08"><span>08. Idle detection ignores failure from GetLastInputInfo</span><span class="issue-toc-status" data-issue-progress-indicator="issue-08" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-09"><span>09. The per-run timeout suppresses an unsupported process-tree kill</span><span class="issue-toc-status" data-issue-progress-indicator="issue-09" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-10"><span>10. Bootstrap trusts any clean repository at the canonical path</span><span class="issue-toc-status" data-issue-progress-indicator="issue-10" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-11"><span>11. Per-run checkpoints accumulate without a retention policy</span><span class="issue-toc-status" data-issue-progress-indicator="issue-11" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-12"><span>12. Checkpoint compatibility omits tokenizer and dataset content identity</span><span class="issue-toc-status" data-issue-progress-indicator="issue-12" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-13"><span>13. CI and npm scripts depend on ignored, untracked validation files</span><span class="issue-toc-status" data-issue-progress-indicator="issue-13" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-14"><span>14. Windows CI does not execute the Python test suite</span><span class="issue-toc-status" data-issue-progress-indicator="issue-14" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-15"><span>15. The autoresearch loop masks repeated iteration failures as success</span><span class="issue-toc-status" data-issue-progress-indicator="issue-15" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-16"><span>16. Concurrent data preparation uses one shared download temporary file</span><span class="issue-toc-status" data-issue-progress-indicator="issue-16" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-17"><span>17. Log ACL hardening failure continues with potentially broad permissions</span><span class="issue-toc-status" data-issue-progress-indicator="issue-17" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-18"><span>18. Experiment score parsing and serialization depend on Windows culture</span><span class="issue-toc-status" data-issue-progress-indicator="issue-18" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-19"><span>19. A 60-second checkpoint interval leaves an unbounded recovery gap</span><span class="issue-toc-status" data-issue-progress-indicator="issue-19" data-progress="incomplete">Incomplete</span></a>
+<a class="issue-toc-link" href="#issue-20"><span>20. Idle-only eligibility is checked once before a potentially unbounded loop</span><span class="issue-toc-status" data-issue-progress-indicator="issue-20" data-progress="incomplete">Incomplete</span></a>
+</nav>
+<section class="risk-register">
+<h2>Prioritized risk register</h2>
+<div class="risk-table-wrap" role="region" aria-label="Risk register" tabindex="0">
+<table class="risk-table">
+<thead><tr><th scope="col">Issue</th><th scope="col">Finding</th><th scope="col">Kind</th><th scope="col">Priority</th><th scope="col">Severity</th><th scope="col">Likelihood</th><th scope="col">Impacted area</th></tr></thead>
+<tbody>
+<tr><th scope="row"><a href="#issue-01">01</a></th><td>A dirty canonical install is recursively deleted before replacement</td><td>Core</td><td>Priority P1, highest</td><td>Severity 1 (Critical)</td><td>Likely</td><td>Data integrity, installation recovery, user trust</td></tr>
+<tr><th scope="row"><a href="#issue-02">02</a></th><td>A discarded iteration can erase unrelated tracked work</td><td>Core</td><td>Priority P1, highest</td><td>Severity 1 (Critical)</td><td>Possible</td><td>Data integrity, experiment history, recovery</td></tr>
+<tr><th scope="row"><a href="#issue-03">03</a></th><td>The full AI edit prompt exceeds Windows process command-line limits</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Almost certain</td><td>Functional correctness, Windows compatibility, experiment throughput</td></tr>
+<tr><th scope="row"><a href="#issue-04">04</a></th><td>Git staging and commit failures are ignored before training</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Possible</td><td>Experiment provenance, data integrity, rollback</td></tr>
+<tr><th scope="row"><a href="#issue-05">05</a></th><td>Concurrent loops can race one repository, result file, and run log</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Possible</td><td>Concurrency, data integrity, experiment reproducibility</td></tr>
+<tr><th scope="row"><a href="#issue-06">06</a></th><td>Generated training code inherits provider API credentials</td><td>Core</td><td>Priority P1, highest</td><td>Severity 1 (Critical)</td><td>Possible</td><td>Security, credential confidentiality, unattended execution</td></tr>
+<tr><th scope="row"><a href="#issue-07">07</a></th><td>The advertised PowerShell 5.1 path fails in the idle gate</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Likely</td><td>Compatibility, scheduled execution, Windows reliability</td></tr>
+<tr><th scope="row"><a href="#issue-08">08</a></th><td>Idle detection ignores failure from GetLastInputInfo</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Rare</td><td>Idle-only policy, user trust, resource use</td></tr>
+<tr><th scope="row"><a href="#issue-09">09</a></th><td>The per-run timeout suppresses an unsupported process-tree kill</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Possible</td><td>Process lifecycle, resource governance, compatibility</td></tr>
+<tr><th scope="row"><a href="#issue-10">10</a></th><td>Bootstrap trusts any clean repository at the canonical path</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Unlikely</td><td>Supply-chain integrity, update safety</td></tr>
+<tr><th scope="row"><a href="#issue-11">11</a></th><td>Per-run checkpoints accumulate without a retention policy</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Likely</td><td>Storage capacity, reliability, recovery</td></tr>
+<tr><th scope="row"><a href="#issue-12">12</a></th><td>Checkpoint compatibility omits tokenizer and dataset content identity</td><td>Core</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Possible</td><td>Data integrity, model reproducibility, recovery</td></tr>
+<tr><th scope="row"><a href="#issue-13">13</a></th><td>CI and npm scripts depend on ignored, untracked validation files</td><td>Core</td><td>Priority P1, highest</td><td>Severity 2 (High)</td><td>Almost certain</td><td>CI reliability, release confidence, test reproducibility</td></tr>
+<tr><th scope="row"><a href="#issue-14">14</a></th><td>Windows CI does not execute the Python test suite</td><td>Core</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Likely</td><td>Research correctness, regression prevention, release confidence</td></tr>
+<tr><th scope="row"><a href="#issue-15">15</a></th><td>The autoresearch loop masks repeated iteration failures as success</td><td>Core</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Possible</td><td>Operational observability, recovery, scheduled-task health</td></tr>
+<tr><th scope="row"><a href="#issue-16">16</a></th><td>Concurrent data preparation uses one shared download temporary file</td><td>Additional</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Possible</td><td>Concurrency, cache integrity, startup reliability</td></tr>
+<tr><th scope="row"><a href="#issue-17">17</a></th><td>Log ACL hardening failure continues with potentially broad permissions</td><td>Additional</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Possible</td><td>Security, local privacy, diagnostics</td></tr>
+<tr><th scope="row"><a href="#issue-18">18</a></th><td>Experiment score parsing and serialization depend on Windows culture</td><td>Additional</td><td>Priority P2, high</td><td>Severity 3 (Medium)</td><td>Possible</td><td>Internationalization, experiment correctness, result history</td></tr>
+<tr><th scope="row"><a href="#issue-19">19</a></th><td>A 60-second checkpoint interval leaves an unbounded recovery gap</td><td>Additional</td><td>Priority P3, moderate</td><td>Severity 3 (Medium)</td><td>Possible</td><td>Recovery, training progress, checkpoint semantics</td></tr>
+<tr><th scope="row"><a href="#issue-20">20</a></th><td>Idle-only eligibility is checked once before a potentially unbounded loop</td><td>Additional</td><td>Priority P2, high</td><td>Severity 2 (High)</td><td>Possible</td><td>Idle policy, process lifecycle, user trust</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+<section class="issue-list" aria-label="Detailed findings">
+<article class="issue" id="issue-01" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 01</p>
+<h2 class="issue-title">A dirty canonical install is recursively deleted before replacement</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="1">Severity 1 (Critical)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Likely</dd></div>
+<div><dt>Impacted area</dt><dd>Data integrity, installation recovery, user trust</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>When the canonical clone has any status output, bootstrap treats it as disposable, removes the entire directory tree, then attempts a fresh clone. That operation also removes ignored and untracked state that Git status does not list, including local configuration, logs, caches, and user edits.</p></section>
+<section><h3>Evidence or rationale</h3><p>Confirmed in the current working tree at scripts/launch.ps1:471-494. Invoke-Bootstrap checks git status, then calls Remove-Item -Recurse -Force on CanonicalRepo. The local diff introduced this path. The present acceptance fixture still expects the prior refusal at scripts/test-autoresearch-acceptance.ps1:197-216; npm test stopped there with “Refusal message missing.” This review did not execute deletion against the real canonical directory.</p></section>
+<section><h3>Why this matters</h3><p>A single stale file can erase the managed checkout and every ignored file beneath it. If recloning then fails, the user loses both the prior installation and the ability to relaunch from it.</p></section>
+<section><h3>Recommended mitigation</h3><p>Fail closed on a dirty managed checkout. Show the exact status and a recoverable next step, or update through a temporary clean clone and atomic directory swap after validating the origin. Keep ignored and untracked files outside any replacement operation. Require an explicit, separately reviewed cleanup workflow before removing managed data.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-01: A dirty canonical install is recursively deleted before replacement. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-Bootstrap and the existing dirty-bootstrap tests. Replace unconditional recursive deletion with a non-destructive, fail-closed update path. Preserve the canonical tree, ignored files, local defaults, logs, caches, results, and any user edits when status is nonempty or origin validation fails. If safe updating requires a new clone, build it in a unique sibling temporary directory, validate its top-level path and exact origin, and switch only after success; retain the old tree for rollback. Do not use a fixed temp name or delete the old tree before the replacement is proven usable.
+
+Regression tests: in a temporary repository, create tracked edits, an untracked file, and an ignored file; force clone failure; assert all three survive and the launcher returns a clear nonzero result. Keep the refusal message and assert no Remove-Item targets the existing canonical path. Baseline: a clean repository with the expected origin reaches the existing update handoff. Run npm run test:acceptance, npm run test:powershell, and npm test; do not invoke the real bootstrap.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Regression, PowerShell fixture: create a temporary canonical Git repo with a tracked edit, an untracked file, and an ignored sentinel; make clone fail after the dirty check. Assert exit is nonzero, every sentinel still exists with identical content, and no replacement process starts. Test an origin mismatch as a separate negative path.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, PowerShell fixture: create a clean temporary repo with the expected origin; invoke the mocked bootstrap and assert it updates or hands off once, forwards the original arguments, and leaves the prior tree available if the fake clone fails.</p></section>
+<section><h3>Acceptance criteria</h3><p>A dirty or unverifiable canonical directory is never recursively removed. Failed replacement leaves the original path and every sentinel intact. A clean matching clone can still update. The acceptance test matches this policy and npm test reaches its next stage.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-01">Issue 01 progress</label>
+<select id="progress-issue-01" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-02" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 02</p>
+<h2 class="issue-title">A discarded iteration can erase unrelated tracked work</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="1">Severity 1 (Critical)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Data integrity, experiment history, recovery</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Each iteration stages the whole repository with git add -A. If the result is not kept, git reset --hard returns to the starting commit and removes all tracked changes, including edits that predated the iteration. Newly staged files can also be committed and then removed by the reset.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1859-1904 contains repository-wide staging and hard reset. The current worktree has modified scripts/launch.ps1, scripts/test-launch-gui-layout.ps1, and tests/launch.Tests.ps1, plus an untracked report. ai-prompts is not ignored by .gitignore. No dirty-tree guard appears before the iteration.</p></section>
+<section><h3>Why this matters</h3><p>A normal experiment decision becomes a destructive rollback of a developer's unrelated work. The report itself could be staged by a later loop and removed when that result is discarded.</p></section>
+<section><h3>Recommended mitigation</h3><p>Refuse to start an iteration in a dirty repository, or isolate each experiment in a dedicated temporary worktree. Stage only the intended train.py change and manage only the iteration's own commit or patch. Never use reset --hard on the user's working directory.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-02: A discarded iteration can erase unrelated tracked work. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-AutoresearchIteration, .gitignore, program.md, and tests/launch.Tests.ps1. Make the experiment transaction unable to commit or reset pre-existing work. The smallest safe policy is to require a clean repository before the loop and operate in an isolated worktree for each edit, training run, and keep/discard decision. If repository conventions already provide a worktree helper, reuse it; do not add a tracking list or broad workflow abstraction.
+
+Regression tests: use a temporary Git repo containing staged, unstaged, untracked, and ignored sentinel files. Exercise both a kept and discarded fake iteration. Assert unrelated tracked state and all sentinels remain byte-identical, the original index is unchanged, and only the experiment branch/worktree moves. Baseline: with a clean fixture, verify a successful improved candidate remains available and a non-improvement is discarded only inside its isolated worktree. Run the relevant Pester bootstrap, iteration tests, and npm test. Never run git reset --hard in the real checkout.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Regression, PowerShell/Pester with a temporary Git repo: prepare one staged change, one unstaged change, one untracked file, and one ignored file before a fake non-improving iteration. Assert the original index, file contents, and status are unchanged after discard. Repeat with a kept result.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, fake Git fixture: start clean, apply only a train.py edit, and return an improved score. Assert the resulting commit contains only the intended experiment change and the source checkout remains intact.</p></section>
+<section><h3>Acceptance criteria</h3><p>No iteration starts in a dirty source checkout unless it uses an isolated worktree. A discard changes no unrelated path or index entry. Tests compare original and final status plus hashes for every sentinel.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-02">Issue 02 progress</label>
+<select id="progress-issue-02" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-03" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 03</p>
+<h2 class="issue-title">The full AI edit prompt exceeds Windows process command-line limits</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Almost certain</dd></div>
+<div><dt>Impacted area</dt><dd>Functional correctness, Windows compatibility, experiment throughput</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Invoke-AiPoweredEdit reads all of program.md and train.py into one string and supplies it as a positional argument to ai-powered text. The current train.py is 82,281 characters and program.md is 7,127 characters before the system prompt and wrappers. Windows CreateProcess limits the command-line string to 32,767 characters.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1783-1811 builds and passes the full prompt. Current file lengths were measured without reading or reporting code contents. The installed ai-powered command resolves through a PowerShell shim that passes arguments to Node. Microsoft documents the 32,767-character CreateProcessA limit: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa. No full-size prompt test exists in the wrapper tests.</p></section>
+<section><h3>Why this matters</h3><p>The scheduled autoresearch loop cannot reliably launch its core AI-edit command on Windows. Repeated iterations may log failures without producing experiments, while consuming the loop's time budget.</p></section>
+<section><h3>Recommended mitigation</h3><p>Use a supported stdin, prompt-file, or direct API input path so prompt content is carried outside the process command line. Keep only short file paths and options in argv. Preserve the current mock mode and avoid truncating the source.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-03: The full AI edit prompt exceeds Windows process command-line limits. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-AiPoweredEdit, the installed ai-powered CLI help and local package documentation, package.json, and the wrapper tests. Replace the large positional prompt argument with a documented input channel that supports the complete source, such as stdin or an explicitly supported prompt-file option. Do not assume an undocumented flag and do not add a dependency. Keep system instructions and the entire current program.md, recent results, and train.py content intact. On failure, remove the temporary prompt in finally, report a concise safe error, skip the edit, and preserve the existing train.py.
+
+Regression tests: construct a prompt above 32,767 characters, invoke the CLI through a local mock executable, and assert the full prompt arrives unchanged through the selected input channel; assert argv remains below the platform limit. Also test an empty response and CLI nonzero exit. Baseline: the existing short ai-powered mock smoke remains functional. Run npm run verify:ai-provider, npm run test:wrapper, and npm test. Never call a real provider.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>API/contract and boundary test, Node or PowerShell mock: create a 90,000-character prompt containing a unique sentinel near the end; invoke the mocked CLI and assert the sentinel and total length arrive intact, while the generated process command line remains below 32,767 characters. Assert nonzero CLI exit leaves train.py unchanged.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, fake CLI: send a short prompt and a full prompt using the repository's supported mock mode. Assert response extraction, DESCRIPTION parsing, cleanup, and normal small-input behavior are unchanged.</p></section>
+<section><h3>Acceptance criteria</h3><p>The full current prompt is delivered without command-line overflow or truncation. The mock verifies exact input length and tail sentinel. Error paths leave the source file untouched and remove temporary prompt data.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-03">Issue 03 progress</label>
+<select id="progress-issue-03" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-04" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 04</p>
+<h2 class="issue-title">Git staging and commit failures are ignored before training</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Experiment provenance, data integrity, rollback</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The loop pipes git add and git commit output to Out-Null without checking either exit status, then reads HEAD and starts training. A failed commit can therefore run modified uncommitted code under the previous commit hash. A later discard reset may erase the edit.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1859-1864 invokes git add and git commit without validating $LASTEXITCODE or using Invoke-Git. It immediately resolves HEAD and continues to the training process at 1869. Existing tests cover bootstrap but do not inject Git stage or commit failure here.</p></section>
+<section><h3>Why this matters</h3><p>The results.tsv commit field can name code that was not committed. Reviewers cannot reconstruct the experiment, and a failure path can destroy the source change while recording a misleading result.</p></section>
+<section><h3>Recommended mitigation</h3><p>Check each Git result explicitly and verify HEAD advanced to the intended commit before training. On failure, stop before executing code, preserve the working tree, append a truthful failure record only if it can be associated with a known source state, and return nonzero.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-04: Git staging and commit failures are ignored before training. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-AutoresearchIteration and the existing Invoke-Git helper. Capture and validate the exit code and output for git add and git commit; do not launch uv unless the expected commit exists and its tree contains the exact train.py that will run. If staging or commit fails, stop before training, retain the edit for review, and report the failed command without logging secrets. Avoid a global reset as cleanup.
+
+Regression tests: inject git add failure, commit failure, and a commit that returns success without moving HEAD. Assert uv is never invoked, no result row claims an experiment commit, and worktree bytes remain unchanged. Baseline: successful commit must be the exact seven-character SHA recorded with the run and results.tsv row. Run the focused Pester tests and npm test. Use fake Git and uv commands only.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Fault injection, PowerShell/Pester: fake Git returns nonzero from add and commit, then separately returns zero while rev-parse remains at the starting SHA. Assert no training process starts, the worktree is retained, and no keep/discard row is written against the stale SHA.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, fake success: add and commit the expected edit, return the new HEAD, and assert the same SHA appears in iteration logging and the result row.</p></section>
+<section><h3>Acceptance criteria</h3><p>Training starts only after Git staging and commit are verified. Any failed or unchanged commit produces a nonzero iteration result, never mislabels the run, and preserves the user's files.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-04">Issue 04 progress</label>
+<select id="progress-issue-04" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-05" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 05</p>
+<h2 class="issue-title">Concurrent loops can race one repository, result file, and run log</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Concurrency, data integrity, experiment reproducibility</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>There is no launcher-wide lock around RunLoop. Separate manual invocations can run beside the scheduled task. Each iteration edits train.py, stages and resets the same repository, appends results.tsv, and truncates shared run.log and run.err.log. Task Scheduler's IgnoreNew setting only covers another instance of that registered task.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1859-1904 uses a shared RepoRoot and fixed run.log names; Invoke-AutoresearchLoop at 1916 onward has no mutex or lock acquisition. The task setting MultipleInstances=IgnoreNew is a scheduler-level guard, not a guard for manual -RunLoop calls. Python checkpoint tests cover separate run directories but not launcher concurrency.</p></section>
+<section><h3>Why this matters</h3><p>Two loops may train different source versions under conflicting commits, append interleaved results, remove each other's log, or reset a commit the other process is using.</p></section>
+<section><h3>Recommended mitigation</h3><p>Acquire a per-repository cross-process lock before initialization or mutation and hold it through loop exit. Record owner PID and start time, detect stale locks safely, and return a visible busy result to a second invocation. Do not rely on a process-local variable.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-05: Concurrent loops can race one repository, result file, and run log. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 action dispatch, Invoke-AutoresearchLoop, Invoke-AutoresearchIteration, task settings, and tests/launch.Tests.ps1. Serialize all operations that mutate the same RepoRoot, results.tsv, run.log, or Git history. Reuse an existing repository lock pattern if present; otherwise add the smallest Windows-compatible named mutex or exclusive lock-file guard with a documented stale-owner check and finally-based release. A second invocation must exit clearly before editing or opening shared files.
+
+Regression tests: launch two fake loop processes against one temporary repo with a barrier that overlaps their edit and Git phases. Assert exactly one acquires the lock, the other returns a busy status, and logs/results remain parseable with one owner. Baseline: separate repository roots can run independently. Run Pester tests and npm test. Do not launch a real loop or Scheduled Task.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Concurrency and race test, process fixture: overlap two RunLoop invocations at the same repository root; assert one lock owner, no second AI call, no second Git mutation, no shared log truncation, and no duplicate results row.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, use two different temporary roots and assert both acquire distinct locks and complete normally.</p></section>
+<section><h3>Acceptance criteria</h3><p>At most one process mutates a given RepoRoot at a time. Lock release occurs after expected and unexpected exceptions; stale-lock recovery never steals a live owner.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-05">Issue 05 progress</label>
+<select id="progress-issue-05" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-06" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 06</p>
+<h2 class="issue-title">Generated training code inherits provider API credentials</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="1">Severity 1 (Critical)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Security, credential confidentiality, unattended execution</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The loop places API keys in the launcher process environment, asks an AI service for a complete train.py replacement, writes that response, and launches uv run train.py from the same process. The training child inherits the provider key. Testable assumption: a malicious or compromised model response could read the environment and transmit the key.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1648-1664 sets OPENAI_API_KEY, ANTHROPIC_API_KEY, or AZURE_OPENAI_API_KEY at Process scope. The same loop calls Invoke-AiPoweredEdit at 1783-1811, writes response contents to train.py, then launches uv run train.py at 1869. No environment-clearing or sandbox boundary exists in this path.</p></section>
+<section><h3>Why this matters</h3><p>Model-generated code is intentionally executed under the user's account. Inheriting live provider credentials gives that code a reusable secret and the same local and network access available to the scheduled process.</p></section>
+<section><h3>Recommended mitigation</h3><p>Scope credentials only to the ai-powered child that needs them, remove them from the environment before starting uv, and run generated training code in a least-privilege boundary without access to secrets or unrelated files. If isolation is unavailable, require a review gate before execution.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-06: Generated training code inherits provider API credentials. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Set-WorkloadEnvironment, Invoke-AiPoweredEdit, Invoke-AutoresearchIteration, and provider tests. Ensure only the ai-powered process receives provider credentials. Before invoking model-generated train.py, remove API-key variables from the process environment and verify the uv child environment contains no provider credential. Preserve provider selection and the working mock mode. Treat model output as untrusted code; use the smallest existing repository-supported isolation boundary or block unattended execution when secrets or user data remain accessible. Do not log or print any real key.
+
+Regression tests: set a fake sentinel key in a temporary process, capture the environment seen by the fake ai-powered CLI and fake uv child, and assert only the CLI sees the sentinel. Add a harmless generated-code fixture that attempts to read environment variables and write only to a temp sentinel. Assert the production process contract denies access to the fake secret. Baseline: Ollama and remote-provider mock selection remains correct. Run Pester and provider verification; never call a live provider.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Security and privacy test, fake child processes: set a non-secret sentinel value under each supported API-key variable. Assert the ai-powered mock can receive only its required key and the training child receives none. Assert logs and task-state JSON contain no sentinel.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, exercise Ollama with no API key and a mocked OpenAI flow with the sentinel scoped to the CLI. Verify provider/model configuration still reaches the intended process.</p></section>
+<section><h3>Acceptance criteria</h3><p>No model-generated training process inherits provider credentials. No real credential is used in tests. Unattended execution fails closed or runs within an existing documented isolation boundary when it cannot enforce the environment separation.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-06">Issue 06 progress</label>
+<select id="progress-issue-06" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-07" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 07</p>
+<h2 class="issue-title">The advertised PowerShell 5.1 path fails in the idle gate</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Likely</dd></div>
+<div><dt>Impacted area</dt><dd>Compatibility, scheduled execution, Windows reliability</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The script declares Windows PowerShell 5.1 support and enables StrictMode, but Get-ComputerIdleState and Get-CurrentProcessCommandLine read $IsWindows. That variable is not defined in Windows PowerShell 5.1, so the guard throws. Task registration also calls Get-PwshExePath, which requires pwsh and does not fall back to powershell.exe.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:362 sets StrictMode Latest; $IsWindows is read at 782 and 2274. A direct Windows PowerShell 5.1.26100.9818 check confirmed the variable is undefined and the StrictMode expression throws. Get-PwshExePath at 1974-1981 throws when pwsh is absent. The file header claims #Requires -Version 5.1.</p></section>
+<section><h3>Why this matters</h3><p>A user running the documented Windows PowerShell 5.1 entry point can fail the idle-only loop or task registration before training starts, despite the advertised compatibility.</p></section>
+<section><h3>Recommended mitigation</h3><p>Choose and enforce one runtime contract. If 5.1 remains supported, replace $IsWindows with the existing Test-WindowsHost helper and resolve the current engine executable safely. Otherwise update help, README, preflight, and task registration to require PowerShell 7 and fail before task changes.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-07: The advertised PowerShell 5.1 path fails in the idle gate. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 runtime declarations, Test-WindowsHost, Get-CurrentProcessCommandLine, Get-ComputerIdleState, Get-PwshExePath, task registration, and compatibility documentation. Make the supported PowerShell contract consistent. For 5.1 support, use Windows checks available on both editions and select the current supported engine path rather than relying on an undefined variable or assuming pwsh exists. If the project intentionally requires PowerShell 7 for Scheduled Tasks, update help and preflight so 5.1 users receive the requirement before registration or idle execution. Keep task configuration unchanged for supported runtimes.
+
+Regression tests: run a no-system-mutation compatibility harness under Windows PowerShell 5.1 and PowerShell 7. Assert the idle guard returns a structured state instead of throwing and the task plan either resolves a valid engine or gives an early precise unsupported-runtime message. Baseline: the same fake plan produces unchanged arguments on both supported editions. Run the Pester suite in a runner that permits its test registry fixture, plus npm test.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Compatibility test, isolated Windows PowerShell 5.1 process: evaluate the idle-state guard under StrictMode and assert no undefined-variable exception. Test task planning when only powershell.exe is available and when pwsh is available; assert a valid supported path or an early explicit rejection before scheduler mutation.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, PowerShell 7 fixture: assert the existing task action arguments, policy, and idle wait settings remain unchanged.</p></section>
+<section><h3>Acceptance criteria</h3><p>The documented runtime matrix matches the launcher and task planner. A supported host completes the idle gate and forms a valid task plan. An unsupported host fails before any task registration.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-07">Issue 07 progress</label>
+<select id="progress-issue-07" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-08" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 08</p>
+<h2 class="issue-title">Idle detection ignores failure from GetLastInputInfo</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Rare</dd></div>
+<div><dt>Impacted area</dt><dd>Idle-only policy, user trust, resource use</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The native GetLastInputInfo call returns a success flag, but the C# wrapper ignores it and computes idle duration from the default zero-valued timestamp if the call fails. A large tick count can then be reported as long idle time.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:2298-2307 declares the Boolean return and calls GetLastInputInfo(ref info) without checking it before subtracting dwTime from GetTickCount. Existing Pester tests mock Get-ComputerIdleState and do not exercise the native false-return path.</p></section>
+<section><h3>Why this matters</h3><p>An idle-only job could start while the user is active if the API reports failure but the wrapper marks the result Available. This is a testable assumption until the failure branch is injected.</p></section>
+<section><h3>Recommended mitigation</h3><p>Check the native return value and validate the timestamp before computing idle duration. Return Available=false with a safe reason on failure so Invoke-IdlePolicyGate skips work. Keep wraparound-safe tick arithmetic.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-08: Idle detection ignores failure from GetLastInputInfo. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Get-ComputerIdleState, the embedded IdleNative P/Invoke, Invoke-IdlePolicyGate, and tests/launch.Tests.ps1. Check GetLastInputInfo's Boolean return and validate the returned structure before reporting Available=true. On false return or invalid data, return Available=false, include a sanitized reason, and ensure IdleOnly skips the workload. Do not treat zero timestamps or exceptions as evidence of inactivity.
+
+Regression tests: inject a false native result, a valid recent input timestamp, and a wrapped tick counter through a test seam; assert false or invalid results never satisfy the gate, while valid long-idle data does. Baseline: Interactive and Unattended policies retain their existing bypass behavior. Run focused Pester tests and npm test without changing a real Scheduled Task.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Fault injection and decision-table test, PowerShell: simulate GetLastInputInfo success with recent input, success with idle duration above the threshold, false return, and invalid timestamp. Assert only the validated above-threshold case starts work.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, mock the existing non-idle policies and assert they do not invoke native idle detection.</p></section>
+<section><h3>Acceptance criteria</h3><p>A failed or invalid native idle query is represented as unavailable and causes IdleOnly to skip. No failed query can be converted into a large idle duration.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-08">Issue 08 progress</label>
+<select id="progress-issue-08" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-09" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 09</p>
+<h2 class="issue-title">The per-run timeout suppresses an unsupported process-tree kill</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Process lifecycle, resource governance, compatibility</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>When a run exceeds its timeout, the launcher calls Process.Kill(true) inside an empty catch and marks the run killed even if termination throws. The installed Windows PowerShell 5.1 runtime does not expose Kill(Boolean), so that timeout path can leave the training process alive while bookkeeping proceeds.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1873-1878 catches every Kill(true) failure without retrying Kill() or verifying HasExited. A reflection check under Windows PowerShell 5.1.26100.9818 confirmed the Boolean overload was absent. The script supports PowerShell 5.1 in its header.</p></section>
+<section><h3>Why this matters</h3><p>The ten-minute bound may be only a status flag. An orphaned GPU process can continue consuming compute and mutate run files after the launcher records a crash or starts another iteration.</p></section>
+<section><h3>Recommended mitigation</h3><p>Use a runtime-compatible process-tree termination strategy with a verified fallback. Check final process state and descendants before returning. Preserve the timeout result only after termination succeeds; on cleanup failure report an explicit uncontained-process condition and stop further loop iterations.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-09: The per-run timeout suppresses an unsupported process-tree kill. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-AutoresearchIteration, its #Requires version, and tests/launch.Tests.ps1. Replace the swallowed Kill(true) failure with a PowerShell-version-compatible process-tree cleanup path. After timeout, verify the root and every spawned descendant have exited before logging the iteration as terminated or starting another one. If cleanup fails, stop the loop, return a distinct failure status, and tell the operator which PID remains without logging credentials.
+
+Regression tests: use a fake long-running child with a child process under both Windows PowerShell 5.1 and PowerShell 7. Force timeout and assert the process tree exits, run.log is finalized once, and no next iteration begins. Inject kill failure and assert nonzero status plus explicit diagnostic. Baseline: a process that exits before the limit remains successful. Run focused Pester tests; do not spawn or kill real workloads.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Compatibility and recovery test, Pester subprocess fixture: under Windows PowerShell 5.1 and PowerShell 7, start a bounded fake parent-child process tree, force timeout, and assert both PIDs exit before the function returns. Inject a denied kill and assert the loop stops with a failure status.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, use a short fake child that exits normally and assert its exit code and metrics are still recorded.</p></section>
+<section><h3>Acceptance criteria</h3><p>Timeout handling verifies child and descendant termination across supported PowerShell runtimes. A failed kill is never reported as successful termination and prevents another training run.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-09">Issue 09 progress</label>
+<select id="progress-issue-09" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-10" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 10</p>
+<h2 class="issue-title">Bootstrap trusts any clean repository at the canonical path</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Unlikely</dd></div>
+<div><dt>Impacted area</dt><dd>Supply-chain integrity, update safety</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>If the canonical directory exists and has a clean Git status, bootstrap runs git pull without checking the repository top-level path, origin URL, or expected branch. It then launches CanonicalScript from that directory.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:471-494 checks status and pulls but performs no remote get-url or top-level identity validation before launching. The expected origin is configured separately in RepoUrl. No test supplies a clean unrelated repository at CanonicalRepo.</p></section>
+<section><h3>Why this matters</h3><p>A clean but unrelated or redirected clone at the managed path can be updated from its own origin and then execute its launcher as the user's scheduled application. This is a testable trust-boundary risk, not an observed compromise.</p></section>
+<section><h3>Recommended mitigation</h3><p>Before pull or launch, validate git rev-parse --show-toplevel, origin URL, and the expected branch or signed revision. Fail closed on mismatch; never pull or execute code from an unrecognized origin. Keep directory replacement separate from user data deletion.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-10: Bootstrap trusts any clean repository at the canonical path. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-Bootstrap, RepoUrl, canonical path construction, and bootstrap fixtures. Before pull or relaunch, validate the canonical repository top-level directory and origin against the configured repository URL. Define whether detached HEAD or a non-default branch is supported and reject all other states with a clear diagnostic. Do not run a fetch or pull against the unrelated remote during the test; use fake Git output. Preserve a mismatched directory for review.
+
+Regression tests: create a clean temporary Git fixture whose origin differs from RepoUrl and assert no pull, clone overwrite, or process launch occurs. Repeat for the wrong top-level path and expected origin. Baseline: the exact expected origin passes validation and forwards args. Run the focused acceptance and Pester tests. Do not contact GitHub or alter the real canonical install.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Security and API-contract tests, temporary fake Git repo: return a clean status but an unrelated origin or unexpected top-level path. Assert bootstrap stops before pull and before Start-Process. Assert the directory remains unchanged.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, return expected origin and canonical top-level values and assert the existing clean update flow is still selected.</p></section>
+<section><h3>Acceptance criteria</h3><p>No remote code is pulled or executed until repository identity matches configured expectations. Mismatch leaves existing files intact and yields a clear nonzero result.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-10">Issue 10 progress</label>
+<select id="progress-issue-10" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-11" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 11</p>
+<h2 class="issue-title">Per-run checkpoints accumulate without a retention policy</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Likely</dd></div>
+<div><dt>Impacted area</dt><dd>Storage capacity, reliability, recovery</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Each training invocation creates a unique run directory under artifacts/checkpoints and saves model, optimizer, and metadata artifacts. The scheduled autoresearch loop continues across iterations, while no checkpoint cleanup or retention mechanism is present in the inspected training path.</p></section>
+<section><h3>Evidence or rationale</h3><p>train.py:1642-1657 resolves the checkpoint root and creates a unique run directory. train.py:1858 onward writes a checkpoint into each directory. scripts/launch.ps1:1916 onward loops and starts new training runs. The launcher prunes run logs, but no checkpoint retention call exists in this path. Exact production checkpoint sizes were not measured.</p></section>
+<section><h3>Why this matters</h3><p>Testable assumption: repeated unattended runs can consume unbounded storage and eventually prevent training, updates, or unrelated system work. The actual rate depends on model and optimizer state size.</p></section>
+<section><h3>Recommended mitigation</h3><p>Add a conservative, explicit checkpoint retention policy scoped to this application. Preserve the newest successful checkpoint, any active run, and ambiguous or recovery-needed artifacts. Record a dry-run plan and actual deletion results. Do not delete files until a safe policy and owner-approved retention limit are configured.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-11: Per-run checkpoints accumulate without a retention policy. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect train.py checkpoint creation and save functions, launcher loop behavior, README checkpoint documentation, and existing tests. Add a bounded retention policy for completed run directories with an explicit configuration default and safe recovery rules. Protect active runs, the newest successful checkpoint, any manually selected resume source, and ambiguous artifacts. Use a dry-run inventory and report bytes by category before deletion; never delete artifacts on a failed inventory or uncertain ownership. Keep current atomic checkpoint writes and manual resume paths intact.
+
+Regression tests: create fixture directories for active, recent successful, older successful, failed, and ambiguous runs with known sizes. Assert the plan preserves required artifacts and deletes only eligible fixtures; inject inventory and delete failures and assert the rest remain. Baseline: saving a new checkpoint is atomic and readable. Run Python unit tests and report the current temp-directory access limitation separately. Do not measure or prune the real checkpoint store.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Recovery and data-retention test, Python unittest in a temporary directory: build known active, successful, failed, and ambiguous run fixtures; assert the dry-run plan is deterministic and protected runs are never eligible. Inject an inventory error and assert no delete occurs.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, save and load a small checkpoint fixture and confirm latest successful run remains selectable after retention planning.</p></section>
+<section><h3>Acceptance criteria</h3><p>A configured cap or age policy bounds eligible storage, active and recovery artifacts remain protected, dry-run reports totals, and every deletion has a verified completion record.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-11">Issue 11 progress</label>
+<select id="progress-issue-11" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-12" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 12</p>
+<h2 class="issue-title">Checkpoint compatibility omits tokenizer and dataset content identity</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Data integrity, model reproducibility, recovery</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The checkpoint compatibility signature records dataset name, vocabulary size, model shape, and batch settings, but not the dataset SHA-256 or tokenizer merge-rank identity. Tokenizer caches do record a dataset hash and pattern. A same-name, same-vocabulary tokenizer revision could therefore pass the checkpoint check while token IDs change meaning.</p></section>
+<section><h3>Evidence or rationale</h3><p>train.py:1599-1607 builds the model-training signature without source or tokenizer hashes. prepare.py:251-260 records dataset_sha256 and tokenizer data. Checkpoint resume tests cover shape and counters but not a changed tokenizer identity.</p></section>
+<section><h3>Why this matters</h3><p>Resumed optimizer and model state can be paired with a semantically different token mapping. This can invalidate comparisons or produce a misleading continuation rather than a clean incompatibility failure.</p></section>
+<section><h3>Recommended mitigation</h3><p>Persist a stable tokenizer fingerprint and dataset content hash in checkpoint metadata and compatibility signatures. Reject resume on mismatch with a precise message; keep cold-start training available. Define how to migrate older checkpoints without pretending they are compatible.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-12: Checkpoint compatibility omits tokenizer and dataset content identity. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect train.py checkpoint signature builders, metadata writer, resume validator, prepare.py tokenizer cache schema, and tests/test_train_checkpoint.py. Extend the compatibility contract with the exact dataset content hash and a deterministic tokenizer fingerprint covering split pattern, special tokens, and mergeable ranks. Validate these before model or optimizer state is loaded. On mismatch, return a clear compatibility error and keep cold start available; do not silently map old weights onto different token IDs.
+
+Regression tests: create same-name fixtures with equal vocabulary size but changed dataset hash, merge ranks, pattern, and special-token map. Assert each mismatch is rejected before optimizer state restore. Baseline: identical signatures round-trip and legacy checkpoint errors remain understandable. Run the focused Python checkpoint tests, then the unit suite when its temporary directory is writable.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Data/migration test, Python unittest: construct two tokenizer metadata objects with the same dataset name and vocabulary size but different fingerprint components. Assert resume rejects each changed component and does not call optimizer.load_state_dict.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, save and resume a checkpoint against the identical tokenizer fingerprint and assert model, optimizer, step, and data cursor round-trip.</p></section>
+<section><h3>Acceptance criteria</h3><p>Every resumed checkpoint matches exact dataset and tokenizer identity. Mismatch returns a documented error before state mutation; compatible checkpoints remain resumable.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-12">Issue 12 progress</label>
+<select id="progress-issue-12" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-13" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 13</p>
+<h2 class="issue-title">CI and npm scripts depend on ignored, untracked validation files</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p1">Priority P1, highest</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Almost certain</dd></div>
+<div><dt>Impacted area</dt><dd>CI reliability, release confidence, test reproducibility</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>package.json and windows-ci.yml invoke scripts/verify-ai-provider.mjs, scripts/test-autoresearch-wrapper.ps1, and scripts/test-autoresearch-acceptance.ps1. .gitignore explicitly ignores all three, and git ls-files confirms none is tracked. A clean checkout therefore lacks the files required by CI and npm test.</p></section>
+<section><h3>Evidence or rationale</h3><p>package.json:3-5 references the three helpers; .github/workflows/windows-ci.yml:51-95 invokes those commands. .gitignore:55-57 ignores each helper. `git ls-files --error-unmatch` found no tracked helper paths. They exist only in this local worktree.</p></section>
+<section><h3>Why this matters</h3><p>The local suite can appear to advance because ignored files happen to exist, while GitHub Actions or a clean clone fails before validating product behavior. CI is not a reproducible release gate.</p></section>
+<section><h3>Recommended mitigation</h3><p>Commit the intended helper source files or move the checks into tracked paths. Remove ignore entries only for deliberate, reviewed helpers. Add a clean-checkout validation that compares package scripts and workflow references with tracked files. Do not use force-add to hide generated or sensitive data.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-13: CI and npm scripts depend on ignored, untracked validation files. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect package.json, .github/workflows/windows-ci.yml, .gitignore, and the three referenced helper paths. Make every script used by npm or CI part of the tracked repository at its canonical path, or change callers to tracked equivalents. Keep local secrets, logs, and generated artifacts ignored. Add a check that resolves every package script and workflow script reference against a clean Git archive, not the current dirty worktree.
+
+Regression tests: build a temporary clean source snapshot from tracked files, run the Node provider check and wrapper/acceptance commands, and assert no referenced path is missing. Baseline: verify intended ignored runtime state remains excluded. Run npm test in the clean snapshot and the current checkout, recording differences. Do not force-add unrelated files or inspect .env contents.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>API/contract test, clean Git archive: resolve each npm script file and each windows-ci command target; assert all required source files exist in the archive and are not ignored. Run the workflows with local fakes and assert no network or system mutation.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, confirm .env, logs, checkpoints, and other generated state remain ignored while only intended test helpers become tracked.</p></section>
+<section><h3>Acceptance criteria</h3><p>A clean checkout contains every helper required by npm scripts and Windows CI. The same command chain starts from a clean archive, with no hidden dependency on local ignored files.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-13">Issue 13 progress</label>
+<select id="progress-issue-13" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-14" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 14</p>
+<h2 class="issue-title">Windows CI does not execute the Python test suite</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Likely</dd></div>
+<div><dt>Impacted area</dt><dd>Research correctness, regression prevention, release confidence</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The Windows workflow validates YAML, runs provider/wrapper/acceptance scripts, and runs Pester, but does not set up the locked Python environment or execute tests/test_prepare.py, tests/test_train_autotune.py, tests/test_train_checkpoint.py, or tests/test_optimized_validation.py.</p></section>
+<section><h3>Evidence or rationale</h3><p>The complete workflow at .github/workflows/windows-ci.yml:1-105 contains no Python setup, uv sync, or unittest command. The four Python test modules are present and use unittest. package.json test invokes no Python suite.</p></section>
+<section><h3>Why this matters</h3><p>Changes to data validation, autotune caches, checkpoint serialization, optimizer invariants, or the evaluation path can merge without those repository tests running in CI.</p></section>
+<section><h3>Recommended mitigation</h3><p>Add a Windows job or step using the supported Python and uv lockfile without changing dependencies. Run the deterministic CPU/unit suite and clearly separate optional GPU tests. Keep the fake/offline boundary so CI does not download datasets, contact AI providers, or require a physical GPU.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-14: Windows CI does not execute the Python test suite. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect pyproject.toml, uv.lock, tests/test_prepare.py, tests/test_train_autotune.py, tests/test_train_checkpoint.py, tests/test_optimized_validation.py, package.json, and .github/workflows/windows-ci.yml. Add a deterministic Windows CI step that provisions only from the existing lockfile and runs the current CPU/offline Python tests. Avoid GPU training, external dataset downloads, provider calls, and dependency upgrades. If runner permissions prevent the suite, fail or mark it explicitly rather than silently skipping.
+
+Regression tests: validate the workflow YAML and assert the Python test command is present in the required job. Use a clean temporary cache and mock network so dataset tests remain offline. Baseline: existing Node and Pester steps still execute. Run the exact Python command locally and report its environment limitation separately from CI behavior.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Configuration and regression test: parse the workflow YAML and assert a supported Python/uv setup and unittest command target all four test modules. Run the suite with network functions mocked and assert no dataset or provider request is made.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, verify existing provider, wrapper, acceptance, and Pester steps remain in the workflow and retain contents: read permissions.</p></section>
+<section><h3>Acceptance criteria</h3><p>Every committed Python test module runs in Windows CI or is explicitly classified as optional with a documented reason. CI produces a distinct failure for Python regressions and does not contact live providers or download datasets.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-14">Issue 14 progress</label>
+<select id="progress-issue-14" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-15" data-issue-kind="core" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 15</p>
+<h2 class="issue-title">The autoresearch loop masks repeated iteration failures as success</h2>
+<span class="issue-kind">Core</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Core</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Operational observability, recovery, scheduled-task health</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Invoke-AutoresearchLoop catches per-iteration exceptions, logs an error, and continues. It also continues after returned crash statuses. At the deadline it returns zero regardless of how many iterations failed. With the default unbounded MaxLoopMinutes, repeated failures may never reach a terminal task result.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1957 onward catches iteration errors and continues; the loop later writes a deadline message and returns 0. Invoke-AutoresearchIteration returns a crash status without throwing for failed metrics. TaskSupervisor records exit code 0 as succeeded at lines 2245-2250.</p></section>
+<section><h3>Why this matters</h3><p>Task Scheduler and operators can see a successful or indefinitely running task while no experiments are completing. Repeated provider or runtime failures lack a bounded circuit breaker.</p></section>
+<section><h3>Recommended mitigation</h3><p>Track consecutive and total failures, add bounded backoff, and stop or mark the loop degraded after a configured threshold. Return a nonzero status when no successful iteration occurred. Preserve intermediate results and allow a later scheduled trigger to retry.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-15: The autoresearch loop masks repeated iteration failures as success. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-AutoresearchLoop, Invoke-AutoresearchIteration, task supervisor exit reporting, and relevant Pester tests. Distinguish successful, discarded, crashed, and thrown iterations. Add a bounded consecutive-failure policy with backoff and a nonzero terminal status when a loop produces no successful run. Preserve completed result rows and diagnostics; do not treat a normal discard as a crash. Keep the next scheduled trigger available after a bounded failure exit.
+
+Regression tests: inject repeated exceptions, repeated crash results, one successful iteration after a failure, and all-success runs using mocks and a short test clock. Assert the correct status, bounded call count, backoff, and preserved rows. Baseline: a valid discard remains a completed experiment. Run focused Pester tests and npm test; do not invoke the actual scheduler.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>State-transition and observability test, Pester mocks: drive throw/throw, crash/crash, failure/success, and success/discard sequences. Assert the loop stops at the configured threshold, returns nonzero only when appropriate, and logs counts without prompt or credential data.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, simulate a valid successful run followed by a non-improving discard and assert the loop remains eligible for the next iteration.</p></section>
+<section><h3>Acceptance criteria</h3><p>A loop with no successful iterations cannot return success. Failure count and final state are structured and visible, retry is bounded, and valid discards do not cause false alarms.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-15">Issue 15 progress</label>
+<select id="progress-issue-15" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-16" data-issue-kind="additional" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 16</p>
+<h2 class="issue-title">Concurrent data preparation uses one shared download temporary file</h2>
+<span class="issue-kind">Additional</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Additional</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Concurrency, cache integrity, startup reliability</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The TinyStories downloader writes all concurrent attempts to the same filepath.tmp. Two launchers preparing the same missing dataset can truncate, interleave, validate, or remove each other's temporary download.</p></section>
+<section><h3>Evidence or rationale</h3><p>prepare.py:549-603 chooses temp_path = filepath + .tmp, writes to it, verifies it, and promotes it. There is no cross-process lock or unique temporary name in the download path. Existing download tests are single-process.</p></section>
+<section><h3>Why this matters</h3><p>A simultaneous manual run and scheduled startup can fail preparation despite a healthy data source. Hash verification prevents promotion of corrupt data but does not prevent false failure or deletion of a concurrent writer's temp file.</p></section>
+<section><h3>Recommended mitigation</h3><p>Use a unique same-directory temporary file per process and atomic promotion, or a narrowly scoped cross-process lock. Keep checksum validation before replacement and never remove another process's temporary file.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-16: Concurrent data preparation uses one shared download temporary file. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect prepare.py _download_tinystories_file, _download_url_with_retries, _promote_verified_download, and tests/test_prepare.py. Give each concurrent downloader a unique temporary path in the destination directory or acquire a cross-process dataset lock. Preserve the expected SHA-256 check and atomic os.replace promotion. A failed process must clean only its own temp file; it must not delete another downloader's data.
+
+Regression tests: run two subprocess fixtures with a barrier so writes overlap; mock the same valid body and a slow writer. Assert both finish safely or one waits, the final parquet hash matches, and each process only removes its own temp. Inject a corrupt response and assert the final target is not promoted. Baseline: retries and existing-cache reuse remain unchanged. Run the focused prepare unit tests when temp storage is writable; do not download real data.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Concurrency, Python subprocess test: coordinate two fake downloads to the same dataset and assert the final file matches the expected digest, neither process deletes the other's temporary file, and cleanup leaves no stale temp files.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, repeat existing valid-file reuse, transient 503 retry, and corrupt-file rejection tests with mocked responses.</p></section>
+<section><h3>Acceptance criteria</h3><p>Concurrent prepare calls cannot corrupt or remove each other's temporary files. Only checksum-verified content is promoted atomically, and all failure cleanup is process-owned.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-16">Issue 16 progress</label>
+<select id="progress-issue-16" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-17" data-issue-kind="additional" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 17</p>
+<h2 class="issue-title">Log ACL hardening failure continues with potentially broad permissions</h2>
+<span class="issue-kind">Additional</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Additional</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Security, local privacy, diagnostics</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Set-LauncherDirectoryAcl warns when hardening fails, then continues using existing permissions. The warning itself says logs and task state may be readable by other accounts. The log stream includes child stdout/stderr and task command metadata.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:640-710 catches ACL errors and returns IsHardened=false while allowing Initialize-LauncherStorage to continue. Write-Json appends child output at 738-765. Pester tests assert warning and fallback behavior rather than fail-closed handling.</p></section>
+<section><h3>Why this matters</h3><p>On a shared Windows machine or misconfigured parent directory, logs and task-state details can be exposed to other local accounts. This is a concrete privacy boundary, though no actual broad ACL was inspected in this review.</p></section>
+<section><h3>Recommended mitigation</h3><p>Define which records require restrictive ACLs. Fail before writing sensitive log or state data when effective permissions cannot be verified, or write only sanitized non-sensitive status to a safe fallback. Avoid claiming hardening succeeded after a warning.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-17: Log ACL hardening failure continues with potentially broad permissions. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Test-LauncherDirectoryAcl, Set-LauncherDirectoryAcl, Ensure-LauncherDirectoryAcl, Initialize-LauncherStorage, Write-Json, and ACL Pester tests. Separate non-sensitive diagnostics from data that must be private. If ACL verification fails, do not write task commands, child output, provider details, or user-specific state into the unverified directory. Return a clear startup failure or use a verified per-user fallback with explicit status. Preserve current behavior only for data proven safe to expose.
+
+Regression tests: mock Get-Acl and Set-Acl denial, inherited broad permissions, unexpected principals, and a verified protected directory. Assert sensitive state is not written on failure, the user receives a clear warning, and no key or raw command is logged. Baseline: valid ACLs still allow logging. Run focused Pester tests in a registry-capable test runner.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Security and configuration test, fake ACL providers: force Set-Acl failure and return an unexpected reader principal. Assert no sensitive task-state or child output is written and startup reports a nonzero privacy failure.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, use an ACL fixture matching the allowed user, SYSTEM, and Administrators and assert normal append-only logging continues.</p></section>
+<section><h3>Acceptance criteria</h3><p>The launcher never records sensitive task state under an unverified permissive ACL. Every fallback is explicit, sanitized, and test-covered.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-17">Issue 17 progress</label>
+<select id="progress-issue-17" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-18" data-issue-kind="additional" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 18</p>
+<h2 class="issue-title">Experiment score parsing and serialization depend on Windows culture</h2>
+<span class="issue-kind">Additional</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Additional</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="3">Severity 3 (Medium)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Internationalization, experiment correctness, result history</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The launcher parses decimal metrics with culture-sensitive Double.TryParse and writes TSV decimals with culture-sensitive ToString. On locales that use comma decimal separators, Python's dot-formatted metrics can be misread or rewritten into a different number format.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1737, 1756, and 1766-1767 use default culture for parsing and formatting. Python prints val_bpb with a dot in train.py, and results.tsv is a cross-run interchange format. No culture-specific test is present.</p></section>
+<section><h3>Why this matters</h3><p>A local machine language setting can change keep/discard comparisons or make later rows unparsable, corrupting experiment history without any source or model change.</p></section>
+<section><h3>Recommended mitigation</h3><p>Use invariant-culture parsing and formatting for machine-readable TSV and Python output. Keep user-facing messages localized separately. Validate finite positive metrics and exact tab column count before comparing.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-18: Experiment score parsing and serialization depend on Windows culture. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Read-RunLogMetrics, Get-CurrentBestValBpb, Add-ResultsTsvRow, and related Pester tests. Use invariant culture for all machine-readable numeric values exchanged with Python and results.tsv. Validate finite nonnegative memory and finite positive val_bpb values; preserve the existing five-column TSV shape and human descriptions. Do not change user-facing locale messages.
+
+Regression tests: set en-US and fr-FR cultures, parse dot-formatted Python metrics, serialize rows, and read them back. Assert the same numeric values and keep/discard decision under both cultures. Add malformed, NaN, infinity, and missing-field cases. Baseline: normal en-US results remain byte-compatible where the decimal separator is already a dot. Run Pester with fake logs only.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Internationalization and decision-table test, PowerShell/Pester: switch CurrentCulture between en-US and fr-FR; parse the same dot-decimal log and compare rows. Assert equal keep/discard decisions and invariant dot-decimal TSV output.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, parse ordinary val_bpb and peak_vram values, preserve five tab-separated columns, and reject malformed or non-finite values.</p></section>
+<section><h3>Acceptance criteria</h3><p>Numeric logs and TSV rows round-trip to the same values regardless of current Windows culture. Malformed metrics cannot silently become a keep or discard score.</p></section>
+<section><h3>Confidence</h3><p>High</p></section>
+<div class="issue-actions">
+<label for="progress-issue-18">Issue 18 progress</label>
+<select id="progress-issue-18" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-19" data-issue-kind="additional" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 19</p>
+<h2 class="issue-title">A 60-second checkpoint interval leaves an unbounded recovery gap</h2>
+<span class="issue-kind">Additional</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Additional</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p3">Priority P3, moderate</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="3">Severity 3 (Medium)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Recovery, training progress, checkpoint semantics</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>The periodic checkpoint interval is fixed at 60 seconds, and a run creates its own checkpoint directory. Abrupt process termination can lose progress since the last save. The launcher starts each new iteration without --resume-from, so a later run does not automatically continue the interrupted checkpoint.</p></section>
+<section><h3>Evidence or rationale</h3><p>train.py:958 defines CHECKPOINT_SAVE_INTERVAL_SECONDS as 60.0; train.py:1498 saves only after that interval plus initial/final checkpoints. scripts/launch.ps1:1869 launches uv run train.py without a resume path. Manual resume is documented and covered by tests, but automatic recovery is not.</p></section>
+<section><h3>Why this matters</h3><p>Power loss, timeout, GPU reset, or process crash can discard the last interval of work and then start a cold run, despite the presence of a checkpoint artifact.</p></section>
+<section><h3>Recommended mitigation</h3><p>Clarify whether checkpoints are manual recovery artifacts or automatic resume state. If automatic recovery is required, preserve a bounded, verified resumable checkpoint and pass it on restart only after compatibility validation. Make interval configurable within safe limits and avoid excessive write amplification.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-19: A 60-second checkpoint interval leaves an unbounded recovery gap. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect train.py checkpoint save timing and resume validation, scripts/launch.ps1 training command, README resume instructions, and checkpoint tests. Define the expected recovery contract: manual resume only or automatic continuation. If automatic continuation is intended, retain and select the newest compatible completed snapshot, pass its path explicitly, and fail back to a cold run only with a visible reason. Keep bounded retention and signature checks. If checkpoints remain manual-only, document the maximum expected loss window and expose it in run metadata.
+
+Regression tests: use a fake clock to interrupt between saves and verify the documented recovery behavior, including missing and incompatible checkpoints. Assert no stale or mismatched run resumes silently. Baseline: manual --resume-from continues the saved step and cursor. Run focused Python checkpoint tests; no GPU training is required.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>Boundary and recovery test, Python unittest with a fake clock: stop immediately before and after the periodic save boundary. Assert the last valid state and reported loss window match the chosen contract and incompatible artifacts are rejected.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, verify manual resume preserves optimizer state, step, and batch cursor for a compatible checkpoint.</p></section>
+<section><h3>Acceptance criteria</h3><p>Checkpoint recovery expectations are explicit and tested. Automatic restart never silently cold-starts when the contract requires continuation, and checkpoint writes remain bounded and atomic.</p></section>
+<section><h3>Confidence</h3><p>Medium</p></section>
+<div class="issue-actions">
+<label for="progress-issue-19">Issue 19 progress</label>
+<select id="progress-issue-19" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+<article class="issue" id="issue-20" data-issue-kind="additional" data-progress="incomplete">
+<header class="issue-header">
+<p class="issue-number">Issue 20</p>
+<h2 class="issue-title">Idle-only eligibility is checked once before a potentially unbounded loop</h2>
+<span class="issue-kind">Additional</span>
+</header>
+<dl class="issue-fields">
+<div><dt>Kind</dt><dd>Additional</dd></div>
+<div><dt>Priority</dt><dd><span class="priority-label" data-priority="p2">Priority P2, high</span></dd></div>
+<div><dt>Severity</dt><dd><span class="severity-label" data-severity="2">Severity 2 (High)</span></dd></div>
+<div><dt>Likelihood</dt><dd>Possible</dd></div>
+<div><dt>Impacted area</dt><dd>Idle policy, process lifecycle, user trust</dd></div>
+</dl>
+<section><h3>Failure mode</h3><p>Invoke-AutoresearchLoop checks the idle gate once before entering its iteration loop. The default MaxLoopMinutes is zero, which creates an unbounded deadline. The task XML sets idle duration and wait values but does not explicitly set StopOnIdleEnd, and the supervisor waits on a separate child without a cancellation handler.</p></section>
+<section><h3>Evidence or rationale</h3><p>scripts/launch.ps1:1921 performs one Invoke-IdlePolicyGate call; the loop and deadline are at 1931 and 1957 onward. Task XML settings at 2398-2411 configure RunOnlyIfIdle and duration but do not set StopOnIdleEnd. Invoke-TaskLaunchSupervisor starts a hidden child with -Wait at 2203 and has no user-activity cancellation path. Whether Task Scheduler terminates descendants is unverified.</p></section>
+<section><h3>Why this matters</h3><p>Testable assumption: user activity after launch may not stop the hidden loop or its training descendants. The repository does not provide a controlled user-activity transition test, so this is a release risk rather than an observed production failure.</p></section>
+<section><h3>Recommended mitigation</h3><p>Define whether idle-only means start-when-idle or run-only-while-idle. For run-only-while-idle, explicitly configure task stop behavior, monitor activity between iterations, and terminate the full child process tree gracefully. Keep safe cancellation and checkpoint recovery.</p></section>
+<section><h3>Implementation prompt</h3><pre class="implementation-prompt" data-copy-target><code>Resolve the project root, read AGENTS.md, and preserve current user work. Address only issue-20: Idle-only eligibility is checked once before a potentially unbounded loop. Inspect the exact files and line ranges in this finding; verify them against current code. Inspect scripts/launch.ps1 Invoke-IdlePolicyGate, Invoke-AutoresearchLoop, Get-TaskXml, Invoke-TaskLaunchSupervisor, and task Pester tests. Define whether IdleOnly requires idle only at start or throughout training. If throughout, set the Task Scheduler idle-end behavior explicitly and supervise the complete child tree with cancellation and cleanup. Recheck activity between iterations so no new experiment begins after activity returns. Preserve the current skip behavior when idle cannot be determined.
+
+Regression tests: mock idle transitions from active to idle to active while a fake supervisor and child process are running. Assert no new iteration starts after activity returns and every child exits within a bounded grace period. Baseline: continuous idle permits the configured loop; unavailable idle state skips safely. Do not register or alter a real Scheduled Task. Run Pester tests in an authorized fixture runner.
+
+Implement the smallest safe fix for this finding and preserve unrelated behavior. Re-read applicable repository guidance and current code. Preserve staged, unstaged, untracked, and ignored user work. Use temporary repositories, fake executables, and mocks for risky scenarios. Do not install or initialize tools, update dependencies, elevate, change OS settings, or run scenarios against real providers, Scheduled Tasks, or production.
+
+Run the focused regression and baseline tests specified above, then supported existing checks. Report exact commands and outcomes. Distinguish blocked runner failures from product failures; state unresolved risks and testable assumptions.
+
+Before tracking work, recheck Beads database and CLI availability and OpenSpec configuration, CLI, active changes, and workflow. Do not install or initialize either. Use only verified applicable tracker records and issue-scoped workflows; report IDs and status truthfully or explain unavailability. The report progress selector is not tracker status.
+
+At completion, list changed files, tests and outcomes, recovery decisions, and unresolved risks. Do not include secrets.</code></pre></section>
+<section><h3>Regression tests</h3><p>State-transition and recovery test, fake Task Scheduler/process fixture: start idle, begin one child, simulate activity, and assert the child tree is cancelled and no next iteration starts. Record the exact boundary where the operating system would terminate the task as unverified until a disposable Windows VM test.</p></section>
+<section><h3>Additional baseline tests</h3><p>Additional baseline, maintain continuous-idle execution and fail-closed behavior when idle detection is unavailable.</p></section>
+<section><h3>Acceptance criteria</h3><p>The documented idle policy has an explicit, testable transition contract. Active input cannot leave an unobserved run looping indefinitely when run-only-while-idle is the selected policy.</p></section>
+<section><h3>Confidence</h3><p>Low</p></section>
+<div class="issue-actions">
+<label for="progress-issue-20">Issue 20 progress</label>
+<select id="progress-issue-20" data-issue-progress-control disabled>
+<option value="incomplete" selected>Incomplete</option>
+<option value="in-progress">In progress</option>
+<option value="complete">Complete</option>
+</select>
+<span class="issue-progress-state" data-issue-progress-state data-progress="incomplete">Incomplete</span>
+</div>
+</article>
+</section>
+<section class="scope-notes">
+<h2>Scope notes, evidence limits, and validation</h2>
+<h3>Working tree and local test outcomes</h3>
+<p>The starting Git status showed modified scripts/launch.ps1, scripts/test-launch-gui-layout.ps1, and tests/launch.Tests.ps1, plus an untracked ai-prompts/pre-mortem-2026-09-11-00-53-12.html. Those files were treated as user work and preserved. The report was the only file created for this review.</p>
+<ul>
+<li><strong>npm test:</strong> exit code 1. Provider verification passed and wrapper validation passed. The acceptance stage stopped at “Refusal message missing” in scripts/test-autoresearch-acceptance.ps1 after the current launcher changed dirty bootstrap to delete and reclone. Pester was not reached by this command.</li>
+<li><strong>npm run test:powershell:</strong> exit code 1. Pester discovery found 54 tests, then its registry fixture failed with “Requested registry access is not allowed”; zero assertions passed. This is a test-runner access failure, not evidence that 54 product assertions failed.</li>
+<li><strong>.venv/Scripts/python.exe -m unittest discover -s tests -v:</strong> exit code 1. The runner reported 36 tests, 4 failures, and 52 errors. Tracebacks showed PermissionError while test fixtures created and cleaned temporary directories. The suite outcome is environment-limited and is not presented as a product defect.</li>
+</ul>
+<p>Validation commands were run in the current dirty checkout. No test result proves hosted CI, production behavior, Windows Task Scheduler behavior, GPU training, or remote provider behavior. No application source or configuration file was changed.</p>
+<h3>Tracker state</h3>
+<p>The global bd CLI reported version 1.3.1, but bd list --json returned “no beads database found.” Ignored .beads artifacts exist locally, but no Beads issue records or IDs were verified. OpenSpec 1.14.1 is installed; openspec list showed an active autoresearch change at 0 of 33 tasks. No Beads or OpenSpec record was created or modified. The prompts require future agents to recheck setup and workflow availability.</p>
+<h3>Shared report asset release condition</h3>
+<p>The only stylesheet and script references in this report are the requested exact URLs: <a href="https://mytech.today/tools/m/config/prompts/style.css">shared style.css</a> and <a href="https://mytech.today/tools/m/config/prompts/code.js">shared code.js</a>. The configured web fetch returned an internal inaccessible response for both endpoints, and the browser access host was unavailable. This is not proof that the host is down. No HTTP status, headers, content type, browser page request, or script execution was verified.</p>
+<p>Therefore the stylesheet behavior, all nine style and color combinations, storage persistence, copy controls, progress synchronization, responsive rendering, print layout, and control initialization remain unverified release conditions. Static markup follows the requested selector contract. Appearance fieldset and progress selectors begin disabled. No local or alternate CSS or JavaScript was added. Do not treat this source inspection as proof that remote controls work.</p>
+<h3>Prior report design reference</h3>
+<p>The newest existing pre-mortem file was ai-prompts/pre-mortem-2026-09-11-00-53-12.html. Its warm neutral colors, serif display headings, rounded cards, metadata grid, and explicit print styles informed the document's semantic layout. No CSS was copied. This report depends only on the required shared stylesheet.</p>
+<h3>Limitations</h3>
+<p>No remote repository, CI run, pull request, task scheduler instance, provider, CUDA workload, dataset download, package install, self-update, or local browser rendering was available or exercised. The PowerShell 5.1 variable and Process.Kill overload checks were read-only runtime probes. Findings based on a future failure mode are explicitly labeled Testable assumption with a confirmation test. Shared-asset and browser boundaries remain unverified.</p>
+</section>
+</main>
+<footer class="report-footer">
+<p>Repository: autoresearch-win-rtx-scheduled</p>
+<p>Branch and revision: autoresearch/may30 at 21328cf</p>
+<p>Project author or maintainer: Not identified from available repository evidence.</p>
+<p>Report author: Kyle Rode, myTech.Today prompt-refined report workflow.</p>
+<p>Generated: 2026-10-31 11:38:23 America/Chicago</p>
+<p>Output: ai-prompts/pre-mortem-2026-10-31-11-38-23.html</p>
+<p>Scope: local evidence-based pre-mortem only; remote, hosted, provider, browser, and production outcomes are not established.</p>
+</footer>
+</body>
+</html>

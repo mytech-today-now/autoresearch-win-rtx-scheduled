@@ -44,6 +44,7 @@ results.tsv
 # Extra files
 .augment
 .beads
+/.beads.gate.lock
 scripts/beads-helpers.ps1
 scripts/beads-query.ps1
 scripts/bump-and-push.ps1

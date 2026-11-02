@@ -42,8 +42,9 @@
       -RunNow         Runs `uv run train.py` once, in the foreground.
                       Does NOT register a scheduled task.
       -RunLoop        Runs the autoresearch experiment loop described in
-                      program.md (edit train.py via ai-powered, commit, run,
-                      decide keep/discard, log to results.tsv, repeat) until
+                      program.md. Requires a clean source checkout and runs
+                      each edit, commit, and training run in an isolated
+                      experiment worktree, staging only train.py, until
                       -MaxLoopMinutes elapses or the process is killed.
       -RegisterTask   Creates/replaces the `Autoresearch-Train` scheduled
                       task. Does NOT run training in this invocation. The
@@ -150,6 +151,10 @@
       * Unattended  - Current user, S4U logon, no active desktop session
                       required.
     Default: 'IdleOnly'.
+
+    AI-generated training code requires an interactive review before execution.
+    IdleOnly and Unattended loops that use AI edits fail closed; use -NoAiEdit
+    for an unattended run of the checked-in training code.
 
     Example (register an unattended overnight task):
         pwsh -File .\scripts\launch.ps1 -NoGui -RegisterTask `
@@ -298,11 +303,12 @@
                    before exiting with the child's status so Task Scheduler
                    sees the real result.
       Workload:    The hidden child drives the autoresearch loop from
-                   program.md: it edits train.py via `ai-powered text`, runs
-                   `uv run train.py` per iteration (10-minute kill switch by
-                   default), parses val_bpb/peak_vram_mb from run.log,
-                   appends a row to results.tsv, and reverts the commit when
-                   val_bpb did not improve. The loop continues until
+                   program.md: it requires a clean source checkout, edits and
+                   trains in temporary experiment worktrees, stages only
+                   train.py, parses val_bpb/peak_vram_mb, and appends a row to
+                   results.tsv. Improved commits stay on the experiment
+                   branch; a discard rewinds only that branch. The source
+                   checkout is not committed or reset. The loop continues until
                    -MaxLoopMinutes elapses (default 0 = forever) or the
                    process is killed.
       Policy:      Interactive, IdleOnly, or Unattended
@@ -379,6 +385,7 @@ $Script:DefaultsPath = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA))
 $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
+$Script:AutoresearchLoopLock = $null
 $Script:TaskLaunchStatePath = Join-Path $LogDir 'autoresearch-task-launch.json'
 $Script:LauncherAclStatus = @{}
 $Script:LogRetentionCount = $LogRetentionCount
@@ -1648,19 +1655,48 @@ function Limit-RunLogs {
     }
 }
 
+function Get-ProviderApiKeyEnvironmentName {
+    param([Parameter(Mandatory)][string]$ProviderName)
+
+    switch ($ProviderName) {
+        'openai'    { return 'OPENAI_API_KEY' }
+        'anthropic' { return 'ANTHROPIC_API_KEY' }
+        'azure'     { return 'AZURE_OPENAI_API_KEY' }
+        default     { return $null }
+    }
+}
+
+function Clear-ProviderApiKeyEnvironment {
+    $apiKeyNames = @('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'AZURE_OPENAI_API_KEY')
+    foreach ($name in $apiKeyNames) {
+        [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+    }
+
+    foreach ($name in $apiKeyNames) {
+        if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name, 'Process'))) {
+            throw 'Provider API-key environment cleanup failed; refusing to launch a child process.'
+        }
+    }
+}
+
 function Set-WorkloadEnvironment {
+    $apiKeyName = Get-ProviderApiKeyEnvironmentName -ProviderName $Provider
+    $configuredApiKey = $null
+    if ($apiKeyName) {
+        if (-not [string]::IsNullOrWhiteSpace($ApiKey)) {
+            $configuredApiKey = $ApiKey
+        } else {
+            $configuredApiKey = [Environment]::GetEnvironmentVariable($apiKeyName, 'Process')
+        }
+    }
+    $script:ProviderApiKeyForAi = $configuredApiKey
+    Clear-ProviderApiKeyEnvironment
+
     [Environment]::SetEnvironmentVariable('OLLAMA_HOST', $OllamaHost, 'Process')
     [Environment]::SetEnvironmentVariable('AI_POWERED_MODEL', $Model, 'Process')
     [Environment]::SetEnvironmentVariable('AI_MODEL', $Model, 'Process')
     $apProvider = switch ($Provider) { 'ollama' { 'custom' } default { $Provider } }
     [Environment]::SetEnvironmentVariable('AI_PROVIDER', $apProvider, 'Process')
-    if ($ApiKey) {
-        switch ($Provider) {
-            'openai'    { [Environment]::SetEnvironmentVariable('OPENAI_API_KEY', $ApiKey, 'Process') }
-            'anthropic' { [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', $ApiKey, 'Process') }
-            'azure'     { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_API_KEY', $ApiKey, 'Process') }
-        }
-    }
     if ($Provider -eq 'azure') {
         if ($AzureEndpoint) { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_ENDPOINT', $AzureEndpoint, 'Process') }
         if ($AzureDeployment) { [Environment]::SetEnvironmentVariable('AZURE_OPENAI_DEPLOYMENT', $AzureDeployment, 'Process') }
@@ -1694,6 +1730,7 @@ function Invoke-Workload {
     Push-Location $RepoRoot
     $exitCode = 1
     try {
+        Clear-ProviderApiKeyEnvironment
         & uv run train.py 2>&1 | ForEach-Object {
             if ($_ -is [System.Management.Automation.ErrorRecord]) {
                 Write-Json -Level stderr -Message $_.ToString()
@@ -1711,13 +1748,10 @@ function Invoke-Workload {
 }
 
 # --------------------------------------------------------------------------
-# Autoresearch experiment loop (driven by program.md). The deterministic
-# bookkeeping lives here in PowerShell; the per-iteration code edit step is
-# delegated to a single `ai-powered text` call. Because `ai-powered` is a
-# text/image/audio client (not an agentic code editor), the edit step is
-# best-effort: the model is asked to return a complete replacement train.py
-# inside a fenced ```python block. If the response cannot be parsed, the
-# iteration is recorded as 'crash' and the working tree is reset.
+# Autoresearch experiment loop (driven by program.md). Each iteration runs in
+# a temporary worktree attached to a dedicated experiment branch. The source
+# checkout is never staged, committed, or reset, and only train.py is staged
+# inside the experiment worktree.
 # --------------------------------------------------------------------------
 
 function Initialize-ResultsTsv {
@@ -1775,17 +1809,63 @@ function Read-RunLogMetrics {
 function Invoke-Git {
     param([Parameter(Mandatory)][string[]]$GitArgs, [string]$Cwd = $RepoRoot)
     $out = & git -C $Cwd @GitArgs 2>&1 | Out-String
-    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.Trim() }
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.TrimEnd([char[]]@("`r","`n")) }
+}
+
+function Invoke-AutoresearchGit {
+    param(
+        [Parameter(Mandatory)][string[]]$GitArgs,
+        [Parameter(Mandatory)][string]$Cwd
+    )
+
+    $result = Invoke-Git -GitArgs $GitArgs -Cwd $Cwd
+    if ($result.ExitCode -ne 0) {
+        $command = if ($GitArgs -contains 'commit') {
+            'git commit --allow-empty -m <description>'
+        } else {
+            'git ' + ($GitArgs -join ' ')
+        }
+        throw "Git command '$command' failed in '$Cwd' with exit code $($result.ExitCode)."
+    }
+    return $result.Output
+}
+
+function Assert-AutoresearchSourceCheckoutClean {
+    param([Parameter(Mandatory)][string]$RepoRootPath)
+
+    $status = Invoke-AutoresearchGit -GitArgs @('status','--porcelain','--untracked-files=all') -Cwd $RepoRootPath
+    if (-not [string]::IsNullOrWhiteSpace($status)) {
+        $entries = @($status -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        throw "Refusing to start the autoresearch loop because the source checkout is dirty. Commit or move these changes first:`n$($entries -join "`n")"
+    }
+}
+
+function New-AutoresearchExperimentBranch {
+    param([Parameter(Mandatory)][string]$RepoRootPath)
+
+    $sourceRoot = Invoke-AutoresearchGit -GitArgs @('rev-parse','--show-toplevel') -Cwd $RepoRootPath
+    $baseCommit = Invoke-AutoresearchGit -GitArgs @('rev-parse','HEAD') -Cwd $sourceRoot
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $branch = "autoresearch/experiment-$stamp-$([guid]::NewGuid().ToString('N'))"
+    [void](Invoke-AutoresearchGit -GitArgs @('branch',$branch,$baseCommit) -Cwd $sourceRoot)
+
+    return [pscustomobject]@{
+        Name       = $branch
+        BaseCommit = $baseCommit
+    }
 }
 
 function Invoke-AiPoweredEdit {
     param(
         [Parameter(Mandatory)][string]$RepoRootPath,
-        [int]$ResultsTailRows = 20
+        [int]$ResultsTailRows = 20,
+        [string]$ResultsPath
     )
     $programPath = Join-Path $RepoRootPath 'program.md'
     $trainPath   = Join-Path $RepoRootPath 'train.py'
-    $resultsPath = Join-Path $RepoRootPath 'results.tsv'
+    if ([string]::IsNullOrWhiteSpace($ResultsPath)) {
+        $ResultsPath = Join-Path $RepoRootPath 'results.tsv'
+    }
     if (-not (Test-Path -LiteralPath $programPath)) { Write-Json -Level warn -Message 'program.md missing; skipping AI edit'; return $null }
     if (-not (Test-Path -LiteralPath $trainPath))   { Write-Json -Level warn -Message 'train.py missing; skipping AI edit';   return $null }
     $program  = Get-Content -LiteralPath $programPath -Raw -Encoding UTF8
@@ -1808,15 +1888,58 @@ $train
 
 Propose ONE small experimental change to train.py and return the complete new file.
 "@
-    $tmpPrompt = [System.IO.Path]::GetTempFileName()
-    Set-Content -LiteralPath $tmpPrompt -Value $prompt -Encoding UTF8
+    $tmpPrompt = $null
+    $previousOutputEncoding = $OutputEncoding
+    $exitCode = $null
+    $raw = $null
     try {
-        $raw = & ai-powered text --quiet --system $system (Get-Content -LiteralPath $tmpPrompt -Raw) 2>&1 | Out-String
+        $apiKeyName = Get-ProviderApiKeyEnvironmentName -ProviderName $Provider
+        $configuredApiKey = Get-Variable -Scope Script -Name ProviderApiKeyForAi -ErrorAction SilentlyContinue
+        $providerApiKey = $null
+        if ($null -ne $configuredApiKey -and -not [string]::IsNullOrWhiteSpace($configuredApiKey.Value)) {
+            $providerApiKey = $configuredApiKey.Value
+        } elseif ($apiKeyName -and -not [string]::IsNullOrWhiteSpace($ApiKey)) {
+            $providerApiKey = $ApiKey
+        } elseif ($apiKeyName) {
+            $providerApiKey = [Environment]::GetEnvironmentVariable($apiKeyName, 'Process')
+        }
+
+        # Expose only the selected provider key while the AI CLI is running.
+        Clear-ProviderApiKeyEnvironment
+        if ($apiKeyName -and -not [string]::IsNullOrWhiteSpace($providerApiKey)) {
+            [Environment]::SetEnvironmentVariable($apiKeyName, $providerApiKey, 'Process')
+        }
+
+        $tmpPrompt = [System.IO.Path]::GetTempFileName()
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($tmpPrompt, $prompt, $utf8)
+        $promptInput = [System.IO.File]::ReadAllText($tmpPrompt, $utf8)
+
+        # ai-powered text reads stdin when its positional prompt is omitted.
+        # Use UTF-8 for Windows PowerShell's native-command pipeline and keep
+        # the full source out of argv.
+        $OutputEncoding = $utf8
+        $raw = $promptInput | & ai-powered text --quiet --system $system 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+    } catch {
+        Write-Json -Level warn -Message 'ai-powered text invocation failed; skipping AI edit'
+        return $null
     } finally {
-        Remove-Item -LiteralPath $tmpPrompt -Force -ErrorAction SilentlyContinue
+        $OutputEncoding = $previousOutputEncoding
+        try {
+            Clear-ProviderApiKeyEnvironment
+        } finally {
+            if ($tmpPrompt) {
+                Remove-Item -LiteralPath $tmpPrompt -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {
-        Write-Json -Level warn -Message 'ai-powered text returned no output' -Extra @{ exit = $LASTEXITCODE }
+    if ($exitCode -ne 0) {
+        Write-Json -Level warn -Message 'ai-powered text failed; skipping AI edit' -Extra @{ exit = $exitCode }
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        Write-Json -Level warn -Message 'ai-powered text returned no output; skipping AI edit'
         return $null
     }
     $description = 'autoresearch iteration'
@@ -1828,103 +1951,448 @@ Propose ONE small experimental change to train.py and return the complete new fi
     return @{ NewContent = $Matches[1].TrimEnd("`r","`n"); Description = $description }
 }
 
+function Assert-AutoresearchGeneratedCodeReviewAvailable {
+    if ($SchedulerPolicy -ne 'Interactive') {
+        throw "AI-generated train.py is blocked for scheduler policy '$SchedulerPolicy' because no isolation boundary prevents access to user files and network resources. Use -NoAiEdit or run with Interactive policy and review each generated file."
+    }
+    if ([Console]::IsInputRedirected) {
+        throw 'AI-generated train.py is blocked because an interactive review prompt is unavailable. Use -NoAiEdit or run from an interactive console.'
+    }
+}
+
+function Confirm-AutoresearchGeneratedCode {
+    param([Parameter(Mandatory)][string]$TrainPath)
+
+    Assert-AutoresearchGeneratedCodeReviewAvailable
+    Write-Warning 'This model-generated code runs as your account and can access your files and network.'
+    Write-Host "Review the complete model-generated training file before execution: $TrainPath"
+    $approval = Read-Host 'After reviewing it, type RUN REVIEWED TRAIN.PY to execute this code'
+    return ($approval -ceq 'RUN REVIEWED TRAIN.PY')
+}
+
 function Invoke-AutoresearchIteration {
     param(
         [Parameter(Mandatory)][string]$RepoRootPath,
         [Parameter(Mandatory)][string]$ResultsPath,
         [int]$PerRunTimeoutMin = 10,
         [switch]$SkipAiEdit,
-        [switch]$BaselineRun
+        [switch]$BaselineRun,
+        [string]$ExperimentBranch
     )
 
-    $startCommit = (Invoke-Git -GitArgs @('rev-parse','HEAD') -Cwd $RepoRootPath).Output
+    $usesAiEdit = -not $SkipAiEdit -and -not $BaselineRun
+    if ($usesAiEdit) {
+        Assert-AutoresearchGeneratedCodeReviewAvailable
+    }
+
+    $sourceRoot = [System.IO.Path]::GetFullPath(
+        (Invoke-AutoresearchGit -GitArgs @('rev-parse','--show-toplevel') -Cwd $RepoRootPath)
+    )
+    if ([string]::IsNullOrWhiteSpace($ExperimentBranch)) {
+        $experiment = New-AutoresearchExperimentBranch -RepoRootPath $sourceRoot
+        $ExperimentBranch = $experiment.Name
+    } else {
+        $branchCheck = Invoke-Git -GitArgs @('check-ref-format','--branch',$ExperimentBranch) -Cwd $sourceRoot
+        if ($branchCheck.ExitCode -ne 0) {
+            throw "Invalid autoresearch experiment branch '$ExperimentBranch'."
+        }
+    }
+
+    $branchRef = "refs/heads/$ExperimentBranch"
+    $branchExists = Invoke-Git -GitArgs @('show-ref','--quiet','--verify',$branchRef) -Cwd $sourceRoot
+    if ($branchExists.ExitCode -ne 0) {
+        throw "Autoresearch experiment branch '$ExperimentBranch' does not exist."
+    }
+    $startCommit = Invoke-AutoresearchGit -GitArgs @('rev-parse','--verify',$branchRef) -Cwd $sourceRoot
+    $worktreesRoot = Join-Path $sourceRoot 'worktrees'
+    $createdWorktreesRoot = -not (Test-Path -LiteralPath $worktreesRoot -PathType Container)
+    if ($createdWorktreesRoot) {
+        New-Item -ItemType Directory -Path $worktreesRoot -Force | Out-Null
+    }
+    $worktreePath = Join-Path $worktreesRoot ("iteration-" + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $worktreePath) {
+        throw "Refusing to reuse existing autoresearch worktree path '$worktreePath'."
+    }
+
     $description = if ($BaselineRun) { 'baseline' } else { 'autoresearch iteration' }
     $appliedEdit = $false
+    $worktreeAdded = $false
+    $worktreeRemoved = $false
+    $iterCommit = $null
+    $shortSha = '0000000'
+    $status = 'crash'
+    $keepCommit = $false
+    $preserveWorktreeOnGitFailure = $false
+    $preserveWorktreeForReview = $false
+    $cleanupError = $null
 
-    # Edit step (skipped on the baseline run or when -NoAiEdit is set).
-    if (-not $SkipAiEdit -and -not $BaselineRun) {
-        $edit = Invoke-AiPoweredEdit -RepoRootPath $RepoRootPath
-        if ($null -ne $edit) {
-            if ($edit.Description) { $description = $edit.Description }
-            if ($edit.NewContent) {
-                Set-Content -LiteralPath (Join-Path $RepoRootPath 'train.py') `
-                    -Value $edit.NewContent -Encoding UTF8 -NoNewline
-                $appliedEdit = $true
-                Write-Json -Level info -Message 'Applied AI-proposed edit to train.py' -Extra @{ description = $description }
+    try {
+        [void](Invoke-AutoresearchGit -GitArgs @('worktree','add',$worktreePath,$ExperimentBranch) -Cwd $sourceRoot)
+        $worktreeAdded = $true
+
+        # Edit step (skipped on the baseline run or when -NoAiEdit is set).
+        if (-not $SkipAiEdit -and -not $BaselineRun) {
+            $edit = Invoke-AiPoweredEdit -RepoRootPath $worktreePath -ResultsPath $ResultsPath
+            if ($null -ne $edit) {
+                if ($edit.Description) { $description = $edit.Description }
+                if ($edit.NewContent) {
+                    Set-Content -LiteralPath (Join-Path $worktreePath 'train.py') `
+                        -Value $edit.NewContent -Encoding UTF8 -NoNewline
+                    $appliedEdit = $true
+                    Write-Json -Level info -Message 'Applied AI-proposed edit to train.py' -Extra @{ description = $description; experimentBranch = $ExperimentBranch }
+                    try {
+                        if (-not (Confirm-AutoresearchGeneratedCode -TrainPath (Join-Path $worktreePath 'train.py'))) {
+                            throw 'Review was not approved.'
+                        }
+                    } catch {
+                        $preserveWorktreeForReview = $true
+                        throw [System.InvalidOperationException]::new(
+                            "Model-generated training code was not approved; training did not run. Candidate worktree retained for review at '$worktreePath'.",
+                            $_.Exception
+                        )
+                    }
+                }
+            }
+            if (-not $appliedEdit) {
+                Write-Json -Level info -Message 'No edit applied this iteration' -Extra @{ description = $description; experimentBranch = $ExperimentBranch }
             }
         }
-        if (-not $appliedEdit) {
-            Write-Json -Level info -Message 'No edit applied this iteration' -Extra @{ description = $description }
+
+        # Each worktree has its own index. Stage only train.py and fail closed
+        # unless the branch advances to a commit containing the exact bytes
+        # that will be passed to uv.
+        try {
+            [void](Invoke-AutoresearchGit -GitArgs @('add','--','train.py') -Cwd $worktreePath)
+            [void](Invoke-AutoresearchGit -GitArgs @('-c','user.name=autoresearch','-c','user.email=autoresearch@local',
+                'commit','--allow-empty','-m',("autoresearch: " + $description)) -Cwd $worktreePath)
+            $iterCommit = Invoke-AutoresearchGit -GitArgs @('rev-parse','HEAD') -Cwd $worktreePath
+            if ($iterCommit -notmatch '^(?:[0-9a-f]{40}|[0-9a-f]{64})$') {
+                throw "Git command 'git rev-parse HEAD' did not return a full commit ID."
+            }
+            if ($iterCommit -ceq $startCommit) {
+                throw "Git command 'git commit' succeeded without advancing HEAD from '$startCommit'."
+            }
+
+            $branchCommit = Invoke-AutoresearchGit -GitArgs @('rev-parse',$branchRef) -Cwd $sourceRoot
+            if ($branchCommit -cne $iterCommit) {
+                throw "Git command 'git commit' did not leave the experiment branch at the expected commit."
+            }
+            $parentCommit = Invoke-AutoresearchGit -GitArgs @('rev-parse',('{0}^' -f $iterCommit)) -Cwd $sourceRoot
+            if ($parentCommit -cne $startCommit) {
+                throw "Git command 'git commit' did not advance directly from the iteration starting commit."
+            }
+
+            $committedTrainBlob = Invoke-AutoresearchGit `
+                -GitArgs @('rev-parse',('{0}:train.py' -f $iterCommit)) -Cwd $sourceRoot
+            $worktreeTrainBlob = Invoke-AutoresearchGit `
+                -GitArgs @('hash-object','--path=train.py','--','train.py') -Cwd $worktreePath
+            if ($committedTrainBlob -cne $worktreeTrainBlob) {
+                throw "Git command 'git commit' does not contain the exact train.py bytes that would run."
+            }
+        } catch {
+            $preserveWorktreeOnGitFailure = $true
+            $failure = [System.InvalidOperationException]::new(
+                "$($_.Exception.Message) The edited worktree was retained for review at '$worktreePath'.",
+                $_.Exception
+            )
+            $failure.Data['AutoresearchGitVerificationFailure'] = $true
+            throw $failure
+        }
+        $shortSha = $iterCommit.Substring(0, 7)
+
+        # Run training inside the same isolated worktree as the edit.
+        $runLog = Join-Path $worktreePath 'run.log'
+        $errFile = Join-Path $worktreePath 'run.err.log'
+        Write-Json -Level info -Message 'Iteration: starting uv run train.py' -Extra @{ commit = $shortSha; timeoutMin = $PerRunTimeoutMin; experimentBranch = $ExperimentBranch }
+        Clear-ProviderApiKeyEnvironment
+        $proc = Start-Process -FilePath 'uv' -ArgumentList @('run','train.py') `
+            -WorkingDirectory $worktreePath -NoNewWindow -PassThru `
+            -RedirectStandardOutput $runLog -RedirectStandardError $errFile
+        $killed = $false
+        if (-not $proc.WaitForExit([int]($PerRunTimeoutMin * 60 * 1000))) {
+            try { $proc.Kill($true) } catch { }
+            try { [void]$proc.WaitForExit() } catch { }
+            $killed = $true
+            Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha; experimentBranch = $ExperimentBranch }
+        }
+        # Merge stderr file into run.log so downstream parsing is unified.
+        if (Test-Path -LiteralPath $errFile) {
+            Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Add-Content -LiteralPath $runLog -Encoding UTF8
+            Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        }
+        $metrics = Read-RunLogMetrics -Path $runLog
+        $valBpb  = $metrics.ValBpb
+        $memGb   = if ($metrics.PeakVramMb -gt 0) { $metrics.PeakVramMb / 1024.0 } else { 0.0 }
+
+        # Decide outcome.
+        if (-not $killed -and $valBpb -gt 0) {
+            $best = Get-CurrentBestValBpb -Path $ResultsPath
+            if ($BaselineRun -or $null -eq $best -or $valBpb -lt $best) {
+                $status = 'keep'
+            } else {
+                $status = 'discard'
+            }
+        }
+
+        Add-ResultsTsvRow -Path $ResultsPath -Commit $shortSha `
+            -ValBpb $valBpb -MemoryGb $memGb -Status $status -Description $description
+        $keepCommit = ($status -eq 'keep')
+
+        Write-Json -Level info -Message 'Iteration finished' -Extra @{
+            commit = $shortSha; valBpb = $valBpb; memoryGb = $memGb; status = $status
+            description = $description; experimentBranch = $ExperimentBranch
         }
     }
-
-    # Commit the (possibly edited) state so we can revert cleanly on discard.
-    & git -C $RepoRootPath add -A 2>&1 | Out-Null
-    & git -C $RepoRootPath -c 'user.name=autoresearch' -c 'user.email=autoresearch@local' `
-        commit --allow-empty -m ("autoresearch: " + $description) 2>&1 | Out-Null
-    $iterCommit = (Invoke-Git -GitArgs @('rev-parse','HEAD') -Cwd $RepoRootPath).Output
-    $shortSha   = if ($iterCommit) { $iterCommit.Substring(0, [Math]::Min(7, $iterCommit.Length)) } else { '0000000' }
-
-    # Run training with a per-run wall-clock kill switch.
-    $runLog = Join-Path $RepoRootPath 'run.log'
-    if (Test-Path -LiteralPath $runLog) { Remove-Item -LiteralPath $runLog -Force -ErrorAction SilentlyContinue }
-    Write-Json -Level info -Message 'Iteration: starting uv run train.py' -Extra @{ commit = $shortSha; timeoutMin = $PerRunTimeoutMin }
-    $proc = Start-Process -FilePath 'uv' -ArgumentList @('run','train.py') `
-        -WorkingDirectory $RepoRootPath -NoNewWindow -PassThru `
-        -RedirectStandardOutput $runLog -RedirectStandardError (Join-Path $RepoRootPath 'run.err.log')
-    $killed = $false
-    if (-not $proc.WaitForExit([int]($PerRunTimeoutMin * 60 * 1000))) {
-        try { $proc.Kill($true) } catch { }
-        $killed = $true
-        Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha }
-    }
-    # Merge stderr file into run.log so downstream parsing is unified.
-    $errFile = Join-Path $RepoRootPath 'run.err.log'
-    if (Test-Path -LiteralPath $errFile) {
-        Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Add-Content -LiteralPath $runLog -Encoding UTF8
-        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
-    }
-    $metrics = Read-RunLogMetrics -Path $runLog
-    $valBpb  = $metrics.ValBpb
-    $memGb   = if ($metrics.PeakVramMb -gt 0) { $metrics.PeakVramMb / 1024.0 } else { 0.0 }
-
-    # Decide outcome.
-    $status = 'crash'
-    if (-not $killed -and $valBpb -gt 0) {
-        $best = Get-CurrentBestValBpb -Path $ResultsPath
-        if ($BaselineRun -or $null -eq $best -or $valBpb -lt $best) {
-            $status = 'keep'
-        } else {
-            $status = 'discard'
+    finally {
+        if ($worktreeAdded -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview) {
+            $removeResult = Invoke-Git -GitArgs @('worktree','remove','--force',$worktreePath) -Cwd $sourceRoot
+            if ($removeResult.ExitCode -eq 0) {
+                $worktreeRemoved = $true
+            } else {
+                $cleanupError = "Unable to remove isolated autoresearch worktree '$worktreePath': $($removeResult.Output)"
+            }
         }
-    }
 
-    Add-ResultsTsvRow -Path $ResultsPath -Commit $shortSha `
-        -ValBpb $valBpb -MemoryGb $memGb -Status $status -Description $description
-
-    if ($status -ne 'keep' -and $startCommit) {
-        # Revert any edits + the commit we just made.
-        & git -C $RepoRootPath reset --hard $startCommit 2>&1 | Out-Null
-        Write-Json -Level info -Message 'Iteration reverted to start commit' -Extra @{
-            startCommit = $startCommit.Substring(0,7); status = $status
+        if ($worktreeRemoved -and -not $keepCommit -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview) {
+            $rewindResult = Invoke-Git -GitArgs @('branch','--force',$ExperimentBranch,$startCommit) -Cwd $sourceRoot
+            if ($rewindResult.ExitCode -ne 0) {
+                $cleanupError = "Unable to discard the isolated experiment branch '$ExperimentBranch': $($rewindResult.Output)"
+            }
         }
+
+        if ($createdWorktreesRoot -and (Test-Path -LiteralPath $worktreesRoot -PathType Container)) {
+            $remaining = @(Get-ChildItem -LiteralPath $worktreesRoot -Force -ErrorAction SilentlyContinue)
+            if ($remaining.Count -eq 0) {
+                Remove-Item -LiteralPath $worktreesRoot -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        if ($cleanupError) { throw $cleanupError }
     }
 
-    Write-Json -Level info -Message 'Iteration finished' -Extra @{
-        commit = $shortSha; valBpb = $valBpb; memoryGb = $memGb; status = $status; description = $description
-    }
-    return @{ Commit = $shortSha; ValBpb = $valBpb; MemoryGb = $memGb; Status = $status; Description = $description }
+    return @{ Commit = $shortSha; ValBpb = $valBpb; MemoryGb = $memGb; Status = $status; Description = $description; ExperimentBranch = $ExperimentBranch; WorktreePath = $worktreePath }
 }
 
-function Invoke-AutoresearchLoop {
+function Get-AutoresearchLoopLockIdentity {
+    param([Parameter(Mandatory)][string]$RepoRootPath)
+
+    $rootResult = Invoke-Git -GitArgs @('rev-parse','--show-toplevel') -Cwd $RepoRootPath
+    if ($rootResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($rootResult.Output)) {
+        throw "Unable to resolve the repository root for the autoresearch loop lock (git rev-parse exited $($rootResult.ExitCode))."
+    }
+
+    $repositoryRoot = [System.IO.Path]::GetFullPath($rootResult.Output.Trim())
+    $normalizedRoot = $repositoryRoot.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $rootBytes = [System.Text.Encoding]::UTF8.GetBytes($normalizedRoot.ToUpperInvariant())
+        $hashBytes = $sha256.ComputeHash($rootBytes)
+        $rootHash = [System.BitConverter]::ToString($hashBytes).Replace('-', '')
+    } finally {
+        $sha256.Dispose()
+    }
+
+    return [pscustomobject]@{
+        RepositoryRoot = $repositoryRoot
+        MutexName      = "Global\myTech.Today.AutoresearchLoop.$rootHash"
+        OwnerPath      = Join-Path ([System.IO.Path]::GetTempPath()) "myTech.Today-AutoresearchLoop-$rootHash.owner.json"
+    }
+}
+
+function Read-AutoresearchLoopLockOwner {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not [System.IO.File]::Exists($Path)) { return $null }
+    $stream = $null
+    $reader = $null
+    try {
+        $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
+        $json = $reader.ReadToEnd()
+        if ([string]::IsNullOrWhiteSpace($json)) { return $null }
+        $owner = $json | ConvertFrom-Json -ErrorAction Stop
+        $ownerProcessId = 0
+        if ([int]::TryParse([string]$owner.ProcessId, [ref]$ownerProcessId) -and $ownerProcessId -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$owner.ProcessStartTimeUtc)) {
+            return $owner
+        }
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        } elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+    return $null
+}
+
+function Format-AutoresearchLoopLockBusyMessage {
+    param([Parameter()][psobject]$Owner)
+
+    if ($null -ne $Owner) {
+        $startTime = [string]$Owner.ProcessStartTimeUtc
+        if ($Owner.ProcessStartTimeUtc -is [DateTime]) {
+            $startTime = $Owner.ProcessStartTimeUtc.ToUniversalTime().ToString('o')
+        }
+        return "Autoresearch loop busy: the repository lock is held (last recorded PID $($Owner.ProcessId), started $startTime). This invocation exited before touching repository, results, or logs."
+    }
+    return 'Autoresearch loop busy: another process holds the repository lock. This invocation exited before touching repository, results, or logs.'
+}
+
+function Enter-AutoresearchLoopLock {
+    param([Parameter(Mandatory)][string]$RepoRootPath)
+
+    $identity = Get-AutoresearchLoopLockIdentity -RepoRootPath $RepoRootPath
+    $mutex = [System.Threading.Mutex]::new($false, $identity.MutexName)
+    $acquired = $false
+    $abandoned = $false
+    try {
+        $acquired = $mutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        # Windows grants ownership when it reports abandonment. This kernel
+        # state, not a PID check or timeout, is the stale-owner authority.
+        $acquired = $true
+        $abandoned = $true
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+
+    if (-not $acquired) {
+        try {
+            $owner = Read-AutoresearchLoopLockOwner -Path $identity.OwnerPath
+            return [pscustomobject]@{
+                Acquired                 = $false
+                Mutex                    = $null
+                MutexName                = $identity.MutexName
+                OwnerPath                = $identity.OwnerPath
+                Owner                    = $owner
+                PreviousOwner            = $null
+                RecoveredStaleOwner      = $false
+                RepositoryRoot           = $identity.RepositoryRoot
+            }
+        } finally {
+            $mutex.Dispose()
+        }
+    }
+
+    $previousOwner = Read-AutoresearchLoopLockOwner -Path $identity.OwnerPath
+    $recoveredStaleOwner = $abandoned
+    if (-not $recoveredStaleOwner -and $null -ne $previousOwner) {
+        # Once WaitOne has granted this mutex, the prior record can describe a
+        # dead process even when Windows has already removed the old mutex
+        # object. PID plus process start time detects that stale record; it is
+        # never used to take a lock from a process that still owns the mutex.
+        $previousStartTimeTicks = [long]0
+        $hasPreviousStartTime = [long]::TryParse(
+            [string]$previousOwner.ProcessStartTimeUtcTicks,
+            [ref]$previousStartTimeTicks
+        )
+        $previousProcess = Get-Process -Id ([int]$previousOwner.ProcessId) -ErrorAction SilentlyContinue
+        if ($null -eq $previousProcess -or -not $hasPreviousStartTime) {
+            $recoveredStaleOwner = $true
+        } else {
+            try {
+                if ($previousProcess.StartTime.ToUniversalTime().Ticks -ne $previousStartTimeTicks) {
+                    $recoveredStaleOwner = $true
+                }
+            } catch {
+                $recoveredStaleOwner = $true
+            }
+        }
+    }
+    $temporaryPath = "$($identity.OwnerPath).$PID.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $process = Get-Process -Id $PID -ErrorAction Stop
+        $processStartTimeUtc = $process.StartTime.ToUniversalTime()
+        $owner = [pscustomobject]@{
+            ProcessId            = [int]$PID
+            ProcessStartTimeUtc  = $processStartTimeUtc.ToString('o')
+            ProcessStartTimeUtcTicks = [long]$processStartTimeUtc.Ticks
+            RepositoryRoot       = $identity.RepositoryRoot
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($temporaryPath, ($owner | ConvertTo-Json -Compress), $utf8)
+        if ([System.IO.File]::Exists($identity.OwnerPath)) {
+            [System.IO.File]::Delete($identity.OwnerPath)
+        }
+        # The mutex is the lock. A busy observer may briefly see no diagnostic
+        # owner record between these operations and will still fail closed.
+        [System.IO.File]::Move($temporaryPath, $identity.OwnerPath)
+        return [pscustomobject]@{
+            Acquired                 = $true
+            Mutex                    = $mutex
+            MutexName                = $identity.MutexName
+            OwnerPath                = $identity.OwnerPath
+            Owner                    = $owner
+            PreviousOwner            = $previousOwner
+            RecoveredStaleOwner      = $recoveredStaleOwner
+            RepositoryRoot           = $identity.RepositoryRoot
+        }
+    } catch {
+        try {
+            if ([System.IO.File]::Exists($temporaryPath)) {
+                [System.IO.File]::Delete($temporaryPath)
+            }
+        } catch { }
+        try {
+            $mutex.ReleaseMutex()
+        } finally {
+            $mutex.Dispose()
+        }
+        throw
+    }
+}
+
+function Exit-AutoresearchLoopLock {
+    param([Parameter(Mandatory)][psobject]$Lock)
+
+    if (-not $Lock.Acquired -or $null -eq $Lock.Mutex) { return }
+    try {
+        $recordedOwner = Read-AutoresearchLoopLockOwner -Path $Lock.OwnerPath
+        $recordedStartTimeTicks = [long]0
+        $hasRecordedStartTime = $null -ne $recordedOwner -and [long]::TryParse(
+            [string]$recordedOwner.ProcessStartTimeUtcTicks,
+            [ref]$recordedStartTimeTicks
+        )
+        if ($hasRecordedStartTime -and
+            $recordedOwner.ProcessId -eq $Lock.Owner.ProcessId -and
+            $recordedStartTimeTicks -eq $Lock.Owner.ProcessStartTimeUtcTicks) {
+            [System.IO.File]::Delete($Lock.OwnerPath)
+        }
+    } catch {
+        # The metadata is diagnostic; the named mutex alone controls access.
+    } finally {
+        try {
+            $Lock.Mutex.ReleaseMutex()
+        } finally {
+            $Lock.Mutex.Dispose()
+        }
+    }
+}
+
+function Invoke-AutoresearchLoopCore {
+    Assert-AutoresearchSourceCheckoutClean -RepoRootPath $RepoRoot
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $Script:RunLogPath = Join-Path $LogDir "autoresearch-loop-$stamp.jsonl"
     New-Item -ItemType File -Path $Script:RunLogPath -Force | Out-Null
+
+    if (-not $NoAiEdit) {
+        Assert-AutoresearchGeneratedCodeReviewAvailable
+    }
 
     if (-not (Invoke-IdlePolicyGate -Policy $SchedulerPolicy -IdleMinutes 5 -WaitTimeoutMinutes 60)) {
         Limit-RunLogs
         return 0
     }
+
+    # Experiments then advance only this retained branch, never the user's
+    # source branch or index.
+    $experiment = New-AutoresearchExperimentBranch -RepoRootPath $RepoRoot
+    $experimentBranch = $experiment.Name
 
     Set-WorkloadEnvironment
 
@@ -1939,6 +2407,7 @@ function Invoke-AutoresearchLoop {
         maxLoopMinutes       = $MaxLoopMinutes
         perRunTimeoutMinutes = $PerRunTimeoutMinutes
         noAiEdit             = [bool]$NoAiEdit
+        experimentBranch     = $experimentBranch
         schedulerPolicy      = $SchedulerPolicy
         policySummary        = (Get-SchedulerPolicyInfo -Policy $SchedulerPolicy).Summary
         deadline             = if ($deadline -eq [DateTime]::MaxValue) { 'none' } else { $deadline.ToString('o') }
@@ -1953,7 +2422,7 @@ function Invoke-AutoresearchLoop {
     if (-not $hasBaseline) {
         Write-Json -Level info -Message 'No baseline row in results.tsv; running baseline iteration'
         [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-            -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun)
+            -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch)
     }
 
     $iter = 0
@@ -1962,16 +2431,50 @@ function Invoke-AutoresearchLoop {
         Write-Json -Level info -Message "Autoresearch iteration #$iter starting"
         try {
             [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit)
+                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch)
         } catch {
             Write-Json -Level error -Message "Iteration #$iter raised: $($_.Exception.Message)"
+            if ($_.Exception.Data.Contains('AutoresearchGitVerificationFailure')) {
+                Limit-RunLogs
+                return 1
+            }
             # Keep looping; per-iteration failures should not kill the whole loop.
         }
     }
 
-    Write-Json -Level info -Message 'Autoresearch loop deadline reached; exiting' -Extra @{ iterations = $iter }
+    Write-Json -Level info -Message 'Autoresearch loop deadline reached; exiting' -Extra @{ iterations = $iter; experimentBranch = $experimentBranch }
     Limit-RunLogs
     return 0
+}
+
+function Invoke-AutoresearchLoop {
+    $existingLockVariable = Get-Variable -Scope Script -Name AutoresearchLoopLock -ErrorAction SilentlyContinue
+    $lock = if ($null -ne $existingLockVariable) { $existingLockVariable.Value } else { $null }
+    $ownsLock = $false
+    if ($null -eq $lock -or -not $lock.Acquired) {
+        $lock = Enter-AutoresearchLoopLock -RepoRootPath $RepoRoot
+        if (-not $lock.Acquired) {
+            Write-Host (Format-AutoresearchLoopLockBusyMessage -Owner $lock.Owner) -ForegroundColor Yellow
+            return 2
+        }
+        $ownsLock = $true
+    }
+
+    try {
+        if ($lock.RecoveredStaleOwner) {
+            $recoveryDetails = @{ staleOwnerRecovered = $true }
+            if ($null -ne $lock.PreviousOwner) {
+                $recoveryDetails.staleOwnerProcessId = $lock.PreviousOwner.ProcessId
+                $recoveryDetails.staleOwnerStartTimeUtc = $lock.PreviousOwner.ProcessStartTimeUtc
+            }
+            Write-Json -Level warn -Message 'Recovered a stale autoresearch repository lock owner' -Extra $recoveryDetails
+        }
+        return Invoke-AutoresearchLoopCore
+    } finally {
+        if ($ownsLock) {
+            Exit-AutoresearchLoopLock -Lock $lock
+        }
+    }
 }
 
 function Get-PwshExePath {
@@ -2901,6 +3404,20 @@ if (Test-TruthyEnvValue $env:AUTORESEARCH_DOT_SOURCE_ONLY) {
 }
 
 try {
+    if ($RunLoop) {
+        try {
+            $loopLock = Enter-AutoresearchLoopLock -RepoRootPath $RepoRoot
+        } catch {
+            [Console]::Error.WriteLine("Autoresearch loop could not acquire the repository lock: $($_.Exception.Message)")
+            exit 1
+        }
+        if (-not $loopLock.Acquired) {
+            Write-Host (Format-AutoresearchLoopLockBusyMessage -Owner $loopLock.Owner) -ForegroundColor Yellow
+            exit 2
+        }
+        $Script:AutoresearchLoopLock = $loopLock
+    }
+
     Initialize-LauncherStorage
     if ($Script:DebugEnabled) {
         Write-Json -Level info -Message "Debug logging enabled" -Extra @{
@@ -3005,4 +3522,10 @@ try {
     try { Write-Json -Level error -Message $errMessage } catch {}
     Write-Error $errMessage
     exit 1
+} finally {
+    if ($null -ne $Script:AutoresearchLoopLock) {
+        $loopLock = $Script:AutoresearchLoopLock
+        $Script:AutoresearchLoopLock = $null
+        Exit-AutoresearchLoopLock -Lock $loopLock
+    }
 }

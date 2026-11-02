@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-01
+
+- `-RunLoop` now requires a clean source checkout, serializes loops per repository, and runs each candidate in an isolated experiment worktree. Only `train.py` is staged there, and keep or discard decisions affect only the experiment branch.
+- Model-generated training code now requires an interactive review and the exact `RUN REVIEWED TRAIN.PY` approval before training. Declined candidates remain available for review, and provider credentials are limited to the selected AI CLI and cleared before training.
+- Large edit prompts now reach `ai-powered` through UTF-8 stdin, with temporary prompt cleanup after the invocation.
+
 ## 2026-09-10
 
 - Launcher defaults now persist only non-secret operational settings under `%LOCALAPPDATA%\myTech.Today\autoresearch-win-rtx-scheduled\launch.json`, while the legacy `scripts\launch.json` path remains read for compatibility only.

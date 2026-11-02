@@ -89,23 +89,24 @@ d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 
 ## The experiment loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The loop refuses to start when the source checkout has staged, unstaged, or untracked changes. Each loop creates a named `autoresearch/experiment-*` branch and uses a fresh temporary worktree under `worktrees/` for each edit, commit, training run, and keep/discard decision. The source checkout is not the experiment workspace: experiment commits and keep/discard decisions affect only the experiment branch. The loop intentionally updates the ignored `results.tsv` at the source root; other ignored files in the source checkout are left alone.
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. Look at the source branch and commit, then create a new experiment branch for this loop.
+2. Add a temporary worktree for the experiment branch under `worktrees/`.
+3. Tune `train.py` in that worktree with an experimental idea.
+4. Stage only `train.py` and commit the experiment in that worktree.
+5. Run `uv run train.py` in that worktree, redirecting output to its `run.log` (do NOT use tee or let output flood your context).
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`.
+7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+8. Record the results in the source checkout's `results.tsv` (NOTE: do not commit the results.tsv file, leave it untracked by git).
+9. If val_bpb improved (lower), keep the commit on the experiment branch so the next iteration starts from it.
+10. If val_bpb is equal or worse, move only the experiment branch back to its pre-iteration commit and remove its temporary worktree.
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+The idea is that you are a completely autonomous researcher trying things out. If they work, you advance the experiment branch and keep the commit. If they don't, you discard the commit from that isolated branch and try the next experiment. The source checkout remains unchanged, and a kept experiment branch remains available after the loop exits.
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard inside the isolated experiment worktree).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 

@@ -1304,6 +1304,8 @@ def _run_training_once(
         "runtime": runtime,
         "config": config,
         "dataset": tokenizer.dataset,
+        "dataset_sha256": tokenizer.dataset_sha256,
+        "tokenizer_fingerprint": tokenizer.tokenizer_fingerprint,
         "vocab_size": config.vocab_size,
         "device_batch_size": device_batch_size,
         "grad_accum_steps": grad_accum_steps,
@@ -1316,6 +1318,8 @@ def _run_training_once(
 
     expected_model_training_signature = _build_model_training_signature(
         dataset=tokenizer.dataset,
+        dataset_sha256=tokenizer.dataset_sha256,
+        tokenizer_fingerprint=tokenizer.tokenizer_fingerprint,
         vocab_size=config.vocab_size,
         config=config,
         device_batch_size=device_batch_size,
@@ -1334,11 +1338,12 @@ def _run_training_once(
         )
         if model_training_issues:
             raise CheckpointCompatibilityError(
-                "Checkpoint is not compatible with the current run:\n- "
-                + "\n- ".join(model_training_issues)
+                _checkpoint_compatibility_message(model_training_issues)
             )
         expected_full_signature = _build_checkpoint_signature(
             dataset=tokenizer.dataset,
+            dataset_sha256=tokenizer.dataset_sha256,
+            tokenizer_fingerprint=tokenizer.tokenizer_fingerprint,
             vocab_size=config.vocab_size,
             config=config,
             device_batch_size=device_batch_size,
@@ -1351,8 +1356,7 @@ def _run_training_once(
         )
         if full_signature_issues:
             raise CheckpointCompatibilityError(
-                "Checkpoint is not compatible with the current optimizer state:\n- "
-                + "\n- ".join(full_signature_issues)
+                _checkpoint_compatibility_message(full_signature_issues)
             )
     else:
         resume_reason = "cold start; no --resume-from path was supplied."
@@ -1385,21 +1389,13 @@ def _run_training_once(
         }
 
     if resume_artifact is not None:
-        try:
-            model.load_state_dict(resume_artifact["model_state_dict"], strict=True)
-        except RuntimeError as exc:
-            raise CheckpointCompatibilityError(
-                f"Checkpoint model state could not be restored: {exc}"
-            ) from exc
-        try:
-            optimizer.load_state_dict(resume_artifact["optimizer_state_dict"])
-        except (KeyError, ValueError, RuntimeError) as exc:
-            raise CheckpointCompatibilityError(
-                f"Checkpoint optimizer state could not be restored: {exc}"
-            ) from exc
-        _move_optimizer_state_to_device(optimizer, runtime.device)
-        _restore_rng_state(resume_artifact.get("rng_state"))
-        resume_train_state = resume_artifact["train_state"]
+        resume_train_state = _restore_checkpoint_state(
+            model=model,
+            optimizer=optimizer,
+            resume_artifact=resume_artifact,
+            expected_signature=expected_full_signature,
+            device=runtime.device,
+        )
         step = int(resume_train_state.get("step", 0))
         total_training_time = float(resume_train_state.get("total_training_time", 0.0))
         smooth_train_loss = float(resume_train_state.get("smooth_train_loss", 0.0))
@@ -1596,9 +1592,20 @@ def _build_model_signature(config):
     }
 
 
-def _build_model_training_signature(*, dataset, vocab_size, config, device_batch_size, grad_accum_steps):
+def _build_model_training_signature(
+    *,
+    dataset,
+    dataset_sha256,
+    tokenizer_fingerprint,
+    vocab_size,
+    config,
+    device_batch_size,
+    grad_accum_steps,
+):
     return {
         "dataset": dataset,
+        "dataset_sha256": dataset_sha256,
+        "tokenizer_fingerprint": tokenizer_fingerprint,
         "vocab_size": int(vocab_size),
         "device_batch_size": int(device_batch_size),
         "grad_accum_steps": int(grad_accum_steps),
@@ -1619,6 +1626,8 @@ def _build_optimizer_signature(optimizer):
 def _build_checkpoint_signature(
     *,
     dataset,
+    dataset_sha256,
+    tokenizer_fingerprint,
     vocab_size,
     config,
     device_batch_size,
@@ -1628,6 +1637,8 @@ def _build_checkpoint_signature(
     signature = {
         "model_training": _build_model_training_signature(
             dataset=dataset,
+            dataset_sha256=dataset_sha256,
+            tokenizer_fingerprint=tokenizer_fingerprint,
             vocab_size=vocab_size,
             config=config,
             device_batch_size=device_batch_size,
@@ -1814,6 +1825,68 @@ def _checkpoint_signature_issues(expected, actual):
     return _signature_differences(expected, actual)
 
 
+def _checkpoint_identity_issues(
+    *,
+    dataset,
+    dataset_sha256,
+    tokenizer_fingerprint,
+    compatibility_signature,
+):
+    expected_identity = {
+        "model_training": {
+            "dataset": dataset,
+            "dataset_sha256": dataset_sha256,
+            "tokenizer_fingerprint": tokenizer_fingerprint,
+        }
+    }
+    return _checkpoint_signature_issues(expected_identity, compatibility_signature)
+
+
+def _checkpoint_compatibility_message(issues):
+    """Explain safe resume rejection, including legacy checkpoints without identity metadata."""
+    missing_identity_fields = {
+        "missing model_training.dataset_sha256",
+        "missing model_training.tokenizer_fingerprint",
+    }
+    if any(issue in missing_identity_fields for issue in issues):
+        prefix = (
+            "Checkpoint lacks dataset/tokenizer identity metadata and cannot be safely resumed. "
+            "Start a cold run without --resume-from to train from scratch."
+        )
+    else:
+        prefix = (
+            "Checkpoint is not compatible with the current dataset, tokenizer, model, "
+            "or optimizer state. Remove --resume-from for a cold start."
+        )
+    return prefix + "\n- " + "\n- ".join(issues)
+
+
+def _restore_checkpoint_state(*, model, optimizer, resume_artifact, expected_signature, device):
+    saved_signature = resume_artifact["metadata"].get("compatibility_signature") or {}
+    signature_issues = _checkpoint_signature_issues(expected_signature, saved_signature)
+    if signature_issues:
+        raise CheckpointCompatibilityError(
+            _checkpoint_compatibility_message(signature_issues)
+        )
+
+    try:
+        model.load_state_dict(resume_artifact["model_state_dict"], strict=True)
+    except RuntimeError as exc:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint model state could not be restored: {exc}"
+        ) from exc
+    try:
+        optimizer.load_state_dict(resume_artifact["optimizer_state_dict"])
+    except (KeyError, ValueError, RuntimeError) as exc:
+        raise CheckpointCompatibilityError(
+            f"Checkpoint optimizer state could not be restored: {exc}"
+        ) from exc
+
+    _move_optimizer_state_to_device(optimizer, device)
+    _restore_rng_state(resume_artifact.get("rng_state"))
+    return resume_artifact["train_state"]
+
+
 def _move_value_to_device(value, device):
     if torch.is_tensor(value):
         return value.to(device)
@@ -1870,10 +1943,14 @@ def _save_run_checkpoint(*, checkpoint_dir, context, model, optimizer, train_sta
         "status": context["status"],
         "resume": context["resume"],
         "resume_reason": context["resume_reason"],
+        "dataset_sha256": context["dataset_sha256"],
+        "tokenizer_fingerprint": context["tokenizer_fingerprint"],
         "run_context": {
             "runtime": _serialize_runtime(context["runtime"]),
             "model_config": _serialize_model_config(context["config"]),
             "dataset": context["dataset"],
+            "dataset_sha256": context["dataset_sha256"],
+            "tokenizer_fingerprint": context["tokenizer_fingerprint"],
             "vocab_size": context["vocab_size"],
             "device_batch_size": context["device_batch_size"],
             "grad_accum_steps": context["grad_accum_steps"],
@@ -1887,6 +1964,8 @@ def _save_run_checkpoint(*, checkpoint_dir, context, model, optimizer, train_sta
         },
         "compatibility_signature": _build_checkpoint_signature(
             dataset=context["dataset"],
+            dataset_sha256=context["dataset_sha256"],
+            tokenizer_fingerprint=context["tokenizer_fingerprint"],
             vocab_size=context["vocab_size"],
             config=context["config"],
             device_batch_size=context["device_batch_size"],
@@ -1941,7 +2020,7 @@ def main():
     print(f"TF32: {'enabled' if runtime.tf32_enabled else 'disabled'}")
     print(f"AMP dtype: {runtime.amp_dtype}")
 
-    tokenizer = Tokenizer.from_directory(dataset=args.dataset)
+    tokenizer = Tokenizer.from_directory(dataset=args.dataset, verify_dataset=True)
     vocab_size = tokenizer.get_vocab_size()
     print(f"Vocab size: {vocab_size:,}")
     print(f"Dataset: {tokenizer.dataset}")
@@ -1965,6 +2044,17 @@ def main():
         except (CheckpointError, FileNotFoundError) as exc:
             print(f"FAIL: {exc}")
             return 1
+        identity_issues = _checkpoint_identity_issues(
+            dataset=tokenizer.dataset,
+            dataset_sha256=tokenizer.dataset_sha256,
+            tokenizer_fingerprint=tokenizer.tokenizer_fingerprint,
+            compatibility_signature=(
+                resume_artifact["metadata"].get("compatibility_signature") or {}
+            ),
+        )
+        if identity_issues:
+            print(f"FAIL: {_checkpoint_compatibility_message(identity_issues)}")
+            return 1
 
     result = None
     chosen_train_batch = None
@@ -1987,6 +2077,8 @@ def main():
             grad_accum_steps = _get_grad_accum_steps(train_batch_size)
             candidate_signature = _build_model_training_signature(
                 dataset=tokenizer.dataset,
+                dataset_sha256=tokenizer.dataset_sha256,
+                tokenizer_fingerprint=tokenizer.tokenizer_fingerprint,
                 vocab_size=vocab_size,
                 config=config,
                 device_batch_size=train_batch_size,

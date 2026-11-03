@@ -110,6 +110,34 @@ TOKENIZER_CACHE_VERSION = 1
 TOKEN_BYTES_CACHE_VERSION = 1
 TOKENIZER_CACHE_KIND = "tokenizer"
 TOKEN_BYTES_CACHE_KIND = "token_bytes"
+TOKENIZER_FINGERPRINT_VERSION = 1
+
+
+def _build_tokenizer_fingerprint(pattern, special_tokens, mergeable_ranks):
+    """Return a stable digest for all data that determines tokenizer token IDs."""
+    mergeable_rank_map = {
+        token.hex(): int(rank)
+        for token, rank in sorted(mergeable_ranks.items(), key=lambda item: item[0])
+    }
+    special_token_ids = {
+        token: len(mergeable_rank_map) + index
+        for index, token in enumerate(special_tokens)
+    }
+    identity = {
+        "fingerprint_version": TOKENIZER_FINGERPRINT_VERSION,
+        "pattern": pattern,
+        "mergeable_ranks": mergeable_rank_map,
+        "special_tokens": list(special_tokens),
+        "special_token_ids": special_token_ids,
+    }
+    canonical_identity = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical_identity).hexdigest()
+    return f"sha256-v{TOKENIZER_FINGERPRINT_VERSION}:{digest}"
 
 
 def _normalize_dataset_name(dataset_name):
@@ -258,11 +286,16 @@ def _save_tokenizer_cache(path, dataset, pattern, mergeable_ranks):
         "pattern": pattern,
         "special_tokens": list(SPECIAL_TOKENS),
         "mergeable_ranks": {token.hex(): rank for token, rank in mergeable_ranks.items()},
+        "tokenizer_fingerprint": _build_tokenizer_fingerprint(
+            pattern,
+            SPECIAL_TOKENS,
+            mergeable_ranks,
+        ),
     }
     _write_json_cache(path, payload)
 
 
-def _load_tokenizer_cache(path, dataset_name=None):
+def _load_tokenizer_cache(path, dataset_name=None, return_metadata=False):
     payload = _load_json_cache(
         path,
         TOKENIZER_CACHE_KIND,
@@ -319,6 +352,17 @@ def _load_tokenizer_cache(path, dataset_name=None):
             f"Tokenizer cache at {path} has non-contiguous mergeable-rank ids."
         )
 
+    tokenizer_fingerprint = _build_tokenizer_fingerprint(
+        payload["pattern"],
+        payload["special_tokens"],
+        mergeable_ranks,
+    )
+    stored_fingerprint = payload.get("tokenizer_fingerprint")
+    if stored_fingerprint is not None and stored_fingerprint != tokenizer_fingerprint:
+        raise TokenizerCacheError(
+            f"Tokenizer cache at {path} has a fingerprint that does not match its tokenizer data."
+        )
+
     token_offset = len(mergeable_ranks)
     special_tokens = {name: token_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
     enc = tiktoken.Encoding(
@@ -332,6 +376,11 @@ def _load_tokenizer_cache(path, dataset_name=None):
             f"Tokenizer cache at {path} rebuilt to vocab size {enc.n_vocab}, "
             f"expected {VOCAB_SIZE}."
         )
+    if return_metadata:
+        return enc, {
+            "dataset_sha256": payload["dataset_sha256"],
+            "tokenizer_fingerprint": tokenizer_fingerprint,
+        }
     return enc
 
 
@@ -750,13 +799,15 @@ def _validate_split(split):
 class Tokenizer:
     """Minimal tokenizer wrapper. Training is handled above."""
 
-    def __init__(self, enc, dataset):
+    def __init__(self, enc, dataset, dataset_sha256, tokenizer_fingerprint):
         self.enc = enc
         self.dataset = _resolve_dataset_name(dataset)
+        self.dataset_sha256 = dataset_sha256
+        self.tokenizer_fingerprint = tokenizer_fingerprint
         self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=None, dataset=None):
+    def from_directory(cls, tokenizer_dir=None, dataset=None, verify_dataset=False):
         dataset_name = _resolve_dataset_name(dataset)
         if tokenizer_dir is None:
             tokenizer_cache_path = _tokenizer_cache_path(dataset_name)
@@ -772,8 +823,22 @@ class Tokenizer:
                 raise FileNotFoundError(
                     f"Tokenizer cache not found at {tokenizer_cache_path}. Run prepare.py first."
                 )
-        enc = _load_tokenizer_cache(tokenizer_cache_path, dataset_name=dataset_name)
-        return cls(enc, dataset=dataset_name)
+        enc, identity = _load_tokenizer_cache(
+            tokenizer_cache_path,
+            dataset_name=dataset_name,
+            return_metadata=True,
+        )
+        if verify_dataset:
+            dataset_path = _resolve_tiny_parquet_for_read(dataset_name)
+            verified_dataset_sha256 = _verify_tinystories_parquet(dataset_path, dataset_name)
+            if identity["dataset_sha256"] != verified_dataset_sha256:
+                raise TokenizerCacheError(
+                    f"Tokenizer cache at {tokenizer_cache_path} has dataset sha256 "
+                    f"{identity['dataset_sha256']!r}, but the dataset at {dataset_path} "
+                    f"has sha256 {verified_dataset_sha256!r}."
+                )
+            identity["dataset_sha256"] = verified_dataset_sha256
+        return cls(enc, dataset=dataset_name, **identity)
 
     def get_vocab_size(self):
         return self.enc.n_vocab

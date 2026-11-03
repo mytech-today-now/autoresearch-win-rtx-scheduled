@@ -189,6 +189,8 @@ BeforeAll {
         'Initialize-ResultsTsv',
         'Invoke-AiPoweredEdit',
         'Invoke-AutoresearchGit',
+        'Get-AutoresearchProcessTreeIds',
+        'Stop-AutoresearchProcessTree',
         'Invoke-AutoresearchIteration',
         'Assert-AutoresearchGeneratedCodeReviewAvailable',
         'Confirm-AutoresearchGeneratedCode',
@@ -1326,6 +1328,13 @@ Describe 'Autoresearch experiment worktree transaction' {
         $script:AutoresearchGitFaultOutput = 'mock failure detail api_key=TEST_ONLY_SECRET'
         $script:AutoresearchGitCalls = @()
         $script:AutoresearchLogRecords = @()
+        $script:FakeTrainingProcessMode = 'immediate'
+        $script:FakeTrainingRuntimePath = $null
+        $script:FakeTrainingTreeScriptPath = $null
+        $script:FakeTrainingTreeMarkerPath = $null
+        $script:FakeTrainingProcess = $null
+        $script:FakeTrainingTrackedProcesses = @()
+        $script:FakeTreeStopCalls = 0
 
         Mock Write-Json {
             $script:AutoresearchLogRecords += [pscustomobject]@{
@@ -1385,6 +1394,48 @@ Describe 'Autoresearch experiment worktree transaction' {
                 [string]$RedirectStandardError
             )
             $script:FakeTrainingRoots += $WorkingDirectory
+            if ($script:FakeTrainingProcessMode -eq 'timeout') {
+                [System.IO.File]::WriteAllText($RedirectStandardOutput, "val_bpb: $script:FakeTrainingScore`n")
+                [System.IO.File]::WriteAllText($RedirectStandardError, 'peak_vram_mb: 1024' + [Environment]::NewLine)
+                $script:FakeTrainingTimeoutPid = [System.Diagnostics.Process]::GetCurrentProcess().Id
+                return [System.Diagnostics.Process]::GetCurrentProcess()
+            }
+            if ($script:FakeTrainingProcessMode -in @('tree', 'short')) {
+                $role = if ($script:FakeTrainingProcessMode -ceq 'short') { 'short' } else { 'root' }
+                $score = if ($role -ceq 'short') { '0.25' } else { '0.123456' }
+                $quotedScript = '"' + $script:FakeTrainingTreeScriptPath + '"'
+                $quotedMarker = '"' + $script:FakeTrainingTreeMarkerPath + '"'
+                $quotedRuntime = '"' + $script:FakeTrainingRuntimePath + '"'
+                $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $startInfo.FileName = $script:FakeTrainingRuntimePath
+                $startInfo.Arguments = '-NoProfile -ExecutionPolicy Bypass -File ' + $quotedScript +
+                    ' -Role ' + $role + ' -MarkerPath ' + $quotedMarker + ' -RuntimePath ' + $quotedRuntime +
+                    ' -OutputPath "' + $RedirectStandardOutput + '" -ErrorPath "' + $RedirectStandardError + '" -Score ' + $score
+                $startInfo.WorkingDirectory = $WorkingDirectory
+                $startInfo.UseShellExecute = $false
+                $process = New-Object System.Diagnostics.Process
+                $process.StartInfo = $startInfo
+                [void]$process.Start()
+                $script:FakeTrainingProcess = $process
+                if ($role -ceq 'root') {
+                    $readyDeadline = [DateTime]::UtcNow.AddSeconds(15)
+                    while ([DateTime]::UtcNow -lt $readyDeadline) {
+                        if (Test-Path -LiteralPath $script:FakeTrainingTreeMarkerPath -PathType Leaf) {
+                            $readyLines = @(Get-Content -LiteralPath $script:FakeTrainingTreeMarkerPath)
+                            if ($readyLines.Count -ge 3) { break }
+                        }
+                        if ($process.HasExited) { throw 'The fake training process tree exited before startup completed.' }
+                        Start-Sleep -Milliseconds 50
+                    }
+                    $readyLines = @(Get-Content -LiteralPath $script:FakeTrainingTreeMarkerPath -ErrorAction SilentlyContinue)
+                    if ($readyLines.Count -lt 3) { throw 'The fake training process tree did not reach its startup barrier.' }
+                    foreach ($line in $readyLines) {
+                        $parts = $line -split ','
+                        $script:FakeTrainingTrackedProcesses += [System.Diagnostics.Process]::GetProcessById([int]$parts[1])
+                    }
+                }
+                return $process
+            }
             [System.IO.File]::WriteAllText(
                 $RedirectStandardOutput,
                 "val_bpb: $script:FakeTrainingScore`npeak_vram_mb: 1024`n"
@@ -1395,6 +1446,101 @@ Describe 'Autoresearch experiment worktree transaction' {
                 return $true
             }
             return $process
+        }
+    }
+
+    It 'terminates and verifies a timed-out parent-child tree before finalizing one result row' -Tag 'Issue09' {
+        $fixture = New-AutoresearchGitFixture -Name 'timeout-process-tree'
+        $script:FakeTrainingProcessMode = 'tree'
+        $script:FakeTrainingRuntimePath = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+        $script:FakeTrainingTreeScriptPath = Join-Path $PSScriptRoot 'fixtures\issue09-process-tree.ps1'
+        $script:FakeTrainingTreeMarkerPath = Join-Path $fixture.Container 'fake-training-tree-pids.txt'
+
+        $trackedProcesses = @()
+        try {
+            $result = Invoke-AutoresearchIteration -RepoRootPath $fixture.Root `
+                -ResultsPath $fixture.ResultsPath -PerRunTimeoutMin 0
+
+            $result.Status | Should -BeExactly 'crash'
+            $result.ValBpb | Should -Be 0.123456
+            $result.MemoryGb | Should -Be 2
+            $pidRecords = @(Get-Content -LiteralPath $script:FakeTrainingTreeMarkerPath | ForEach-Object {
+                $parts = $_ -split ','
+                [pscustomobject]@{ Role = $parts[0]; ProcessId = [int]$parts[1] }
+            })
+            @($pidRecords | Where-Object { $_.Role -in @('root','child','grandchild') }).Count | Should -Be 3
+            $trackedProcesses = @($script:FakeTrainingTrackedProcesses)
+            $liveProcesses = @($trackedProcesses | Where-Object { -not $_.HasExited })
+            $liveProcesses.Count | Should -Be 0
+
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration exceeded per-run timeout; killed' }).Count |
+                Should -Be 1
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration finished' }).Count | Should -Be 1
+            $resultRows = @(Get-Content -LiteralPath $fixture.ResultsPath | Where-Object { $_ -and $_ -notmatch '^commit\t' })
+            $resultRows.Count | Should -Be 1
+            $columns = $resultRows[0] -split "`t"
+            $columns[1] | Should -BeExactly '0.123456'
+            $columns[2] | Should -BeExactly '2.0'
+            $columns[3] | Should -BeExactly 'crash'
+            Test-Path -LiteralPath $result.WorktreePath | Should -BeFalse
+        } finally {
+            foreach ($trackedProcess in $trackedProcesses) {
+                try {
+                    if (-not $trackedProcess.HasExited) {
+                        $trackedProcess.Kill()
+                        [void]$trackedProcess.WaitForExit(5000)
+                    }
+                } catch { }
+                try { $trackedProcess.Dispose() } catch { }
+            }
+            if ($null -ne $script:FakeTrainingProcess) {
+                try {
+                    if (-not $script:FakeTrainingProcess.HasExited) {
+                        $script:FakeTrainingProcess.Kill()
+                        [void]$script:FakeTrainingProcess.WaitForExit(5000)
+                    }
+                } catch { }
+                try { $script:FakeTrainingProcess.Dispose() } catch { }
+            }
+            if ($null -ne $result -and $result.Status -ceq 'uncontained-process' -and
+                (Test-Path -LiteralPath $result.WorktreePath -PathType Container)) {
+                & git -C $fixture.Root worktree remove --force $result.WorktreePath 2>&1 | Out-Null
+            }
+        }
+    }
+
+    It 'records a normal short child exit code and metrics without timeout cleanup' -Tag 'Issue09' {
+        $fixture = New-AutoresearchGitFixture -Name 'short-training-child'
+        $script:FakeTrainingProcessMode = 'short'
+        $script:FakeTrainingRuntimePath = Join-Path $PSHOME $(if ($PSVersionTable.PSEdition -eq 'Core') { 'pwsh.exe' } else { 'powershell.exe' })
+        $script:FakeTrainingTreeScriptPath = Join-Path $PSScriptRoot 'fixtures\issue09-process-tree.ps1'
+        $script:FakeTrainingTreeMarkerPath = Join-Path $fixture.Container 'fake-training-short-pids.txt'
+        try {
+            $result = Invoke-AutoresearchIteration -RepoRootPath $fixture.Root `
+                -ResultsPath $fixture.ResultsPath -PerRunTimeoutMin 1
+
+            $result.Status | Should -BeExactly 'keep'
+            $result.ExitCode | Should -Be 0
+            $result.ValBpb | Should -Be 0.25
+            $result.MemoryGb | Should -Be 1.5
+            $finished = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration finished' })
+            $finished.Count | Should -Be 1
+            $finished[0].Extra.exitCode | Should -Be 0
+            $finished[0].Extra.valBpb | Should -Be 0.25
+            $finished[0].Extra.memoryGb | Should -Be 1.5
+            $resultRows = @(Get-Content -LiteralPath $fixture.ResultsPath | Where-Object { $_ -and $_ -notmatch '^commit\t' })
+            $resultRows.Count | Should -Be 1
+            $columns = $resultRows[0] -split "`t"
+            $columns[1] | Should -BeExactly '0.250000'
+            $columns[2] | Should -BeExactly '1.5'
+            $columns[3] | Should -BeExactly 'keep'
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration exceeded per-run timeout; killed' }).Count |
+                Should -Be 0
+        } finally {
+            if ($null -ne $script:FakeTrainingProcess) {
+                try { if (-not $script:FakeTrainingProcess.HasExited) { $script:FakeTrainingProcess.Kill() } } catch { }
+                try { $script:FakeTrainingProcess.Dispose() } catch { }
+            }
         }
     }
 
@@ -1632,6 +1778,81 @@ Describe 'Autoresearch experiment worktree transaction' {
         (Get-AutoresearchFixtureHash -Path $resultsPath) | Should -BeExactly $resultsHash
         $script:FakeTrainingRoots.Count | Should -Be 0
         Assert-AutoresearchGitFixtureUnchanged -Fixture $fixture
+    }
+
+    It 'returns a distinct failure and starts no next iteration when process-tree cleanup fails' -Tag 'Issue09' {
+        $fixture = New-AutoresearchGitFixture -Name 'uncontained-process-loop'
+        $resultsPath = Join-Path $fixture.Root 'results.tsv'
+        $baselineRow = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.200000`t1.0`tkeep`tbaseline`r`n"
+        [System.IO.File]::WriteAllText($resultsPath, $baselineRow)
+
+        $previousValues = @{}
+        foreach ($name in @('RepoRoot','LogDir','MaxLoopMinutes','PerRunTimeoutMinutes','NoAiEdit','SchedulerPolicy','RunLogPath')) {
+            $previousVariable = Get-Variable -Scope Script -Name $name -ErrorAction SilentlyContinue
+            $previousValues[$name] = [pscustomobject]@{
+                Exists = ($null -ne $previousVariable)
+                Value  = if ($null -ne $previousVariable) { $previousVariable.Value } else { $null }
+            }
+        }
+        $script:RepoRoot = $fixture.Root
+        $script:LogDir = $fixture.Container
+        $script:MaxLoopMinutes = 1
+        $script:PerRunTimeoutMinutes = 0
+        $script:NoAiEdit = $false
+        $script:SchedulerPolicy = 'Interactive'
+        $script:FakeTrainingProcessMode = 'timeout'
+        $script:FakeTrainingRoots = @()
+        $script:FakeTreeStopCalls = 0
+        $script:FakeTrainingTimeoutPid = $null
+        $script:CapturedProcessCleanupWarnings = @()
+        $resultsHash = Get-AutoresearchFixtureHash -Path $resultsPath
+
+        Mock Assert-AutoresearchSourceCheckoutClean {}
+        Mock Invoke-IdlePolicyGate { return $true }
+        Mock Assert-AutoresearchGeneratedCodeReviewAvailable {}
+        Mock Set-WorkloadEnvironment {}
+        Mock Initialize-ResultsTsv {}
+        Mock Limit-RunLogs {}
+        Mock Stop-AutoresearchProcessTree {
+            $script:FakeTreeStopCalls++
+            return [pscustomobject]@{
+                Succeeded = $false
+                RemainingProcessIds = @($script:FakeTrainingTimeoutPid)
+            }
+        }
+        Mock Write-Warning {
+            $script:CapturedProcessCleanupWarnings += $Message
+        }
+
+        try {
+            $loopResult = Invoke-AutoresearchLoopCore
+            $diagnosticPattern = 'Remaining or unverified PID\(s\): {0}' -f $script:FakeTrainingTimeoutPid
+
+            $loopResult | Should -Be 3
+            $script:FakeTreeStopCalls | Should -Be 1
+            $script:FakeTrainingRoots.Count | Should -Be 1
+            (Get-AutoresearchFixtureHash -Path $resultsPath) | Should -BeExactly $resultsHash
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -match 'uncontained-process' -or $_.Message -match $diagnosticPattern }).Count |
+                Should -BeGreaterThan 0
+            @($script:CapturedProcessCleanupWarnings | Where-Object { $_ -match $diagnosticPattern }).Count |
+                Should -Be 1
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Autoresearch iteration #2 starting' }).Count |
+                Should -Be 0
+            @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration finished' }).Count | Should -Be 0
+            $retainedWorktrees = @(Get-ChildItem -LiteralPath (Join-Path $fixture.Root 'worktrees') -Directory -Filter 'iteration-*')
+            $retainedWorktrees.Count | Should -Be 1
+        } finally {
+            if ($script:FakeTrainingRoots.Count -gt 0 -and (Test-Path -LiteralPath $script:FakeTrainingRoots[0])) {
+                & git -C $fixture.Root worktree remove --force $script:FakeTrainingRoots[0] 2>&1 | Out-Null
+            }
+            foreach ($name in $previousValues.Keys) {
+                if ($previousValues[$name].Exists) {
+                    Set-Variable -Scope Script -Name $name -Value $previousValues[$name].Value
+                } else {
+                    Remove-Variable -Scope Script -Name $name -ErrorAction SilentlyContinue
+                }
+            }
+        }
     }
 
     It 'refuses to start the production loop when the source checkout is dirty' {
@@ -2026,8 +2247,20 @@ Describe 'Get-TaskXml' {
 }
 
 Describe 'Invoke-IdlePolicyGate' {
+    BeforeAll {
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $false
+            StructureSize = [uint32]0
+            LastInputTime = [uint32]0
+            CurrentTick   = [uint32]0
+        }
+        [void](Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate)
+        $script:idleNativeInfoSize = [Autoresearch.IdleNative]::LastInputInfoSize
+    }
+
     BeforeEach {
         $script:captured = @()
+        $script:idleNativeProbeCount = 0
         Mock Write-Json {
             param([string]$Level, [string]$Message, [hashtable]$Extra)
             $script:captured += [pscustomobject]@{ Level = $Level; Message = $Message; Extra = $Extra }
@@ -2048,9 +2281,152 @@ Describe 'Invoke-IdlePolicyGate' {
         @($script:captured | Where-Object { $_.Message -match 'Idle-only policy skipped' }).Count | Should -Be 1
     }
 
-    It 'passes through for non-idle-only policies without probing idle state' {
-        $result = Invoke-IdlePolicyGate -Policy Interactive -IdleMinutes 5 -WaitTimeoutMinutes 0 -PollIntervalSeconds 0
+    It 'marks a false native result unavailable and skips IdleOnly' {
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $false
+            StructureSize = $script:idleNativeInfoSize
+            LastInputTime = [uint32]100
+            CurrentTick   = [uint32]900100
+        }
+
+        $state = Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        $state.Available | Should -BeFalse
+        $state.IdleMs | Should -BeNullOrEmpty
+        $state.Reason | Should -Be 'GetLastInputInfo returned false.'
+
+        $provider = {
+            $script:idleNativeProbeCount++
+            Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        }
+        $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 1 -IdleStateProvider $provider
+
+        $result | Should -BeFalse
+        $script:idleNativeProbeCount | Should -Be 1
+        @($script:captured | Where-Object { $_.Message -match 'could not be determined' }).Count | Should -Be 1
+        $script:captured[1].Extra.reason | Should -Be 'GetLastInputInfo returned false.'
+        $script:captured[1].Extra.reason | Should -Not -Match '[\\/]|Exception| at '
+    }
+
+    It 'reports the sanitized reason when only the final idle probe is unavailable' {
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $false
+            StructureSize = $script:idleNativeInfoSize
+            LastInputTime = [uint32]100
+            CurrentTick   = [uint32]900100
+        }
+        $provider = { Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate }
+
+        $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 0 -IdleStateProvider $provider
+
+        $result | Should -BeFalse
+        $skip = @($script:captured | Where-Object { $_.Message -match 'Idle-only policy skipped' })[-1]
+        $skip.Message | Should -Match 'could not be determined: GetLastInputInfo returned false\.'
+        $skip.Extra.reason | Should -Be 'GetLastInputInfo returned false.'
+    }
+
+    It 'rejects zero, mismatched, and future timestamps before they can satisfy IdleOnly' {
+        $invalidSamples = @(
+            [pscustomobject]@{
+                Success       = $true
+                StructureSize = $script:idleNativeInfoSize
+                LastInputTime = [uint32]0
+                CurrentTick   = [uint32]900000
+            },
+            [pscustomobject]@{
+                Success       = $true
+                StructureSize = [uint32]($script:idleNativeInfoSize + 4)
+                LastInputTime = [uint32]100
+                CurrentTick   = [uint32]900100
+            },
+            [pscustomobject]@{
+                Success       = $true
+                StructureSize = $script:idleNativeInfoSize
+                LastInputTime = [uint32]900001
+                CurrentTick   = [uint32]900000
+            }
+        )
+
+        foreach ($sample in $invalidSamples) {
+            $script:idleNativeSampleForGate = $sample
+            $state = Get-ComputerIdleState -TestNativeSample $sample
+            $state.Available | Should -BeFalse
+            $state.IdleMs | Should -BeNullOrEmpty
+            $state.Reason | Should -Be 'GetLastInputInfo returned invalid idle data.'
+
+            $provider = { Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate }
+            $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 1 -IdleStateProvider $provider
+            $result | Should -BeFalse
+        }
+    }
+
+    It 'accepts a valid recent timestamp but does not satisfy the idle threshold' {
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $true
+            StructureSize = $script:idleNativeInfoSize
+            LastInputTime = [uint32]599000
+            CurrentTick   = [uint32]600000
+        }
+
+        $state = Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        $state.Available | Should -BeTrue
+        $state.IdleMs | Should -Be 1000
+
+        $provider = { Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate }
+        $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 0 -IdleStateProvider $provider
+        $result | Should -BeFalse
+    }
+
+    It 'handles a wrapped tick counter and starts work only for validated long idle data' {
+        $currentTick = [uint32]250000
+        $idleMilliseconds = [uint32]600000
+        $lastInputTime = [uint32]([uint64]4294967296 + $currentTick - $idleMilliseconds)
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $true
+            StructureSize = $script:idleNativeInfoSize
+            LastInputTime = $lastInputTime
+            CurrentTick   = $currentTick
+        }
+
+        $state = Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        $state.Available | Should -BeTrue
+        $state.IdleMs | Should -Be 600000
+        $state.IdleMinutes | Should -Be 10
+
+        $provider = { Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate }
+        $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 1 -IdleStateProvider $provider
         $result | Should -BeTrue
+    }
+
+    It 'treats malformed native data exceptions as unavailable' {
+        $script:idleNativeSampleForGate = [pscustomobject]@{
+            Success       = $true
+            StructureSize = $script:idleNativeInfoSize
+            LastInputTime = [uint32]100
+            CurrentTick   = 'not-a-tick'
+        }
+
+        $state = Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        $state.Available | Should -BeFalse
+        $state.IdleMs | Should -BeNullOrEmpty
+        $state.Reason | Should -Be 'Windows idle detection failed.'
+
+        $provider = { Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate }
+        $result = Invoke-IdlePolicyGate -Policy IdleOnly -IdleMinutes 5 -WaitTimeoutMinutes 1 -IdleStateProvider $provider
+        $result | Should -BeFalse
+    }
+
+    It 'preserves Interactive and Unattended bypass behavior without probing idle state' {
+        $provider = {
+            $script:idleNativeProbeCount++
+            Get-ComputerIdleState -TestNativeSample $script:idleNativeSampleForGate
+        }
+
+        $interactive = Invoke-IdlePolicyGate -Policy Interactive -IdleMinutes 5 -WaitTimeoutMinutes 0 -PollIntervalSeconds 0 -IdleStateProvider $provider
+        $unattended = Invoke-IdlePolicyGate -Policy Unattended -IdleMinutes 5 -WaitTimeoutMinutes 0 -PollIntervalSeconds 0 -IdleStateProvider $provider
+
+        $interactive | Should -BeTrue
+        $unattended | Should -BeTrue
+        $script:idleNativeProbeCount | Should -Be 0
     }
 }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-03
+
+- Timed-out training now uses process-tree cleanup and verification. If cleanup cannot be verified, the loop stops with a distinct exit code and retains the iteration worktree; idle-only scheduling also skips when Windows idle data cannot be validated.
+- Checkpoints now record the dataset SHA-256 and tokenizer fingerprint. Resume validation rejects mismatched identities and older checkpoints without that metadata.
+- CI and npm validation helpers are tracked, and `npm test` first checks local script references against a clean Git archive.
+
 ## 2026-11-01
 
 - `-RunLoop` now requires a clean source checkout, serializes loops per repository, and runs each candidate in an isolated experiment worktree. Only `train.py` is staged there, and keep or discard decisions affect only the experiment branch.

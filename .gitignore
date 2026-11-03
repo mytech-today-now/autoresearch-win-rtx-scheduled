@@ -16,6 +16,7 @@ queue/
 .env
 .env.*
 !.env.example
+.test-tmp-*/
 logs/
 *.log
 
@@ -31,6 +32,7 @@ node_modules/
 
 # Model checkpoints
 *.pt
+artifacts/checkpoints/
 
 # Results file
 results.tsv
@@ -53,8 +55,5 @@ scripts/proc-beads.ps1
 scripts/proc-beads-01.ps1
 scripts/process-beads.ps1
 scripts/make-beads.ps1
-scripts/test-autoresearch-acceptance.ps1
-scripts/test-autoresearch-wrapper.ps1
-scripts/verify-ai-provider.mjs
 
 .agents

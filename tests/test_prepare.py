@@ -1,6 +1,7 @@
 import contextlib
 import hashlib
 import io
+import json
 import os
 import tempfile
 import types
@@ -191,6 +192,45 @@ class PrepareTokenizerCacheTests(PrepareTestCase):
         self.assertEqual(tokenizer.dataset, "tinystories")
         self.assertEqual(tokenizer.get_vocab_size(), 5)
         self.assertEqual(tokenizer.get_bos_token_id(), 1)
+
+    def test_tokenizer_cache_persists_fingerprint_and_verified_dataset_hash(self):
+        path = prepare._tokenizer_cache_path("tinystories")
+        mergeable_ranks = {b"A": 0}
+        dataset_sha256 = prepare._dataset_sha256("tinystories")
+
+        with mock.patch.object(prepare, "VOCAB_SIZE", 5):
+            prepare._save_tokenizer_cache(
+                path,
+                "tinystories",
+                prepare.SPLIT_PATTERN,
+                mergeable_ranks,
+            )
+            with open(path, "r", encoding="utf-8") as cache_file:
+                payload = json.load(cache_file)
+
+            expected_fingerprint = prepare._build_tokenizer_fingerprint(
+                prepare.SPLIT_PATTERN,
+                prepare.SPECIAL_TOKENS,
+                mergeable_ranks,
+            )
+            with mock.patch.object(
+                prepare,
+                "_verify_tinystories_parquet",
+                return_value=dataset_sha256,
+            ) as verify_dataset:
+                tokenizer = self._quiet_call(
+                    prepare.Tokenizer.from_directory,
+                    dataset="tinystories",
+                    verify_dataset=True,
+                )
+
+        self.assertEqual(payload["tokenizer_fingerprint"], expected_fingerprint)
+        self.assertEqual(tokenizer.dataset_sha256, dataset_sha256)
+        self.assertEqual(tokenizer.tokenizer_fingerprint, expected_fingerprint)
+        verify_dataset.assert_called_once_with(
+            prepare._resolve_tiny_parquet_for_read("tinystories"),
+            "tinystories",
+        )
 
     def test_tokenizer_loads_successfully_after_format_version_bump(self):
         self._write_tokenizer_cache(vocab_size=5, version=1)

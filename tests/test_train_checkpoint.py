@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+import prepare
 import train
 
 
@@ -16,6 +17,15 @@ class CheckpointTestCase(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name)
+        self.dataset_sha256 = "a" * 64
+        self.split_pattern = prepare.SPLIT_PATTERN
+        self.special_tokens = list(prepare.SPECIAL_TOKENS)
+        self.mergeable_ranks = {bytes((65 + idx,)): idx for idx in range(12)}
+        self.tokenizer_fingerprint = prepare._build_tokenizer_fingerprint(
+            self.split_pattern,
+            self.special_tokens,
+            self.mergeable_ranks,
+        )
 
     def _quiet_call(self, func, *args, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -89,6 +99,8 @@ class CheckpointTestCase(unittest.TestCase):
             "runtime": runtime,
             "config": config,
             "dataset": "tinystories",
+            "dataset_sha256": self.dataset_sha256,
+            "tokenizer_fingerprint": self.tokenizer_fingerprint,
             "vocab_size": config.vocab_size,
             "device_batch_size": device_batch_size,
             "grad_accum_steps": grad_accum_steps,
@@ -246,9 +258,23 @@ class CheckpointRoundTripTests(CheckpointTestCase):
         self._assert_nested_equal(optimizer.state_dict(), artifact["optimizer_state_dict"], "optimizer")
         self._assert_nested_equal(train_state, artifact["train_state"], "train_state")
 
-        fresh_model.load_state_dict(artifact["model_state_dict"])
-        fresh_optimizer.load_state_dict(artifact["optimizer_state_dict"])
-        train._move_optimizer_state_to_device(fresh_optimizer, torch.device("cpu"))
+        expected_signature = train._build_checkpoint_signature(
+            dataset=context["dataset"],
+            dataset_sha256=context["dataset_sha256"],
+            tokenizer_fingerprint=context["tokenizer_fingerprint"],
+            vocab_size=context["vocab_size"],
+            config=config,
+            device_batch_size=context["device_batch_size"],
+            grad_accum_steps=context["grad_accum_steps"],
+            optimizer=fresh_optimizer,
+        )
+        restored_train_state = train._restore_checkpoint_state(
+            model=fresh_model,
+            optimizer=fresh_optimizer,
+            resume_artifact=artifact,
+            expected_signature=expected_signature,
+            device=torch.device("cpu"),
+        )
 
         self._assert_nested_equal(artifact["model_state_dict"], fresh_model.state_dict(), "fresh_model")
         self._assert_nested_equal(
@@ -256,12 +282,23 @@ class CheckpointRoundTripTests(CheckpointTestCase):
             fresh_optimizer.state_dict(),
             "fresh_optimizer",
         )
+        self._assert_nested_equal(train_state, restored_train_state, "restored_train_state")
 
         metadata_path = run_dir / train.CHECKPOINT_METADATA_FILE_NAME
         self.assertTrue(metadata_path.exists())
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         self.assertEqual(metadata["snapshot_reason"], "initial")
         self.assertEqual(metadata["run_id"], run_dir.name)
+        self.assertEqual(metadata["dataset_sha256"], context["dataset_sha256"])
+        self.assertEqual(metadata["tokenizer_fingerprint"], context["tokenizer_fingerprint"])
+        self.assertEqual(
+            metadata["compatibility_signature"]["model_training"]["dataset_sha256"],
+            context["dataset_sha256"],
+        )
+        self.assertEqual(
+            metadata["compatibility_signature"]["model_training"]["tokenizer_fingerprint"],
+            context["tokenizer_fingerprint"],
+        )
 
     def test_resumed_checkpoint_keeps_saved_step_and_batch_cursor(self):
         runtime = self._make_runtime()
@@ -343,6 +380,8 @@ class CheckpointRoundTripTests(CheckpointTestCase):
         )
         expected = train._build_model_training_signature(
             dataset="tinystories",
+            dataset_sha256=self.dataset_sha256,
+            tokenizer_fingerprint=self.tokenizer_fingerprint,
             vocab_size=mismatched_config.vocab_size,
             config=mismatched_config,
             device_batch_size=2,
@@ -410,6 +449,128 @@ class CheckpointRoundTripTests(CheckpointTestCase):
         self.assertTrue(path_b.exists())
         self.assertTrue((run_dir_a / train.CHECKPOINT_METADATA_FILE_NAME).exists())
         self.assertTrue((run_dir_b / train.CHECKPOINT_METADATA_FILE_NAME).exists())
+
+
+class CheckpointIdentityCompatibilityTests(CheckpointTestCase):
+    def _model_training_signature(self, dataset_sha256=None, tokenizer_fingerprint=None):
+        config = self._make_config()
+        return train._build_model_training_signature(
+            dataset="tinystories",
+            dataset_sha256=(
+                self.dataset_sha256 if dataset_sha256 is None else dataset_sha256
+            ),
+            tokenizer_fingerprint=(
+                self.tokenizer_fingerprint
+                if tokenizer_fingerprint is None
+                else tokenizer_fingerprint
+            ),
+            vocab_size=config.vocab_size,
+            config=config,
+            device_batch_size=2,
+            grad_accum_steps=2,
+        )
+
+    def _assert_identity_mismatch_rejected(self, dataset_sha256, tokenizer_fingerprint):
+        saved_signature = {"model_training": self._model_training_signature()}
+        expected_signature = {
+            "model_training": self._model_training_signature(
+                dataset_sha256=dataset_sha256,
+                tokenizer_fingerprint=tokenizer_fingerprint,
+            )
+        }
+        self.assertEqual(saved_signature["model_training"]["dataset"], "tinystories")
+        self.assertEqual(expected_signature["model_training"]["dataset"], "tinystories")
+        self.assertEqual(saved_signature["model_training"]["vocab_size"], 16)
+        self.assertEqual(expected_signature["model_training"]["vocab_size"], 16)
+
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        artifact = {
+            "metadata": {"compatibility_signature": saved_signature},
+            "model_state_dict": {},
+            "optimizer_state_dict": {},
+            "train_state": {},
+            "rng_state": None,
+        }
+        with self.assertRaises(train.CheckpointCompatibilityError) as error:
+            train._restore_checkpoint_state(
+                model=model,
+                optimizer=optimizer,
+                resume_artifact=artifact,
+                expected_signature=expected_signature,
+                device=torch.device("cpu"),
+            )
+
+        self.assertIn("current dataset, tokenizer", str(error.exception))
+        model.load_state_dict.assert_not_called()
+        optimizer.load_state_dict.assert_not_called()
+
+    def test_dataset_content_hash_mismatch_is_rejected_before_optimizer_restore(self):
+        self._assert_identity_mismatch_rejected(
+            dataset_sha256="b" * 64,
+            tokenizer_fingerprint=self.tokenizer_fingerprint,
+        )
+
+    def test_mergeable_rank_mismatch_is_rejected_before_optimizer_restore(self):
+        changed_ranks = dict(self.mergeable_ranks)
+        changed_ranks[b"A"], changed_ranks[b"B"] = (
+            changed_ranks[b"B"],
+            changed_ranks[b"A"],
+        )
+        changed_fingerprint = prepare._build_tokenizer_fingerprint(
+            self.split_pattern,
+            self.special_tokens,
+            changed_ranks,
+        )
+        self.assertNotEqual(changed_fingerprint, self.tokenizer_fingerprint)
+        self._assert_identity_mismatch_rejected(self.dataset_sha256, changed_fingerprint)
+
+    def test_split_pattern_mismatch_is_rejected_before_optimizer_restore(self):
+        changed_fingerprint = prepare._build_tokenizer_fingerprint(
+            self.split_pattern + "x",
+            self.special_tokens,
+            self.mergeable_ranks,
+        )
+        self.assertNotEqual(changed_fingerprint, self.tokenizer_fingerprint)
+        self._assert_identity_mismatch_rejected(self.dataset_sha256, changed_fingerprint)
+
+    def test_special_token_map_mismatch_is_rejected_before_optimizer_restore(self):
+        changed_fingerprint = prepare._build_tokenizer_fingerprint(
+            self.split_pattern,
+            list(reversed(self.special_tokens)),
+            self.mergeable_ranks,
+        )
+        self.assertNotEqual(changed_fingerprint, self.tokenizer_fingerprint)
+        self._assert_identity_mismatch_rejected(self.dataset_sha256, changed_fingerprint)
+
+    def test_legacy_checkpoint_without_identity_is_rejected_with_cold_start_guidance(self):
+        legacy_signature = self._model_training_signature()
+        legacy_signature.pop("dataset_sha256")
+        legacy_signature.pop("tokenizer_fingerprint")
+        model = mock.Mock()
+        optimizer = mock.Mock()
+        artifact = {
+            "metadata": {"compatibility_signature": {"model_training": legacy_signature}},
+            "model_state_dict": {},
+            "optimizer_state_dict": {},
+            "train_state": {},
+            "rng_state": None,
+        }
+
+        with self.assertRaises(train.CheckpointCompatibilityError) as error:
+            train._restore_checkpoint_state(
+                model=model,
+                optimizer=optimizer,
+                resume_artifact=artifact,
+                expected_signature={"model_training": self._model_training_signature()},
+                device=torch.device("cpu"),
+            )
+
+        message = str(error.exception)
+        self.assertIn("cannot be safely resumed", message)
+        self.assertIn("Start a cold run without --resume-from", message)
+        model.load_state_dict.assert_not_called()
+        optimizer.load_state_dict.assert_not_called()
 
 
 if __name__ == "__main__":

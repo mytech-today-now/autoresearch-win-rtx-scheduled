@@ -1970,6 +1970,254 @@ function Confirm-AutoresearchGeneratedCode {
     return ($approval -ceq 'RUN REVIEWED TRAIN.PY')
 }
 
+function Get-AutoresearchProcessTreeIds {
+    param([Parameter(Mandatory)][int]$RootProcessId)
+
+    if (-not ('Autoresearch.ProcessTreeNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace Autoresearch {
+    public sealed class ProcessTreeEntry {
+        public int ProcessId { get; private set; }
+        public int ParentProcessId { get; private set; }
+
+        public ProcessTreeEntry(int processId, int parentProcessId) {
+            ProcessId = processId;
+            ParentProcessId = parentProcessId;
+        }
+    }
+
+    public static class ProcessTreeNative {
+        private const uint TH32CS_SNAPPROCESS = 0x00000002;
+        private const int ERROR_NO_MORE_FILES = 18;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32W {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public UIntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        private static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32W entry);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        private static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32W entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static ProcessTreeEntry[] GetProcesses() {
+            IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == new IntPtr(-1)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            try {
+                var entries = new List<ProcessTreeEntry>();
+                var entry = new PROCESSENTRY32W();
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+                if (!Process32First(snapshot, ref entry)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                do {
+                    entries.Add(new ProcessTreeEntry(
+                        unchecked((int)entry.th32ProcessID),
+                        unchecked((int)entry.th32ParentProcessID)
+                    ));
+                    entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32W));
+                } while (Process32Next(snapshot, ref entry));
+
+                int error = Marshal.GetLastWin32Error();
+                if (error != ERROR_NO_MORE_FILES) {
+                    throw new Win32Exception(error);
+                }
+                return entries.ToArray();
+            } finally {
+                CloseHandle(snapshot);
+            }
+        }
+    }
+}
+'@ -Language CSharp -ErrorAction Stop
+    }
+
+    $processes = @([Autoresearch.ProcessTreeNative]::GetProcesses())
+    $childrenByParent = @{}
+    foreach ($process in $processes) {
+        $parentId = [int]$process.ParentProcessId
+        if (-not $childrenByParent.ContainsKey($parentId)) {
+            $childrenByParent[$parentId] = New-Object 'System.Collections.Generic.List[int]'
+        }
+        $childrenByParent[$parentId].Add([int]$process.ProcessId)
+    }
+
+    $descendantIds = New-Object 'System.Collections.Generic.HashSet[int]'
+    $pendingIds = New-Object 'System.Collections.Generic.List[int]'
+    $pendingIds.Add($RootProcessId)
+    for ($index = 0; $index -lt $pendingIds.Count; $index++) {
+        $parentId = $pendingIds[$index]
+        if (-not $childrenByParent.ContainsKey($parentId)) { continue }
+        foreach ($childId in $childrenByParent[$parentId]) {
+            if ($childId -ne $RootProcessId -and $descendantIds.Add($childId)) {
+                $pendingIds.Add($childId)
+            }
+        }
+    }
+
+    return @($descendantIds | Sort-Object)
+}
+
+function Stop-AutoresearchProcessTree {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [ValidateRange(1, 120)][int]$WaitTimeoutSeconds = 15
+    )
+
+    $rootProcessId = $Process.Id
+    $observedProcesses = @{}
+    $verificationAvailable = $true
+    $taskkillExitCode = $null
+    $initialDescendantIds = @()
+
+    try {
+        $initialDescendantIds = @(Get-AutoresearchProcessTreeIds -RootProcessId $rootProcessId)
+    } catch {
+        $verificationAvailable = $false
+    }
+
+    foreach ($processId in $initialDescendantIds) {
+        try {
+            $descendant = [System.Diagnostics.Process]::GetProcessById([int]$processId)
+            if ($descendant.HasExited) {
+                $descendant.Dispose()
+            } else {
+                $observedProcesses[[int]$processId] = $descendant
+            }
+        } catch {
+            # A process that exited between the process snapshot and OpenProcess
+            # no longer needs termination. Descendants are tracked separately.
+        }
+    }
+
+    try {
+        $taskkillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+        if (-not $Process.HasExited -and (Test-Path -LiteralPath $taskkillPath -PathType Leaf)) {
+            try {
+                & $taskkillPath /PID $rootProcessId /T /F 2>&1 | Out-Null
+                $taskkillExitCode = $LASTEXITCODE
+            } catch {
+                $taskkillExitCode = -1
+            }
+        }
+
+        $deadline = [DateTime]::UtcNow.AddSeconds($WaitTimeoutSeconds)
+        $lastTreeIds = @()
+        do {
+            try {
+                $lastTreeIds = @(Get-AutoresearchProcessTreeIds -RootProcessId $rootProcessId)
+            } catch {
+                $verificationAvailable = $false
+                $lastTreeIds = @()
+            }
+
+            foreach ($processId in $lastTreeIds) {
+                if ($observedProcesses.ContainsKey([int]$processId)) { continue }
+                try {
+                    $descendant = [System.Diagnostics.Process]::GetProcessById([int]$processId)
+                    if ($descendant.HasExited) {
+                        $descendant.Dispose()
+                    } else {
+                        $observedProcesses[[int]$processId] = $descendant
+                    }
+                } catch {
+                    # A process that exited between the process snapshot and OpenProcess
+                    # no longer needs termination. A still-listed PID remains in
+                    # lastTreeIds and will keep verification from succeeding.
+                }
+            }
+
+            if (-not $Process.HasExited) {
+                try { $Process.Kill() } catch { }
+            }
+            foreach ($descendant in @($observedProcesses.Values)) {
+                try {
+                    if (-not $descendant.HasExited) { $descendant.Kill() }
+                } catch { }
+            }
+
+            $remainingProcessIds = New-Object 'System.Collections.Generic.List[int]'
+            try {
+                if (-not $Process.HasExited) { $remainingProcessIds.Add($rootProcessId) }
+            } catch {
+                $verificationAvailable = $false
+                $remainingProcessIds.Add($rootProcessId)
+            }
+            foreach ($processId in @($observedProcesses.Keys)) {
+                try {
+                    if (-not $observedProcesses[[int]$processId].HasExited) {
+                        $remainingProcessIds.Add([int]$processId)
+                    }
+                } catch {
+                    $verificationAvailable = $false
+                    $remainingProcessIds.Add([int]$processId)
+                }
+            }
+            foreach ($processId in $lastTreeIds) {
+                if (-not $observedProcesses.ContainsKey([int]$processId) -and
+                    -not $remainingProcessIds.Contains([int]$processId)) {
+                    $remainingProcessIds.Add([int]$processId)
+                }
+            }
+
+            if ($Process.HasExited -and $remainingProcessIds.Count -eq 0 -and
+                $lastTreeIds.Count -eq 0 -and $verificationAvailable) {
+                [void]$Process.WaitForExit()
+                return [pscustomobject]@{
+                    Succeeded            = $true
+                    RootProcessId        = $rootProcessId
+                    RemainingProcessIds  = @()
+                    VerificationAvailable = $true
+                    TaskkillExitCode     = $taskkillExitCode
+                }
+            }
+
+            if ([DateTime]::UtcNow -ge $deadline) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($true)
+
+        $remaining = @($remainingProcessIds | Sort-Object -Unique)
+        if ($remaining.Count -eq 0) { $remaining = @($rootProcessId) }
+        return [pscustomobject]@{
+            Succeeded             = $false
+            RootProcessId         = $rootProcessId
+            RemainingProcessIds   = $remaining
+            VerificationAvailable = $verificationAvailable
+            TaskkillExitCode      = $taskkillExitCode
+        }
+    } finally {
+        foreach ($descendant in @($observedProcesses.Values)) {
+            try { $descendant.Dispose() } catch { }
+        }
+    }
+}
+
 function Invoke-AutoresearchIteration {
     param(
         [Parameter(Mandatory)][string]$RepoRootPath,
@@ -2024,6 +2272,7 @@ function Invoke-AutoresearchIteration {
     $keepCommit = $false
     $preserveWorktreeOnGitFailure = $false
     $preserveWorktreeForReview = $false
+    $preserveWorktreeForUncontainedProcess = $false
     $cleanupError = $null
 
     try {
@@ -2109,11 +2358,46 @@ function Invoke-AutoresearchIteration {
             -WorkingDirectory $worktreePath -NoNewWindow -PassThru `
             -RedirectStandardOutput $runLog -RedirectStandardError $errFile
         $killed = $false
+        $exitCode = $null
         if (-not $proc.WaitForExit([int]($PerRunTimeoutMin * 60 * 1000))) {
-            try { $proc.Kill($true) } catch { }
-            try { [void]$proc.WaitForExit() } catch { }
+            try {
+                $termination = Stop-AutoresearchProcessTree -Process $proc
+            } catch {
+                $termination = [pscustomobject]@{
+                    Succeeded = $false
+                    RemainingProcessIds = @($proc.Id)
+                }
+            }
+            if (-not $termination.Succeeded) {
+                $remainingProcessIds = @($termination.RemainingProcessIds)
+                if ($remainingProcessIds.Count -eq 0) { $remainingProcessIds = @($proc.Id) }
+                $pidList = ($remainingProcessIds -join ', ')
+                $diagnostic = "Timeout cleanup could not verify or terminate the training process tree. Remaining or unverified PID(s): $pidList. The worktree is retained and the autoresearch loop will stop."
+                $preserveWorktreeForUncontainedProcess = $true
+                $status = 'uncontained-process'
+                try {
+                    Write-Json -Level error -Message $diagnostic -Extra @{
+                        status = $status
+                        processIds = $remainingProcessIds
+                    }
+                    Write-Warning $diagnostic
+                } catch {
+                    $failure = [System.InvalidOperationException]::new($diagnostic, $_.Exception)
+                    $failure.Data['AutoresearchUncontainedProcess'] = $true
+                    throw $failure
+                }
+                return @{
+                    Commit = $shortSha; ValBpb = 0.0; MemoryGb = 0.0; Status = $status
+                    Description = $description; ExperimentBranch = $ExperimentBranch
+                    WorktreePath = $worktreePath; ExitCode = $null
+                    RemainingProcessIds = $remainingProcessIds
+                }
+            }
             $killed = $true
+            $exitCode = $proc.ExitCode
             Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha; experimentBranch = $ExperimentBranch }
+        } else {
+            $exitCode = $proc.ExitCode
         }
         # Merge stderr file into run.log so downstream parsing is unified.
         if (Test-Path -LiteralPath $errFile) {
@@ -2139,12 +2423,12 @@ function Invoke-AutoresearchIteration {
         $keepCommit = ($status -eq 'keep')
 
         Write-Json -Level info -Message 'Iteration finished' -Extra @{
-            commit = $shortSha; valBpb = $valBpb; memoryGb = $memGb; status = $status
+            commit = $shortSha; exitCode = $exitCode; valBpb = $valBpb; memoryGb = $memGb; status = $status
             description = $description; experimentBranch = $ExperimentBranch
         }
     }
     finally {
-        if ($worktreeAdded -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview) {
+        if ($worktreeAdded -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview -and -not $preserveWorktreeForUncontainedProcess) {
             $removeResult = Invoke-Git -GitArgs @('worktree','remove','--force',$worktreePath) -Cwd $sourceRoot
             if ($removeResult.ExitCode -eq 0) {
                 $worktreeRemoved = $true
@@ -2153,7 +2437,7 @@ function Invoke-AutoresearchIteration {
             }
         }
 
-        if ($worktreeRemoved -and -not $keepCommit -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview) {
+        if ($worktreeRemoved -and -not $keepCommit -and -not $preserveWorktreeOnGitFailure -and -not $preserveWorktreeForReview -and -not $preserveWorktreeForUncontainedProcess) {
             $rewindResult = Invoke-Git -GitArgs @('branch','--force',$ExperimentBranch,$startCommit) -Cwd $sourceRoot
             if ($rewindResult.ExitCode -ne 0) {
                 $cleanupError = "Unable to discard the isolated experiment branch '$ExperimentBranch': $($rewindResult.Output)"
@@ -2170,7 +2454,7 @@ function Invoke-AutoresearchIteration {
         if ($cleanupError) { throw $cleanupError }
     }
 
-    return @{ Commit = $shortSha; ValBpb = $valBpb; MemoryGb = $memGb; Status = $status; Description = $description; ExperimentBranch = $ExperimentBranch; WorktreePath = $worktreePath }
+    return @{ Commit = $shortSha; ExitCode = $exitCode; ValBpb = $valBpb; MemoryGb = $memGb; Status = $status; Description = $description; ExperimentBranch = $ExperimentBranch; WorktreePath = $worktreePath }
 }
 
 function Get-AutoresearchLoopLockIdentity {
@@ -2416,13 +2700,28 @@ function Invoke-AutoresearchLoopCore {
     # Baseline iteration first if results.tsv is empty (only the header row).
     $hasBaseline = $false
     if (Test-Path -LiteralPath $resultsPath) {
-        $rowCount = (@(Get-Content -LiteralPath $resultsPath -Encoding UTF8) | Where-Object { $_ -and $_ -notmatch '^commit\t' }).Count
+        $rowCount = @(
+            Get-Content -LiteralPath $resultsPath -Encoding UTF8 |
+                Where-Object { $_ -and $_ -notmatch '^commit\t' }
+        ).Count
         $hasBaseline = ($rowCount -gt 0)
     }
     if (-not $hasBaseline) {
         Write-Json -Level info -Message 'No baseline row in results.tsv; running baseline iteration'
-        [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-            -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch)
+        try {
+            $baselineResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
+                -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch
+        } catch {
+            if ($_.Exception.Data.Contains('AutoresearchUncontainedProcess')) {
+                Limit-RunLogs
+                return 3
+            }
+            throw
+        }
+        if ($null -ne $baselineResult -and $baselineResult.Status -ceq 'uncontained-process') {
+            Limit-RunLogs
+            return 3
+        }
     }
 
     $iter = 0
@@ -2430,13 +2729,21 @@ function Invoke-AutoresearchLoopCore {
         $iter++
         Write-Json -Level info -Message "Autoresearch iteration #$iter starting"
         try {
-            [void](Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch)
+            $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
+                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch
+            if ($null -ne $iterationResult -and $iterationResult.Status -ceq 'uncontained-process') {
+                Limit-RunLogs
+                return 3
+            }
         } catch {
             Write-Json -Level error -Message "Iteration #$iter raised: $($_.Exception.Message)"
             if ($_.Exception.Data.Contains('AutoresearchGitVerificationFailure')) {
                 Limit-RunLogs
                 return 1
+            }
+            if ($_.Exception.Data.Contains('AutoresearchUncontainedProcess')) {
+                Limit-RunLogs
+                return 3
             }
             # Keep looping; per-iteration failures should not kill the whole loop.
         }
@@ -2777,7 +3084,12 @@ function Get-ScheduledTaskDescription {
 }
 
 function Get-ComputerIdleState {
-    if (-not $IsWindows) {
+    param(
+        [Parameter(DontShow)]
+        [psobject]$TestNativeSample
+    )
+
+    if (-not (Test-WindowsHost) -and -not $PSBoundParameters.ContainsKey('TestNativeSample')) {
         return [pscustomobject]@{
             Available = $false
             IdleMs    = $null
@@ -2800,24 +3112,101 @@ namespace Autoresearch {
             public uint dwTime;
         }
 
+        public static uint LastInputInfoSize {
+            get { return (uint)Marshal.SizeOf(typeof(LASTINPUTINFO)); }
+        }
+
         [DllImport("user32.dll")]
         private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
 
         [DllImport("kernel32.dll")]
         private static extern uint GetTickCount();
 
-        public static uint GetIdleMilliseconds() {
+        public static bool TryGetIdleMilliseconds(out uint idleMilliseconds, out string reason) {
             LASTINPUTINFO info = new LASTINPUTINFO();
-            info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
-            GetLastInputInfo(ref info);
-            return GetTickCount() - info.dwTime;
+            info.cbSize = LastInputInfoSize;
+
+            if (!GetLastInputInfo(ref info)) {
+                idleMilliseconds = 0;
+                reason = "GetLastInputInfo returned false.";
+                return false;
+            }
+
+            return TryComputeIdleMilliseconds(
+                true,
+                info.cbSize,
+                info.dwTime,
+                GetTickCount(),
+                out idleMilliseconds,
+                out reason
+            );
+        }
+
+        public static bool TryComputeIdleMilliseconds(
+            bool nativeCallSucceeded,
+            uint structureSize,
+            uint lastInputTime,
+            uint currentTick,
+            out uint idleMilliseconds,
+            out string reason
+        ) {
+            idleMilliseconds = 0;
+
+            if (!nativeCallSucceeded) {
+                reason = "GetLastInputInfo returned false.";
+                return false;
+            }
+
+            if (structureSize != LastInputInfoSize || lastInputTime == 0) {
+                reason = "GetLastInputInfo returned invalid idle data.";
+                return false;
+            }
+
+            // Unsigned subtraction handles GetTickCount rollover. A delta in
+            // the upper half of the DWORD range is ambiguous with a future
+            // timestamp, so fail closed instead of reporting a large idle time.
+            uint elapsed = unchecked(currentTick - lastInputTime);
+            if (elapsed > Int32.MaxValue) {
+                reason = "GetLastInputInfo returned invalid idle data.";
+                return false;
+            }
+
+            idleMilliseconds = elapsed;
+            reason = null;
+            return true;
         }
     }
 }
 "@ -Language CSharp
         }
 
-        $idleMs = [Autoresearch.IdleNative]::GetIdleMilliseconds()
+        [uint32]$idleMs = 0
+        [string]$reason = $null
+        if ($PSBoundParameters.ContainsKey('TestNativeSample')) {
+            $available = [Autoresearch.IdleNative]::TryComputeIdleMilliseconds(
+                [bool]$TestNativeSample.Success,
+                [uint32]$TestNativeSample.StructureSize,
+                [uint32]$TestNativeSample.LastInputTime,
+                [uint32]$TestNativeSample.CurrentTick,
+                [ref]$idleMs,
+                [ref]$reason
+            )
+        } else {
+            $available = [Autoresearch.IdleNative]::TryGetIdleMilliseconds(
+                [ref]$idleMs,
+                [ref]$reason
+            )
+        }
+
+        if (-not $available) {
+            return [pscustomobject]@{
+                Available   = $false
+                IdleMs      = $null
+                IdleMinutes = $null
+                Reason      = $reason
+            }
+        }
+
         return [pscustomobject]@{
             Available  = $true
             IdleMs     = [int64]$idleMs
@@ -2829,7 +3218,7 @@ namespace Autoresearch {
             Available  = $false
             IdleMs     = $null
             IdleMinutes = $null
-            Reason     = $_.Exception.Message
+            Reason     = 'Windows idle detection failed.'
         }
     }
 }
@@ -2839,7 +3228,8 @@ function Invoke-IdlePolicyGate {
         [Parameter(Mandatory)][string]$Policy,
         [int]$IdleMinutes = 5,
         [int]$WaitTimeoutMinutes = 60,
-        [int]$PollIntervalSeconds = 30
+        [int]$PollIntervalSeconds = 30,
+        [Parameter(DontShow)][scriptblock]$IdleStateProvider
     )
 
     if ($Policy -ne 'IdleOnly') {
@@ -2854,7 +3244,7 @@ function Invoke-IdlePolicyGate {
 
     $deadline = (Get-Date).AddMinutes($WaitTimeoutMinutes)
     while ((Get-Date) -lt $deadline) {
-        $state = Get-ComputerIdleState
+        $state = if ($null -ne $IdleStateProvider) { & $IdleStateProvider } else { Get-ComputerIdleState }
         if (-not $state.Available) {
             Write-Json -Level info -Message "Idle-only policy skipped because Windows idle state could not be determined: $($state.Reason)" -Extra @{
                 policy = $Policy
@@ -2876,8 +3266,18 @@ function Invoke-IdlePolicyGate {
         Start-Sleep -Seconds $PollIntervalSeconds
     }
 
-    $finalState = Get-ComputerIdleState
-    $observed = if ($finalState.Available) { $finalState.IdleMinutes } else { $null }
+    $finalState = if ($null -ne $IdleStateProvider) { & $IdleStateProvider } else { Get-ComputerIdleState }
+    if (-not $finalState.Available) {
+        Write-Json -Level info -Message "Idle-only policy skipped after waiting $WaitTimeoutMinutes minute(s) because Windows idle state could not be determined: $($finalState.Reason)" -Extra @{
+            policy             = $Policy
+            reason             = $finalState.Reason
+            requiredIdle       = $IdleMinutes
+            waitTimeoutMinutes = $WaitTimeoutMinutes
+        }
+        return $false
+    }
+
+    $observed = $finalState.IdleMinutes
     Write-Json -Level info -Message "Idle-only policy skipped after waiting $WaitTimeoutMinutes minute(s); observed idle time was $observed minute(s), which did not reach the required $IdleMinutes minute(s)." -Extra @{
         policy            = $Policy
         observedIdle      = $observed

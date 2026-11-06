@@ -20,7 +20,9 @@
     Performs preflight checks (PATH, dependencies, Ollama daemon, model),
     streams stdout/stderr as JSON lines to a per-invocation log, and manages
     a Scheduled Task named Autoresearch-Train. Pure non-interactive workflow.
-    Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+    Compatible with Windows PowerShell 5.1 and PowerShell 7+. Examples use
+    pwsh when available; replace it with powershell.exe when running under
+    Windows PowerShell 5.1.
 
     Persisted launcher defaults are human-readable, non-secret convenience
     settings stored per user under %LOCALAPPDATA%\myTech.Today\autoresearch-
@@ -45,7 +47,8 @@
                       program.md. Requires a clean source checkout and runs
                       each edit, commit, and training run in an isolated
                       experiment worktree, staging only train.py, until
-                      -MaxLoopMinutes elapses or the process is killed.
+                      -MaxLoopMinutes elapses or the consecutive failure
+                      threshold is reached.
       -RegisterTask   Creates/replaces the `Autoresearch-Train` scheduled
                       task. Does NOT run training in this invocation. The
                       task's action drives -TaskSupervisor, which launches
@@ -230,6 +233,16 @@
     and exit code in the task launch state file, and exits with the child's
     status so Task Scheduler can see the real result.
 
+.PARAMETER MaxConsecutiveIterationFailures
+    Maximum number of consecutive failed loop iterations before the loop
+    stops with exit code 4. A successful `keep` or valid `discard` resets the
+    consecutive-failure count. Failed retries wait 5 seconds, doubling up to
+    a 60 second cap. Valid range: 1..1000. Default: 5.
+
+    Example:
+        pwsh -File .\scripts\launch.ps1 -NoGui -RunLoop `
+            -MaxConsecutiveIterationFailures 3
+
 .EXAMPLE
     pwsh -File .\scripts\launch.ps1
     # Preflight only. Verifies uv, ollama, ai-powered, the model, and the
@@ -285,7 +298,10 @@
       Non-zero  Either preflight failed or `uv run train.py` exited non-zero;
                 in -RunNow mode the script propagates the workload's exit code;
                 in -TaskSupervisor mode the script propagates the hidden
-                child exit code.
+                child exit code. A loop returns 4 when its consecutive
+                iteration-failure threshold is reached or a finite loop ends
+                without a completed experiment. Git verification failures
+                return 1; uncontained process failures return 3.
 
     Logs:
       Aggregate JSONL: <LogDir>\autoresearch.jsonl
@@ -295,10 +311,12 @@
 
     Scheduled task:
       Name:        Autoresearch-Train
-      Action:      pwsh.exe -NoProfile -ExecutionPolicy Bypass
-                            -File launch.ps1 -NoGui -TaskSupervisor ...
+      Action:      pwsh.exe when available, otherwise powershell.exe
+                   -NoProfile -ExecutionPolicy Bypass -File launch.ps1
+                   -NoGui -TaskSupervisor ...
                    The supervisor launches the hidden `-RunLoop` child and
                    writes `%HOMEDRIVE%\myTech.Today\logs\autoresearch-task-launch.json`
+                   using the same selected PowerShell executable.
                    with the child PID, redacted command line, and exit code
                    before exiting with the child's status so Task Scheduler
                    sees the real result.
@@ -310,7 +328,10 @@
                    branch; a discard rewinds only that branch. The source
                    checkout is not committed or reset. The loop continues until
                    -MaxLoopMinutes elapses (default 0 = forever) or the
-                   process is killed.
+                   process is killed. It also stops with exit code 4 after
+                   -MaxConsecutiveIterationFailures consecutive failed
+                   iterations (default 5). Failed retries use 5, 10, 20, 40,
+                   then 60 second delays, capped at 60 seconds.
       Policy:      Interactive, IdleOnly, or Unattended
                    - Interactive = current user, logged-on session only.
                    - IdleOnly = current user, launcher waits up to 1 hour for
@@ -354,7 +375,10 @@ param(
     [switch]$RegisterTask,
     [switch]$RunNow,
     [switch]$RunLoop,
+    [ValidateRange(0, 2147483647)]
     [int]$MaxLoopMinutes = 0,
+    [ValidateRange(1, 1000)]
+    [int]$MaxConsecutiveIterationFailures = 5,
     [int]$PerRunTimeoutMinutes = 10,
     [switch]$NoAiEdit,
     [switch]$Unregister,
@@ -383,6 +407,8 @@ $Script:DefaultsPath = if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA))
     $Script:LegacyDefaultsPath
 }
 $Script:RepoUrl = 'https://github.com/mytech-today-now/autoresearch-win-rtx-scheduled.git'
+# scripts/bump-and-push.ps1 defines main as the release branch and pushes to origin/main.
+$Script:BootstrapBranch = 'main'
 $Script:AggregateLog = Join-Path $LogDir 'autoresearch.jsonl'
 $Script:RunLogPath = $null
 $Script:AutoresearchLoopLock = $null
@@ -471,7 +497,8 @@ function Invoke-Bootstrap {
     if (-not (Test-Path -LiteralPath $Script:InstallRoot)) {
         New-Item -ItemType Directory -Path $Script:InstallRoot -Force | Out-Null
     }
-    if (-not (Test-Path -LiteralPath $Script:CanonicalRepo)) {
+    $canonicalRepoAlreadyExisted = Test-Path -LiteralPath $Script:CanonicalRepo
+    if (-not $canonicalRepoAlreadyExisted) {
         & git clone $Script:RepoUrl $Script:CanonicalRepo
         if ($LASTEXITCODE -ne 0) { Write-Error 'git clone failed'; exit 3 }
     } else {
@@ -490,19 +517,50 @@ function Invoke-Bootstrap {
             }
             exit 4
         }
+    }
 
-        $originOutput = & git -C $Script:CanonicalRepo remote get-url --all origin 2>&1 | Out-String
-        $originExitCode = $LASTEXITCODE
-        $origins = @(
-            $originOutput -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        )
-        if ($originExitCode -ne 0 -or $origins.Count -ne 1 -or $origins[0] -cne $Script:RepoUrl) {
-            Write-Error "Refusing to update canonical install at '$Script:CanonicalRepo' because its origin could not be verified as the expected repository '$Script:RepoUrl'. Check 'git remote -v' and correct it only if this is the intended checkout." -ErrorAction Continue
-            exit 4
+    $expectedCanonicalRepo = [System.IO.Path]::GetFullPath($Script:CanonicalRepo).TrimEnd([char[]]@([char]92, [char]47))
+    $topLevelOutput = & git -C $Script:CanonicalRepo rev-parse --show-toplevel 2>&1 | Out-String
+    $topLevelExitCode = $LASTEXITCODE
+    $observedTopLevel = $topLevelOutput.Trim()
+    $normalizedTopLevel = $null
+    if (-not [string]::IsNullOrWhiteSpace($observedTopLevel)) {
+        try {
+            $normalizedTopLevel = [System.IO.Path]::GetFullPath($observedTopLevel).TrimEnd([char[]]@([char]92, [char]47))
+        } catch {
+            $normalizedTopLevel = $null
         }
+    }
+    if ($topLevelExitCode -ne 0 -or $normalizedTopLevel -ine $expectedCanonicalRepo) {
+        $displayTopLevel = if ([string]::IsNullOrWhiteSpace($observedTopLevel)) { '<empty>' } else { $observedTopLevel }
+        Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because its Git top-level does not match the expected canonical repository. Expected '$expectedCanonicalRepo'; observed '$displayTopLevel' (git exit $topLevelExitCode)." -ErrorAction Continue
+        exit 4
+    }
 
-        & git -C $Script:CanonicalRepo pull --ff-only | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Error "git pull --ff-only failed for '$Script:CanonicalRepo'" -ErrorAction Continue; exit 3 }
+    $branchOutput = & git -C $Script:CanonicalRepo rev-parse --abbrev-ref HEAD 2>&1 | Out-String
+    $branchExitCode = $LASTEXITCODE
+    $observedBranch = $branchOutput.Trim()
+    if ($branchExitCode -ne 0 -or $observedBranch -cne $Script:BootstrapBranch) {
+        $displayBranch = if ([string]::IsNullOrWhiteSpace($observedBranch)) { '<empty>' } else { $observedBranch }
+        Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because its current branch does not match the approved release branch. Expected '$Script:BootstrapBranch'; observed '$displayBranch' (git exit $branchExitCode)." -ErrorAction Continue
+        exit 4
+    }
+
+    $originOutput = & git -C $Script:CanonicalRepo remote get-url --all origin 2>&1 | Out-String
+    $originExitCode = $LASTEXITCODE
+    $origins = @(
+        $originOutput -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    if ($originExitCode -ne 0 -or $origins.Count -ne 1 -or $origins[0] -cne $Script:RepoUrl) {
+        $observedOrigins = if ($origins.Count -eq 0) { '<none>' } else { $origins -join ', ' }
+        Write-Error "Refusing to bootstrap canonical install at '$Script:CanonicalRepo' because its origin could not be verified. Expected exactly one origin '$Script:RepoUrl'; observed $($origins.Count): $observedOrigins (git exit $originExitCode)." -ErrorAction Continue
+        exit 4
+    }
+
+    if ($canonicalRepoAlreadyExisted) {
+        & git -C $Script:CanonicalRepo pull --ff-only origin $Script:BootstrapBranch | Out-Null
+        $pullExitCode = $LASTEXITCODE
+        if ($pullExitCode -ne 0) { Write-Error "git pull --ff-only failed for '$Script:CanonicalRepo' (exit $pullExitCode)" -ErrorAction Continue; exit 3 }
     }
     $pwshCmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue
     if (-not $pwshCmd) { $pwshCmd = Get-Command powershell.exe -ErrorAction Stop }
@@ -789,7 +847,7 @@ function Write-DebugLog {
 }
 
 function Get-CurrentProcessCommandLine {
-    if (-not $IsWindows) { return $null }
+    if (-not (Test-WindowsHost)) { return $null }
     try {
         $process = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $PID" -ErrorAction Stop
         return $process.CommandLine
@@ -1703,6 +1761,40 @@ function Set-WorkloadEnvironment {
     }
 }
 
+function Invoke-CheckpointRetention {
+    param([Parameter(Mandatory)][string]$RepositoryRootPath)
+
+    $trainPath = Join-Path $RepositoryRootPath 'train.py'
+    if (-not (Test-Path -LiteralPath $trainPath -PathType Leaf)) {
+        Write-Json -Level warn -Message "Checkpoint retention skipped because train.py was not found at '$trainPath'."
+        return 1
+    }
+
+    $retentionExitCode = 1
+    Push-Location $RepositoryRootPath
+    try {
+        & uv run train.py --cleanup-checkpoints 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                Write-Json -Level stderr -Message ("Checkpoint retention: " + $_.ToString())
+            } else {
+                Write-Json -Level info -Message ("Checkpoint retention: " + $_.ToString())
+            }
+        }
+        $retentionExitCode = $LASTEXITCODE
+        if ($null -eq $retentionExitCode) { $retentionExitCode = 1 }
+    } catch {
+        Write-Json -Level warn -Message "Checkpoint retention could not run: $($_.Exception.Message)"
+        $retentionExitCode = 1
+    } finally {
+        Pop-Location
+    }
+
+    if ($retentionExitCode -ne 0) {
+        Write-Json -Level warn -Message "Checkpoint retention finished with exit code $retentionExitCode; unremoved artifacts were retained."
+    }
+    return $retentionExitCode
+}
+
 function Invoke-Workload {
     Set-WorkloadEnvironment
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -1742,6 +1834,7 @@ function Invoke-Workload {
     } finally {
         Pop-Location
     }
+    [void](Invoke-CheckpointRetention -RepositoryRootPath $RepoRoot)
     Write-Json -Level info -Message 'Workload finished' -Extra @{ exitCode = $exitCode }
     Limit-RunLogs
     return $exitCode
@@ -1873,7 +1966,7 @@ function Invoke-AiPoweredEdit {
     $results  = if (Test-Path -LiteralPath $resultsPath) {
         ((Get-Content -LiteralPath $resultsPath -Encoding UTF8) | Select-Object -Last $ResultsTailRows) -join "`n"
     } else { '' }
-    $system = 'You are an autonomous ML research agent. Reply with EXACTLY one short one-line description prefixed by "DESCRIPTION: ", then a single fenced code block ```python containing the COMPLETE new contents of train.py. No other text.'
+    $system = 'You are an autonomous ML research agent. Reply with exactly one short one-line description starting with DESCRIPTION:, then one fenced python code block containing the complete new contents of train.py. No other text.'
     $prompt = @"
 PROGRAM:
 $program
@@ -1889,7 +1982,9 @@ $train
 Propose ONE small experimental change to train.py and return the complete new file.
 "@
     $tmpPrompt = $null
-    $previousOutputEncoding = $OutputEncoding
+    $tmpSystemPrompt = $null
+    $tmpCliOutput = $null
+    $tmpCliScript = $null
     $exitCode = $null
     $raw = $null
     try {
@@ -1913,24 +2008,59 @@ Propose ONE small experimental change to train.py and return the complete new fi
         $tmpPrompt = [System.IO.Path]::GetTempFileName()
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($tmpPrompt, $prompt, $utf8)
-        $promptInput = [System.IO.File]::ReadAllText($tmpPrompt, $utf8)
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            # Windows PowerShell 5.1 uses the caller's native-pipeline encoding
+            # inside functions, even when OutputEncoding is changed locally.
+            # Run the pipeline at script scope, where UTF-8 is honored.
+            $tmpSystemPrompt = [System.IO.Path]::GetTempFileName()
+            $tmpCliOutput = [System.IO.Path]::GetTempFileName()
+            $tmpCliScript = "$tmpPrompt.ps1"
+            if (Test-Path -LiteralPath $tmpCliScript) {
+                throw 'Could not create the temporary ai-powered invocation script.'
+            }
+            [System.IO.File]::WriteAllText($tmpSystemPrompt, $system, $utf8)
+            $cliScript = @'
+param(
+    [Parameter(Mandatory)][string]$PromptPath,
+    [Parameter(Mandatory)][string]$SystemPromptPath,
+    [Parameter(Mandatory)][string]$OutputPath
+)
 
-        # ai-powered text reads stdin when its positional prompt is omitted.
-        # Use UTF-8 for Windows PowerShell's native-command pipeline and keep
-        # the full source out of argv.
-        $OutputEncoding = $utf8
-        $raw = $promptInput | & ai-powered text --quiet --system $system 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$OutputEncoding = $utf8
+$promptInput = [System.IO.File]::ReadAllText($PromptPath, $utf8)
+$systemPrompt = [System.IO.File]::ReadAllText($SystemPromptPath, $utf8)
+$raw = $promptInput | & ai-powered text --quiet --system $systemPrompt 2>&1 | Out-String
+$exitCode = $LASTEXITCODE
+[System.IO.File]::WriteAllText($OutputPath, $raw, $utf8)
+exit $exitCode
+'@
+            [System.IO.File]::WriteAllText($tmpCliScript, $cliScript, $utf8)
+            $shellPath = Join-Path $PSHOME 'powershell.exe'
+            $childArguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $tmpCliScript + '"' +
+                ' -PromptPath "' + $tmpPrompt + '"' +
+                ' -SystemPromptPath "' + $tmpSystemPrompt + '"' +
+                ' -OutputPath "' + $tmpCliOutput + '"'
+            $cliProcess = Start-Process -FilePath $shellPath -ArgumentList $childArguments -WorkingDirectory (Get-Location).Path -PassThru -Wait -NoNewWindow -ErrorAction Stop
+            $exitCode = $cliProcess.ExitCode
+            $raw = [System.IO.File]::ReadAllText($tmpCliOutput, $utf8)
+        } else {
+            $promptInput = [System.IO.File]::ReadAllText($tmpPrompt, $utf8)
+            $OutputEncoding = $utf8
+            $raw = $promptInput | & ai-powered text --quiet --system $system 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+        }
     } catch {
         Write-Json -Level warn -Message 'ai-powered text invocation failed; skipping AI edit'
         return $null
     } finally {
-        $OutputEncoding = $previousOutputEncoding
         try {
             Clear-ProviderApiKeyEnvironment
         } finally {
-            if ($tmpPrompt) {
-                Remove-Item -LiteralPath $tmpPrompt -Force -ErrorAction SilentlyContinue
+            foreach ($temporaryPath in @($tmpPrompt, $tmpSystemPrompt, $tmpCliOutput, $tmpCliScript)) {
+                if (-not [string]::IsNullOrWhiteSpace($temporaryPath)) {
+                    Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+                }
             }
         }
     }
@@ -2352,9 +2482,11 @@ function Invoke-AutoresearchIteration {
         # Run training inside the same isolated worktree as the edit.
         $runLog = Join-Path $worktreePath 'run.log'
         $errFile = Join-Path $worktreePath 'run.err.log'
+        $checkpointRoot = Join-Path $sourceRoot 'artifacts\checkpoints'
+        $trainingArguments = 'run train.py --checkpoint-root "' + $checkpointRoot + '"'
         Write-Json -Level info -Message 'Iteration: starting uv run train.py' -Extra @{ commit = $shortSha; timeoutMin = $PerRunTimeoutMin; experimentBranch = $ExperimentBranch }
         Clear-ProviderApiKeyEnvironment
-        $proc = Start-Process -FilePath 'uv' -ArgumentList @('run','train.py') `
+        $proc = Start-Process -FilePath 'uv' -ArgumentList $trainingArguments `
             -WorkingDirectory $worktreePath -NoNewWindow -PassThru `
             -RedirectStandardOutput $runLog -RedirectStandardError $errFile
         $killed = $false
@@ -2399,6 +2531,7 @@ function Invoke-AutoresearchIteration {
         } else {
             $exitCode = $proc.ExitCode
         }
+        [void](Invoke-CheckpointRetention -RepositoryRootPath $sourceRoot)
         # Merge stderr file into run.log so downstream parsing is unified.
         if (Test-Path -LiteralPath $errFile) {
             Get-Content -LiteralPath $errFile -ErrorAction SilentlyContinue | Add-Content -LiteralPath $runLog -Encoding UTF8
@@ -2409,7 +2542,7 @@ function Invoke-AutoresearchIteration {
         $memGb   = if ($metrics.PeakVramMb -gt 0) { $metrics.PeakVramMb / 1024.0 } else { 0.0 }
 
         # Decide outcome.
-        if (-not $killed -and $valBpb -gt 0) {
+        if (-not $killed -and $exitCode -eq 0 -and $valBpb -gt 0) {
             $best = Get-CurrentBestValBpb -Path $ResultsPath
             if ($BaselineRun -or $null -eq $best -or $valBpb -lt $best) {
                 $status = 'keep'
@@ -2658,6 +2791,68 @@ function Exit-AutoresearchLoopLock {
     }
 }
 
+function Get-AutoresearchLoopTime {
+    return [DateTime]::UtcNow
+}
+
+function Get-AutoresearchLoopBackoffDelayMilliseconds {
+    param([Parameter(Mandatory)][ValidateRange(1, 2147483647)][int]$ConsecutiveFailureCount)
+
+    $exponent = [Math]::Min(($ConsecutiveFailureCount - 1), 4)
+    $delay = [Math]::Min(60000.0, (5000.0 * [Math]::Pow(2.0, $exponent)))
+    return [int]$delay
+}
+
+function Start-AutoresearchLoopSleep {
+    param([Parameter(Mandatory)][ValidateRange(1, 60000)][int]$Milliseconds)
+
+    Start-Sleep -Milliseconds $Milliseconds
+}
+
+function Wait-AutoresearchLoopBackoff {
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 2147483647)][int]$ConsecutiveFailureCount,
+        [Parameter(Mandatory)][DateTime]$Deadline
+    )
+
+    $delayMilliseconds = Get-AutoresearchLoopBackoffDelayMilliseconds -ConsecutiveFailureCount $ConsecutiveFailureCount
+    if ($Deadline -ne [DateTime]::MaxValue) {
+        $remainingMilliseconds = ($Deadline - (Get-AutoresearchLoopTime)).TotalMilliseconds
+        if ($remainingMilliseconds -le 0) { return 0 }
+        $delayMilliseconds = [int][Math]::Min($delayMilliseconds, [Math]::Ceiling($remainingMilliseconds))
+    }
+
+    if ($delayMilliseconds -gt 0) {
+        Start-AutoresearchLoopSleep -Milliseconds $delayMilliseconds
+    }
+    return $delayMilliseconds
+}
+
+function Write-AutoresearchLoopTerminalSummary {
+    param(
+        [Parameter(Mandatory)][string]$TerminalStatus,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][int]$AttemptedIterations,
+        [Parameter(Mandatory)][int]$SuccessfulIterations,
+        [Parameter(Mandatory)][int]$FailedIterations,
+        [Parameter(Mandatory)][int]$ConsecutiveFailureCount,
+        [Parameter(Mandatory)][int]$FailureThreshold,
+        [AllowEmptyString()][string]$ExperimentBranch
+    )
+
+    $level = if ($ExitCode -eq 0) { 'info' } else { 'error' }
+    Write-Json -Level $level -Message "Autoresearch loop finished with status '$TerminalStatus'." -Extra @{
+        status                    = $TerminalStatus
+        exitCode                  = $ExitCode
+        attemptedIterations       = $AttemptedIterations
+        successfulIterations      = $SuccessfulIterations
+        failedIterations          = $FailedIterations
+        consecutiveFailures       = $ConsecutiveFailureCount
+        consecutiveFailureLimit   = $FailureThreshold
+        experimentBranch          = $ExperimentBranch
+    }
+}
+
 function Invoke-AutoresearchLoopCore {
     Assert-AutoresearchSourceCheckoutClean -RepoRootPath $RepoRoot
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
@@ -2669,6 +2864,9 @@ function Invoke-AutoresearchLoopCore {
     }
 
     if (-not (Invoke-IdlePolicyGate -Policy $SchedulerPolicy -IdleMinutes 5 -WaitTimeoutMinutes 60)) {
+        Write-AutoresearchLoopTerminalSummary -TerminalStatus 'idle-policy-skipped' -ExitCode 0 `
+            -AttemptedIterations 0 -SuccessfulIterations 0 -FailedIterations 0 -ConsecutiveFailureCount 0 `
+            -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch ''
         Limit-RunLogs
         return 0
     }
@@ -2683,18 +2881,22 @@ function Invoke-AutoresearchLoopCore {
     $resultsPath = Join-Path $RepoRoot 'results.tsv'
     Initialize-ResultsTsv -Path $resultsPath
 
-    $deadline = if ($MaxLoopMinutes -gt 0) { (Get-Date).AddMinutes($MaxLoopMinutes) } else { [DateTime]::MaxValue }
+    $loopStartedAt = Get-AutoresearchLoopTime
+    $deadline = if ($MaxLoopMinutes -gt 0) { $loopStartedAt.AddMinutes($MaxLoopMinutes) } else { [DateTime]::MaxValue }
     Write-Json -Level info -Message 'Starting autoresearch loop' -Extra @{
-        repoRoot             = $RepoRoot
-        runLog               = $Script:RunLogPath
-        resultsTsv           = $resultsPath
-        maxLoopMinutes       = $MaxLoopMinutes
-        perRunTimeoutMinutes = $PerRunTimeoutMinutes
-        noAiEdit             = [bool]$NoAiEdit
-        experimentBranch     = $experimentBranch
-        schedulerPolicy      = $SchedulerPolicy
-        policySummary        = (Get-SchedulerPolicyInfo -Policy $SchedulerPolicy).Summary
-        deadline             = if ($deadline -eq [DateTime]::MaxValue) { 'none' } else { $deadline.ToString('o') }
+        repoRoot                         = $RepoRoot
+        runLog                           = $Script:RunLogPath
+        resultsTsv                       = $resultsPath
+        maxLoopMinutes                   = $MaxLoopMinutes
+        maxConsecutiveIterationFailures  = $MaxConsecutiveIterationFailures
+        retryBackoffBaseMilliseconds     = 5000
+        retryBackoffMaximumMilliseconds  = 60000
+        perRunTimeoutMinutes             = $PerRunTimeoutMinutes
+        noAiEdit                         = [bool]$NoAiEdit
+        experimentBranch                 = $experimentBranch
+        schedulerPolicy                  = $SchedulerPolicy
+        policySummary                    = (Get-SchedulerPolicyInfo -Policy $SchedulerPolicy).Summary
+        deadline                         = if ($deadline -eq [DateTime]::MaxValue) { 'none' } else { $deadline.ToString('o') }
     }
 
     # Baseline iteration first if results.tsv is empty (only the header row).
@@ -2706,50 +2908,140 @@ function Invoke-AutoresearchLoopCore {
         ).Count
         $hasBaseline = ($rowCount -gt 0)
     }
-    if (-not $hasBaseline) {
-        Write-Json -Level info -Message 'No baseline row in results.tsv; running baseline iteration'
-        try {
-            $baselineResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch
-        } catch {
-            if ($_.Exception.Data.Contains('AutoresearchUncontainedProcess')) {
-                Limit-RunLogs
-                return 3
+    $baselinePending = -not $hasBaseline
+    $attemptedIterations = 0
+    $successfulIterations = 0
+    $failedIterations = 0
+    $consecutiveFailures = 0
+
+    while ($baselinePending -or ((Get-AutoresearchLoopTime) -lt $deadline)) {
+        $isBaselineRun = $baselinePending
+        $baselinePending = $false
+        $attemptedIterations++
+        $iterationNumber = $attemptedIterations
+        $iterationResult = $null
+        $iterationErrorRecord = $null
+        $iterationStatus = 'missing-result'
+        $fatalExitCode = 0
+
+        if ($isBaselineRun) {
+            Write-Json -Level info -Message 'No baseline row in results.tsv; running baseline iteration' -Extra @{
+                iteration = $iterationNumber
             }
-            throw
+        } else {
+            Write-Json -Level info -Message "Autoresearch iteration #$iterationNumber starting"
         }
-        if ($null -ne $baselineResult -and $baselineResult.Status -ceq 'uncontained-process') {
+
+        try {
+            if ($isBaselineRun) {
+                $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
+                    -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch
+            } else {
+                $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
+                    -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch
+            }
+        } catch {
+            $iterationErrorRecord = $_
+            $iterationException = $_.Exception
+            $failureMessage = $iterationException.Message
+            Write-Json -Level error -Message "Iteration #$iterationNumber raised: $failureMessage" -Extra @{
+                baseline = [bool]$isBaselineRun
+            }
+            if ($iterationException.Data.Contains('AutoresearchGitVerificationFailure')) {
+                $fatalExitCode = 1
+                $iterationStatus = 'git-verification-failure'
+            } elseif ($iterationException.Data.Contains('AutoresearchUncontainedProcess')) {
+                $fatalExitCode = 3
+                $iterationStatus = 'uncontained-process'
+            }
+        }
+
+        if ($iterationResult -is [System.Collections.IDictionary]) {
+            if ($iterationResult.Contains('Status') -and
+                -not [string]::IsNullOrWhiteSpace([string]$iterationResult['Status'])) {
+                $iterationStatus = [string]$iterationResult['Status']
+            }
+        } elseif ($null -ne $iterationResult) {
+            $statusProperty = $iterationResult.PSObject.Properties['Status']
+            if ($null -ne $statusProperty -and -not [string]::IsNullOrWhiteSpace([string]$statusProperty.Value)) {
+                $iterationStatus = [string]$statusProperty.Value
+            }
+        }
+        if ($iterationStatus -ceq 'uncontained-process') {
+            $fatalExitCode = 3
+        }
+
+        if ($null -eq $iterationErrorRecord -and $iterationStatus -in @('keep', 'discard')) {
+            $successfulIterations++
+            $consecutiveFailures = 0
+        } else {
+            $failedIterations++
+            $consecutiveFailures++
+        }
+
+        $outcomeLevel = if ($null -eq $iterationErrorRecord -and $iterationStatus -in @('keep', 'discard')) { 'info' } else { 'warn' }
+        Write-Json -Level $outcomeLevel -Message "Iteration #$iterationNumber recorded as '$iterationStatus'." -Extra @{
+            baseline             = [bool]$isBaselineRun
+            attemptedIterations  = $attemptedIterations
+            successfulIterations = $successfulIterations
+            failedIterations     = $failedIterations
+            consecutiveFailures  = $consecutiveFailures
+            failureLimit         = $MaxConsecutiveIterationFailures
+        }
+
+        if ($fatalExitCode -ne 0) {
+            $terminalStatus = if ($fatalExitCode -eq 1) { 'git-verification-failure' } else { 'uncontained-process' }
+            Write-AutoresearchLoopTerminalSummary -TerminalStatus $terminalStatus -ExitCode $fatalExitCode `
+                -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+                -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+                -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
             Limit-RunLogs
-            return 3
+            return $fatalExitCode
+        }
+
+        if ($consecutiveFailures -ge $MaxConsecutiveIterationFailures) {
+            Write-Json -Level error -Message 'Consecutive iteration-failure limit reached; stopping autoresearch loop.' -Extra @{
+                consecutiveFailures      = $consecutiveFailures
+                consecutiveFailureLimit  = $MaxConsecutiveIterationFailures
+            }
+            Write-AutoresearchLoopTerminalSummary -TerminalStatus 'failure-threshold' -ExitCode 4 `
+                -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+                -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+                -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
+            Limit-RunLogs
+            return 4
+        }
+
+        if ($iterationStatus -cne 'keep' -and $iterationStatus -cne 'discard') {
+            $backoffMilliseconds = Wait-AutoresearchLoopBackoff -ConsecutiveFailureCount $consecutiveFailures -Deadline $deadline
+            Write-Json -Level warn -Message 'Waiting before retrying a failed autoresearch iteration.' -Extra @{
+                delayMilliseconds     = $backoffMilliseconds
+                consecutiveFailures   = $consecutiveFailures
+                failureLimit          = $MaxConsecutiveIterationFailures
+                attemptedIterations   = $attemptedIterations
+            }
         }
     }
 
-    $iter = 0
-    while ((Get-Date) -lt $deadline) {
-        $iter++
-        Write-Json -Level info -Message "Autoresearch iteration #$iter starting"
-        try {
-            $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch
-            if ($null -ne $iterationResult -and $iterationResult.Status -ceq 'uncontained-process') {
-                Limit-RunLogs
-                return 3
-            }
-        } catch {
-            Write-Json -Level error -Message "Iteration #$iter raised: $($_.Exception.Message)"
-            if ($_.Exception.Data.Contains('AutoresearchGitVerificationFailure')) {
-                Limit-RunLogs
-                return 1
-            }
-            if ($_.Exception.Data.Contains('AutoresearchUncontainedProcess')) {
-                Limit-RunLogs
-                return 3
-            }
-            # Keep looping; per-iteration failures should not kill the whole loop.
-        }
+    Write-Json -Level info -Message 'Autoresearch loop deadline reached; exiting' -Extra @{
+        attemptedIterations  = $attemptedIterations
+        successfulIterations = $successfulIterations
+        failedIterations     = $failedIterations
+        experimentBranch     = $experimentBranch
+    }
+    if ($successfulIterations -eq 0) {
+        Write-AutoresearchLoopTerminalSummary -TerminalStatus 'deadline-no-success' -ExitCode 4 `
+            -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+            -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+            -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
+        Limit-RunLogs
+        return 4
     }
 
-    Write-Json -Level info -Message 'Autoresearch loop deadline reached; exiting' -Extra @{ iterations = $iter; experimentBranch = $experimentBranch }
+    Write-AutoresearchLoopTerminalSummary -TerminalStatus 'deadline-complete' -ExitCode 0 `
+        -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+        -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+        -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
     Limit-RunLogs
     return 0
 }
@@ -2785,11 +3077,28 @@ function Invoke-AutoresearchLoop {
 }
 
 function Get-PwshExePath {
-    $candidate = Get-Command 'pwsh.exe' -ErrorAction SilentlyContinue
-    if ($candidate) { return $candidate.Source }
-    $candidate = Get-Command 'pwsh' -ErrorAction SilentlyContinue
-    if ($candidate) { return $candidate.Source }
-    throw 'pwsh.exe is required for the scheduled task action but was not found on PATH.'
+    $commandNames = @('pwsh.exe', 'pwsh')
+    if (Test-WindowsHost) {
+        $commandNames += @('powershell.exe', 'powershell')
+    }
+
+    foreach ($commandName in $commandNames) {
+        $candidates = @(Get-Command -Name $commandName -CommandType Application -ErrorAction SilentlyContinue)
+        foreach ($candidate in $candidates) {
+            $candidatePath = $candidate.Source
+            if ([string]::IsNullOrWhiteSpace($candidatePath)) {
+                $candidatePath = $candidate.Definition
+            }
+            if (-not [string]::IsNullOrWhiteSpace($candidatePath) -and
+                (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                return $candidatePath
+            }
+        }
+    }
+
+    $message = 'No compatible PowerShell executable was found. Install PowerShell 7 (pwsh.exe) or use Windows PowerShell 5.1 (powershell.exe), ' +
+        'and ensure the executable is available on PATH before registering the task.'
+    throw $message
 }
 
 function Get-ScheduleTimeOptions {
@@ -2941,13 +3250,14 @@ function ConvertTo-WeekdayMask {
 }
 
 function Get-TaskLauncherPlan {
-    $pwshPath = Get-PwshExePath
+    $powerShellPath = Get-PwshExePath
     $scriptPath = $Script:CanonicalScript
     $commonArgs = @(
         '-Provider', $Provider,
         '-Model', $Model,
         '-SchedulerPolicy', $SchedulerPolicy,
         '-MaxLoopMinutes', $MaxLoopMinutes,
+        '-MaxConsecutiveIterationFailures', $MaxConsecutiveIterationFailures,
         '-PerRunTimeoutMinutes', $PerRunTimeoutMinutes
     )
     if ($Provider -eq 'ollama') {
@@ -2965,14 +3275,14 @@ function Get-TaskLauncherPlan {
     $taskArgs  = Format-CommandLineArgumentList -Arguments $taskArgList
 
     return [pscustomobject]@{
-        PwshPath               = $pwshPath
+        PowerShellPath         = $powerShellPath
         ScriptPath             = $scriptPath
         InnerArgList           = $childArgList
         TaskActionArgList      = $taskArgList
         TaskActionArguments    = $taskArgs
-        TaskActionCommand      = Format-CommandLine -FilePath $pwshPath -Arguments $taskArgList
+        TaskActionCommand      = Format-CommandLine -FilePath $powerShellPath -Arguments $taskArgList
         WorkloadArguments      = $childArgs
-        WorkloadCommand        = Format-CommandLine -FilePath $pwshPath -Arguments $childArgList
+        WorkloadCommand        = Format-CommandLine -FilePath $powerShellPath -Arguments $childArgList
         TaskLaunchStatePath    = (Get-TaskLaunchStatePath)
     }
 }
@@ -3013,7 +3323,7 @@ function Invoke-TaskLaunchSupervisor {
     }
 
     try {
-        $child = Start-Process -FilePath $plan.PwshPath -ArgumentList $plan.InnerArgList `
+        $child = Start-Process -FilePath $plan.PowerShellPath -ArgumentList $plan.InnerArgList `
             -WorkingDirectory $RepoRoot -WindowStyle Hidden -PassThru -Wait
     } catch {
         $state.status = 'spawn-failed'
@@ -3288,9 +3598,13 @@ function Invoke-IdlePolicyGate {
 }
 
 function Get-TaskXml {
+    param([AllowNull()][psobject]$Plan)
+
     $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
     $schedule = Get-ScheduleTriggerSpec -Frequency $ScheduleFrequency -Value $ScheduleTime
-    $plan = Get-TaskLauncherPlan
+    if ($null -eq $Plan) {
+        $Plan = Get-TaskLauncherPlan
+    }
 
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
@@ -3336,8 +3650,8 @@ function Get-TaskXml {
     }
 
     $action = $task.Actions.Create(0)
-    $action.Path = $plan.PwshPath
-    $action.Arguments = $plan.TaskActionArguments
+    $action.Path = $Plan.PowerShellPath
+    $action.Arguments = $Plan.TaskActionArguments
     $action.WorkingDirectory = $RepoRoot
 
     return $task.XmlText
@@ -3362,21 +3676,22 @@ function Get-RegisteredLauncherTask {
 }
 
 function Register-LauncherTask {
+    $plan = Get-TaskLauncherPlan
+    $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
     $existing = Get-RegisteredLauncherTask
     if ($existing) {
         Write-Json -Level info -Message "Existing task $($Script:TaskName) found; replacing"
         Unregister-ScheduledTask -TaskPath $existing.TaskPath -TaskName $existing.TaskName -Confirm:$false
     }
-    $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
-    $plan = Get-TaskLauncherPlan
     Write-Json -Level info -Message "Registering scheduled task $($Script:TaskPath)$($Script:TaskName) with $($policy.DisplayName) policy" -Extra @{
         schedulerPolicy = $SchedulerPolicy
+        powerShellPath  = $plan.PowerShellPath
         policySummary   = $policy.Summary
         logonType       = $policy.LogonTypeName
         requiresDesktop = $policy.RequiresDesktopSession
         idleGate        = $policy.UsesIdleGate
     }
-    $xml = Get-TaskXml
+    $xml = Get-TaskXml -Plan $plan
 
     Register-ScheduledTask -TaskName $Script:TaskName -TaskPath $Script:TaskPath `
         -Xml $xml | Out-Null
@@ -3392,6 +3707,7 @@ function Register-LauncherTask {
         idleMinutes          = if ($policy.UsesIdleGate) { 5 } else { $null }
         idleWaitMinutes      = if ($policy.UsesIdleGate) { 60 } else { $null }
         ownProcess           = $true
+        powerShellPath       = $plan.PowerShellPath
         launcherCommand      = $plan.TaskActionCommand
         workloadCommand      = $plan.WorkloadCommand
         taskLaunchState      = $plan.TaskLaunchStatePath
@@ -3838,6 +4154,7 @@ try {
             RunNow               = [bool]$RunNow
             RunLoop              = [bool]$RunLoop
             MaxLoopMinutes       = $MaxLoopMinutes
+            MaxConsecutiveIterationFailures = $MaxConsecutiveIterationFailures
             PerRunTimeoutMinutes = $PerRunTimeoutMinutes
             NoAiEdit             = [bool]$NoAiEdit
             Unregister           = [bool]$Unregister
@@ -3903,17 +4220,18 @@ try {
     }
     if (-not ($RegisterTask -or $Update)) {
         $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { $Script:CanonicalScript }
+        $powerShellCommand = if ($PSVersionTable.PSEdition -eq 'Desktop') { 'powershell.exe' } else { 'pwsh.exe' }
         Write-Json -Level info -Message 'Preflight OK. No action selected; nothing to do.'
         Write-Host ''
         Write-Host 'Preflight OK. Re-run with one of:' -ForegroundColor Cyan
-        Write-Host "  pwsh -File `"$scriptPath`"                 # GUI launcher"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunNow  # single training run via ai-powered"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop  # autoresearch experiment loop"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RunLoop -MaxLoopMinutes 120  # loop with 2-hour limit"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime -SchedulerPolicy $SchedulerPolicy"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -RegisterTask -SchedulerPolicy Unattended -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Unregister"
-        Write-Host "  pwsh -File `"$scriptPath`" -NoGui -Update"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`"                 # GUI launcher"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -RunNow  # single training run via ai-powered"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -RunLoop  # autoresearch experiment loop"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -RunLoop -MaxLoopMinutes 120  # loop with 2-hour limit"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -RegisterTask -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime -SchedulerPolicy $SchedulerPolicy"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -RegisterTask -SchedulerPolicy Unattended -ScheduleFrequency $ScheduleFrequency -ScheduleTime $ScheduleTime"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -Unregister"
+        Write-Host "  $powerShellCommand -File `"$scriptPath`" -NoGui -Update"
         Write-Host ''
     }
     exit 0

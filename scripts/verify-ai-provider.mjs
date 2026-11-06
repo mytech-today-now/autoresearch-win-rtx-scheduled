@@ -140,7 +140,7 @@ function shouldScan(path) {
 
 function walk(dir, files = []) {
   for (const entry of readdirSync(dir)) {
-    if (excludedDirs.has(entry)) continue;
+    if (excludedDirs.has(entry) || entry.startsWith(".test-tmp-")) continue;
     const path = join(dir, entry);
     const info = statSync(path);
     if (info.isDirectory()) {

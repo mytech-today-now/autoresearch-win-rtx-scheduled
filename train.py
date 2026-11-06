@@ -12,6 +12,8 @@ import math
 import os
 import platform
 import secrets
+import shutil
+import stat
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -956,6 +958,9 @@ CHECKPOINT_FORMAT_VERSION = 1
 CHECKPOINT_FILE_NAME = "checkpoint.pt"
 CHECKPOINT_METADATA_FILE_NAME = "metadata.json"
 CHECKPOINT_SAVE_INTERVAL_SECONDS = 60.0
+CHECKPOINT_RETENTION_COUNT = 5
+CHECKPOINT_RETENTION_DAYS = 30
+CHECKPOINT_RECOVERY_MARKER_FILE_NAME = "recovery-needed"
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
@@ -1529,6 +1534,7 @@ def _run_training_once(
         train_state=current_train_state(),
         snapshot_reason="final",
     )
+    _mark_checkpoint_run_successful(run_dir)
 
     print()
     return {
@@ -1668,6 +1674,347 @@ def _create_run_checkpoint_dir(checkpoint_root, run_id=None):
     return run_dir
 
 
+def _is_reparse_point(path):
+    try:
+        file_info = Path(path).lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(file_info, "st_file_attributes", 0)
+    return stat.S_ISLNK(file_info.st_mode) or bool(reparse_flag and attributes & reparse_flag)
+
+
+def _has_reparse_point_ancestor(path):
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    while True:
+        if _is_reparse_point(candidate):
+            return True
+        if candidate.parent == candidate:
+            return False
+        candidate = candidate.parent
+
+
+def _is_safe_checkpoint_run_dir(checkpoint_root, run_dir):
+    root = Path(checkpoint_root)
+    candidate = Path(run_dir)
+    if not candidate.name.startswith("run-") or _is_reparse_point(candidate):
+        return False
+
+    try:
+        resolved_root = root.resolve()
+        resolved_candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    return (
+        resolved_candidate != resolved_root
+        and resolved_candidate.parent == resolved_root
+        and resolved_candidate.is_dir()
+    )
+
+
+def _is_safe_regular_checkpoint_child(parent, child):
+    child = Path(child)
+    if _is_reparse_point(child):
+        return False
+    try:
+        resolved_parent = Path(parent).resolve(strict=True)
+        resolved_child = child.resolve(strict=True)
+        file_info = child.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(file_info, "st_file_attributes", 0)
+    return (
+        stat.S_ISREG(file_info.st_mode)
+        and not (reparse_flag and attributes & reparse_flag)
+        and resolved_child.parent == resolved_parent
+        and file_info.st_size > 0
+    )
+
+
+def _is_positive_int(value):
+    return type(value) is int and value > 0
+
+
+def _is_supported_checkpoint_compatibility_signature(signature):
+    if not isinstance(signature, dict):
+        return False
+
+    model_training = signature.get("model_training")
+    optimizer = signature.get("optimizer")
+    if not isinstance(model_training, dict) or not isinstance(optimizer, dict):
+        return False
+
+    dataset = model_training.get("dataset")
+    dataset_sha256 = model_training.get("dataset_sha256")
+    tokenizer_fingerprint = model_training.get("tokenizer_fingerprint")
+    if not isinstance(dataset, str) or not dataset.strip():
+        return False
+    if not isinstance(dataset_sha256, str) or len(dataset_sha256) != 64:
+        return False
+    try:
+        int(dataset_sha256, 16)
+    except ValueError:
+        return False
+    if not isinstance(tokenizer_fingerprint, str) or not tokenizer_fingerprint.strip():
+        return False
+
+    for field_name in (
+        "vocab_size",
+        "device_batch_size",
+        "grad_accum_steps",
+        "total_batch_size",
+    ):
+        if not _is_positive_int(model_training.get(field_name)):
+            return False
+
+    model_signature = model_training.get("model")
+    if not isinstance(model_signature, dict) or not model_signature:
+        return False
+    for field_name in ("sequence_len", "vocab_size", "n_layer", "n_head", "n_kv_head", "n_embd"):
+        if not _is_positive_int(model_signature.get(field_name)):
+            return False
+
+    group_count = optimizer.get("param_group_count")
+    group_kinds = optimizer.get("group_kinds")
+    group_param_counts = optimizer.get("group_param_counts")
+    return (
+        isinstance(optimizer.get("name"), str)
+        and bool(optimizer["name"].strip())
+        and _is_positive_int(group_count)
+        and isinstance(group_kinds, list)
+        and len(group_kinds) == group_count
+        and all(isinstance(kind, str) and kind for kind in group_kinds)
+        and isinstance(group_param_counts, list)
+        and len(group_param_counts) == group_count
+        and all(type(count) is int and count >= 0 for count in group_param_counts)
+    )
+
+
+def _inspect_checkpoint_run(checkpoint_root, run_dir):
+    run_dir = Path(run_dir)
+    if not _is_safe_checkpoint_run_dir(checkpoint_root, run_dir):
+        return {"eligible": False, "reason": "path-escape-or-reparse-point"}
+
+    metadata_path = run_dir / CHECKPOINT_METADATA_FILE_NAME
+    checkpoint_path = run_dir / CHECKPOINT_FILE_NAME
+    if not _is_safe_regular_checkpoint_child(run_dir, metadata_path):
+        return {"eligible": False, "reason": "missing-or-ambiguous-metadata"}
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"eligible": False, "reason": "malformed-metadata"}
+
+    if not isinstance(metadata, dict):
+        return {"eligible": False, "reason": "malformed-metadata"}
+    if metadata.get("artifact_kind") != "autoresearch-training-checkpoint":
+        return {"eligible": False, "reason": "ambiguous-artifact-kind"}
+    if metadata.get("run_id") != run_dir.name:
+        return {"eligible": False, "reason": "ambiguous-run-id"}
+    run_state = metadata.get("run_state")
+    if run_state == "active":
+        return {"eligible": False, "reason": "active-run"}
+    if run_state != "successful":
+        return {"eligible": False, "reason": "ambiguous-run-state"}
+    if metadata.get("format_version") != CHECKPOINT_FORMAT_VERSION:
+        return {"eligible": False, "reason": "incompatible-checkpoint-format"}
+
+    recovery_needed = metadata.get("recovery_needed", False)
+    ambiguous_recovery_state = not isinstance(recovery_needed, bool)
+    recovery_marker = run_dir / CHECKPOINT_RECOVERY_MARKER_FILE_NAME
+    ambiguous_recovery_marker = _is_reparse_point(recovery_marker)
+    recovery_protected = (
+        ambiguous_recovery_state
+        or ambiguous_recovery_marker
+        or recovery_needed is True
+        or recovery_marker.exists()
+    )
+    if metadata.get("snapshot_reason") != "final":
+        return {"eligible": False, "reason": "ambiguous-completion"}
+
+    completed_unix = metadata.get("completed_unix")
+    if not _is_positive_int(completed_unix):
+        return {"eligible": False, "reason": "ambiguous-completion-time"}
+    if not _is_supported_checkpoint_compatibility_signature(
+        metadata.get("compatibility_signature")
+    ):
+        return {"eligible": False, "reason": "incompatible-or-incomplete-signature"}
+    if not isinstance(metadata.get("train_state"), dict):
+        return {"eligible": False, "reason": "ambiguous-train-state"}
+    if not _is_safe_regular_checkpoint_child(run_dir, checkpoint_path):
+        return {"eligible": False, "reason": "missing-or-ambiguous-checkpoint"}
+    checkpoint_size_bytes = metadata.get("checkpoint_size_bytes")
+    if (
+        not _is_positive_int(checkpoint_size_bytes)
+        or checkpoint_path.stat().st_size != checkpoint_size_bytes
+    ):
+        return {"eligible": False, "reason": "ambiguous-checkpoint-size"}
+
+    return {
+        "eligible": True,
+        "protected": recovery_protected,
+        "reason": (
+            "ambiguous-recovery-state"
+            if ambiguous_recovery_state or ambiguous_recovery_marker
+            else "recovery-needed" if recovery_protected else None
+        ),
+        "completed_unix": completed_unix,
+        "compatibility_signature": metadata["compatibility_signature"],
+    }
+
+
+def cleanup_checkpoint_runs(
+    checkpoint_root=None,
+    retention_count=CHECKPOINT_RETENTION_COUNT,
+    retention_days=CHECKPOINT_RETENTION_DAYS,
+    dry_run=False,
+    now_unix=None,
+):
+    """Prune only well-formed, completed checkpoint runs beneath their root."""
+    if not _is_positive_int(retention_count):
+        raise ValueError("checkpoint retention count must be a positive integer")
+    if not _is_positive_int(retention_days):
+        raise ValueError("checkpoint retention age in days must be a positive integer")
+
+    requested_root = _default_checkpoint_root() if checkpoint_root is None else Path(checkpoint_root)
+    requested_root = Path(os.path.abspath(os.fspath(requested_root)))
+    if _has_reparse_point_ancestor(requested_root):
+        raise ValueError(
+            f"Refusing checkpoint cleanup through a linked root or parent: {requested_root}"
+        )
+    if requested_root.exists() and not requested_root.is_dir():
+        raise ValueError(f"Checkpoint root is not a directory: {requested_root}")
+
+    root = requested_root.resolve()
+    result = {"root": root, "selected": [], "deleted": [], "failed": [], "protected": []}
+    print(
+        "Checkpoint retention policy: "
+        f"root={root} keep_count={retention_count} max_age_days={retention_days} "
+        f"dry_run={str(bool(dry_run)).lower()}"
+    )
+    if not root.exists():
+        print("Checkpoint retention: root does not exist; nothing to clean.")
+        return result
+
+    successful_runs = []
+    for run_dir in sorted(root.iterdir(), key=lambda item: item.name):
+        if not run_dir.name.startswith("run-") or not run_dir.is_dir():
+            continue
+        inspection = _inspect_checkpoint_run(root, run_dir)
+        if inspection.get("eligible"):
+            successful_runs.append(
+                {
+                    "path": run_dir,
+                    "completed_unix": inspection["completed_unix"],
+                    "compatibility_signature": inspection["compatibility_signature"],
+                    "protected": bool(inspection.get("protected")),
+                    "protect_reason": inspection.get("reason"),
+                }
+            )
+        elif inspection.get("reason"):
+            result["protected"].append({"path": run_dir, "reason": inspection["reason"]})
+
+    successful_runs.sort(
+        key=lambda entry: (entry["completed_unix"], entry["path"].name),
+        reverse=True,
+    )
+    if successful_runs:
+        newest_successful = successful_runs[0]["path"]
+        newest_signature = successful_runs[0]["compatibility_signature"]
+    else:
+        newest_successful = None
+        newest_signature = None
+    compatible_runs = []
+    for entry in successful_runs:
+        if entry["compatibility_signature"] != newest_signature:
+            result["protected"].append(
+                {"path": entry["path"], "reason": "incompatible-with-newest-success"}
+            )
+            continue
+        compatible_runs.append(entry)
+
+    current_time = int(time.time()) if now_unix is None else int(now_unix)
+    age_cutoff = current_time - retention_days * 24 * 60 * 60
+    selected = []
+    for index, entry in enumerate(compatible_runs, start=1):
+        run_dir = entry["path"]
+        reasons = []
+        if run_dir == newest_successful:
+            result["protected"].append({"path": run_dir, "reason": "newest-successful"})
+            continue
+        if index > retention_count:
+            reasons.append("beyond-retention-count")
+        if entry["completed_unix"] < age_cutoff:
+            reasons.append("older-than-retention-age")
+        if entry["protected"]:
+            result["protected"].append(
+                {"path": run_dir, "reason": entry["protect_reason"] or "recovery-needed"}
+            )
+            continue
+        if reasons:
+            selected.append(
+                {
+                    "path": run_dir,
+                    "completed_unix": entry["completed_unix"],
+                    "compatibility_signature": entry["compatibility_signature"],
+                    "reasons": reasons,
+                }
+            )
+
+    result["selected"] = [str(entry["path"]) for entry in selected]
+    for entry in result["protected"]:
+        print(f"Checkpoint retention protected: path={entry['path']} reason={entry['reason']}")
+    for entry in selected:
+        print(
+            f"Checkpoint retention selected: path={entry['path']} "
+            f"reasons={','.join(entry['reasons'])}"
+        )
+
+    if dry_run:
+        print(f"Checkpoint retention dry-run complete: selected={len(selected)} deleted=0 failed=0")
+        return result
+
+    for entry in selected:
+        run_dir = entry["path"]
+        current = _inspect_checkpoint_run(root, run_dir)
+        if (
+            not current.get("eligible")
+            or current.get("protected")
+            or current.get("completed_unix") != entry["completed_unix"]
+            or current.get("compatibility_signature") != entry["compatibility_signature"]
+            or not _is_safe_checkpoint_run_dir(root, run_dir)
+        ):
+            failure = {"path": str(run_dir), "error": "eligibility or path changed after planning"}
+            result["failed"].append(failure)
+            print(
+                f"Checkpoint retention delete failed: path={run_dir} "
+                f"error={failure['error']}"
+            )
+            continue
+
+        try:
+            shutil.rmtree(run_dir)
+        except OSError as exc:
+            failure = {"path": str(run_dir), "error": str(exc)}
+            result["failed"].append(failure)
+            print(f"Checkpoint retention delete failed: path={run_dir} error={exc}")
+        else:
+            result["deleted"].append(str(run_dir))
+            print(f"Checkpoint retention deleted: path={run_dir}")
+
+    print(
+        "Checkpoint retention complete: "
+        f"selected={len(selected)} deleted={len(result['deleted'])} failed={len(result['failed'])}"
+    )
+    return result
+
+
 def _atomic_write_json(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1683,6 +2030,43 @@ def _atomic_write_json(path, payload):
                 tmp_path.unlink()
             except OSError:
                 pass
+
+
+def _mark_checkpoint_run_successful(checkpoint_dir, completed_unix=None):
+    checkpoint_dir = Path(checkpoint_dir)
+    metadata_path = checkpoint_dir / CHECKPOINT_METADATA_FILE_NAME
+    checkpoint_path = checkpoint_dir / CHECKPOINT_FILE_NAME
+    if not _is_safe_regular_checkpoint_child(checkpoint_dir, metadata_path):
+        raise CheckpointFormatError(
+            f"Cannot mark checkpoint run successful; metadata is missing or unsafe: {metadata_path}"
+        )
+    if not _is_safe_regular_checkpoint_child(checkpoint_dir, checkpoint_path):
+        raise CheckpointFormatError(
+            f"Cannot mark checkpoint run successful; checkpoint is missing or unsafe: {checkpoint_path}"
+        )
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CheckpointFormatError(
+            f"Cannot mark checkpoint run successful; metadata is unreadable: {metadata_path}"
+        ) from exc
+    if not isinstance(metadata, dict) or metadata.get("run_id") != checkpoint_dir.name:
+        raise CheckpointFormatError(
+            f"Cannot mark checkpoint run successful; metadata does not identify {checkpoint_dir.name}."
+        )
+    if metadata.get("checkpoint_size_bytes") != checkpoint_path.stat().st_size:
+        raise CheckpointFormatError(
+            f"Cannot mark checkpoint run successful; checkpoint size does not match metadata: {checkpoint_path}"
+        )
+
+    completed_unix = int(time.time()) if completed_unix is None else int(completed_unix)
+    if completed_unix <= 0:
+        raise ValueError("checkpoint completion time must be a positive Unix timestamp")
+    metadata["run_state"] = "successful"
+    metadata["completed_unix"] = completed_unix
+    _atomic_write_json(metadata_path, metadata)
+    return metadata
 
 
 def _atomic_torch_save(payload, path):
@@ -1940,6 +2324,8 @@ def _save_run_checkpoint(*, checkpoint_dir, context, model, optimizer, train_sta
         "run_dir": str(checkpoint_dir.resolve()),
         "checkpoint_path": str(checkpoint_path.resolve()),
         "snapshot_reason": snapshot_reason,
+        "run_state": "active",
+        "completed_unix": None,
         "status": context["status"],
         "resume": context["resume"],
         "resume_reason": context["resume_reason"],
@@ -1975,14 +2361,18 @@ def _save_run_checkpoint(*, checkpoint_dir, context, model, optimizer, train_sta
         "train_state": train_state,
         "saved_unix": saved_unix,
     }
+    payload_metadata = dict(metadata)
+    payload_metadata.pop("run_state", None)
+    payload_metadata.pop("completed_unix", None)
     payload = {
-        "metadata": metadata,
+        "metadata": payload_metadata,
         "model_state_dict": model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "train_state": train_state,
         "rng_state": _capture_rng_state(),
     }
     _atomic_torch_save(payload, checkpoint_path)
+    metadata["checkpoint_size_bytes"] = checkpoint_path.stat().st_size
     _atomic_write_json(metadata_path, metadata)
     print(f"Saved checkpoint ({snapshot_reason}, step={train_state['step']}) -> {checkpoint_path}")
     return checkpoint_path
@@ -2007,9 +2397,46 @@ def main():
     parser.add_argument(
         "--checkpoint-root",
         default=None,
-        help="Directory where each run writes its checkpoint artifact subdirectory.",
+        help="Checkpoint root for training or cleanup; defaults to artifacts/checkpoints.",
+    )
+    parser.add_argument(
+        "--cleanup-checkpoints",
+        action="store_true",
+        help="Apply the checkpoint retention policy and exit without starting training.",
+    )
+    parser.add_argument(
+        "--checkpoint-retention-count",
+        type=int,
+        default=CHECKPOINT_RETENTION_COUNT,
+        help=f"Maximum retained successful runs by count (default: {CHECKPOINT_RETENTION_COUNT}).",
+    )
+    parser.add_argument(
+        "--checkpoint-retention-days",
+        type=int,
+        default=CHECKPOINT_RETENTION_DAYS,
+        help=f"Maximum age for retained successful runs in days (default: {CHECKPOINT_RETENTION_DAYS}).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --cleanup-checkpoints, print the deletion plan without deleting files.",
     )
     args = parser.parse_args()
+
+    if args.dry_run and not args.cleanup_checkpoints:
+        parser.error("--dry-run requires --cleanup-checkpoints")
+    if args.cleanup_checkpoints:
+        try:
+            result = cleanup_checkpoint_runs(
+                checkpoint_root=args.checkpoint_root,
+                retention_count=args.checkpoint_retention_count,
+                retention_days=args.checkpoint_retention_days,
+                dry_run=args.dry_run,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"Checkpoint retention refused or failed: {exc}")
+            return 1
+        return 1 if result["failed"] else 0
 
     runtime = detect_runtime()
     print(f"GPU: {runtime.gpu_name}")

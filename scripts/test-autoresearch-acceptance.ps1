@@ -3,6 +3,7 @@
 param()
 
 $ErrorActionPreference = "Stop"
+$script:RequiredPesterVersion = [version]'5.0.0'
 $HarnessRoot = Split-Path -Parent $PSScriptRoot
 $LaunchPath = Join-Path $PSScriptRoot "launch.ps1"
 $PreviousDotSourceOnly = $env:AUTORESEARCH_DOT_SOURCE_ONLY
@@ -303,7 +304,7 @@ function Test-LaunchPesterSuite {
     Write-Host "Acceptance: launch.ps1 Pester suite"
     $pesterPath = Join-Path $HarnessRoot "tests\launch.Tests.ps1"
     Assert-True (Test-Path -LiteralPath $pesterPath) "launch.Tests.ps1 is missing."
-    Import-Module Pester -ErrorAction Stop
+    Import-Module Pester -RequiredVersion $script:RequiredPesterVersion -ErrorAction Stop
     $result = Invoke-Pester -Path $pesterPath -PassThru
     Assert-True ($result.FailedCount -eq 0) "launch.Tests.ps1 reported failing tests."
 }

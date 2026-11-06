@@ -51,6 +51,7 @@ function script:Get-LaunchFixtureState {
         'AzureDeployment',
         'SchedulerPolicy',
         'MaxLoopMinutes',
+        'MaxConsecutiveIterationFailures',
         'PerRunTimeoutMinutes',
         'NoAiEdit',
         'TaskName',
@@ -114,6 +115,7 @@ function script:Initialize-LaunchFixtureState {
     $script:ScheduleFrequency = 'Daily'
     $script:ScheduleTime = $null
     $script:MaxLoopMinutes = 0
+    $script:MaxConsecutiveIterationFailures = 5
     $script:PerRunTimeoutMinutes = 10
     $script:NoAiEdit = $false
     $script:captured = @()
@@ -163,6 +165,7 @@ BeforeAll {
         'Get-ProviderApiKeyEnvironmentName',
         'Clear-ProviderApiKeyEnvironment',
         'Set-WorkloadEnvironment',
+        'Invoke-CheckpointRetention',
         'Get-VersionToken',
         'ConvertTo-VersionObject',
         'Get-ToolVersion',
@@ -199,6 +202,11 @@ BeforeAll {
         'Format-AutoresearchLoopLockBusyMessage',
         'Enter-AutoresearchLoopLock',
         'Exit-AutoresearchLoopLock',
+        'Get-AutoresearchLoopTime',
+        'Get-AutoresearchLoopBackoffDelayMilliseconds',
+        'Start-AutoresearchLoopSleep',
+        'Wait-AutoresearchLoopBackoff',
+        'Write-AutoresearchLoopTerminalSummary',
         'Invoke-AutoresearchLoopCore',
         'Invoke-AutoresearchLoop',
         'Invoke-Git',
@@ -313,8 +321,7 @@ function script:ConvertTo-SingleQuotedLiteral {
 function script:New-FakeGitCommand {
     param(
         [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$LogPath,
-        [int]$PullExitCode = 0
+        [Parameter(Mandatory)][string]$LogPath
     )
     $bin = Join-Path $Root 'bin'
     New-Item -ItemType Directory -Path $bin -Force | Out-Null
@@ -324,8 +331,15 @@ function script:New-FakeGitCommand {
 setlocal
 echo %*>>"$LogPath"
 if /i "%1"=="clone" exit /b 81
-if /i "%1"=="-C" if /i "%3"=="pull" exit /b $PullExitCode
+if /i "%1"=="-C" if /i "%3"=="pull" (
+    if /i "%4"=="--ff-only" if /i "%5"=="origin" if /i "%6"=="main" exit /b 0
+    exit /b 83
+)
 if /i "%1"=="-C" if /i "%3"=="status" (
+    "$gitExecutable" %*
+    exit /b %errorlevel%
+)
+if /i "%1"=="-C" if /i "%3"=="rev-parse" (
     "$gitExecutable" %*
     exit /b %errorlevel%
 )
@@ -357,6 +371,8 @@ function script:New-TemporaryGitRepository {
     if ($LASTEXITCODE -ne 0) { throw 'Could not stage the temporary Git repository fixture.' }
     & git.exe -C $Root -c user.name=BootstrapTest -c user.email=bootstrap@example.invalid commit --quiet -m initial
     if ($LASTEXITCODE -ne 0) { throw 'Could not commit the temporary Git repository fixture.' }
+    & git.exe -C $Root branch -M main
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set the temporary Git repository release branch.' }
     & git.exe -C $Root remote add origin $OriginUrl
     if ($LASTEXITCODE -ne 0) { throw 'Could not configure the temporary Git repository origin.' }
 
@@ -384,9 +400,12 @@ function script:Invoke-BootstrapTestFixture {
         [Parameter(Mandatory)][string]$GitBin,
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$RepoUrl,
+        [int]$PullExitCode = 0,
+        [int]$ChildExitCode = 0,
         [string[]]$ForwardArgs = @()
     )
 
+    $gitExecutable = (Get-Command -Name 'git.exe' -CommandType Application -ErrorAction Stop).Source
     $startProcessLog = Join-Path $Root 'start-process.log'
     $removeItemLog = Join-Path $Root 'remove-item.log'
     $command = @"
@@ -402,7 +421,7 @@ function Start-Process {
         [switch]`$Wait
     )
     [System.IO.File]::AppendAllText($(ConvertTo-SingleQuotedLiteral $startProcessLog), (`$FilePath + '|' + (`$ArgumentList -join '|') + [Environment]::NewLine))
-    return [pscustomobject]@{ ExitCode = 0 }
+    return [pscustomobject]@{ ExitCode = $(ConvertTo-SingleQuotedLiteral ([string]$ChildExitCode)) }
 }
 function Remove-Item {
     [CmdletBinding()]
@@ -414,6 +433,24 @@ function Remove-Item {
     [System.IO.File]::AppendAllText($(ConvertTo-SingleQuotedLiteral $removeItemLog), (`$LiteralPath + [Environment]::NewLine))
 }
 `$env:PATH = $(ConvertTo-SingleQuotedLiteral $GitBin) + ';' + `$env:PATH
+function git {
+    `$gitArguments = @(`$args)
+    [System.IO.File]::AppendAllText($(ConvertTo-SingleQuotedLiteral (Join-Path $Root 'git-invocations.log')), (`$gitArguments -join ' ') + [Environment]::NewLine)
+    if (`$gitArguments.Count -gt 0 -and `$gitArguments[0] -ieq 'clone') {
+        `$global:LASTEXITCODE = 81
+        return
+    }
+    if (`$gitArguments.Count -ge 3 -and `$gitArguments[0] -ieq '-C' -and `$gitArguments[2] -ieq 'pull') {
+        if (`$gitArguments.Count -ge 6 -and `$gitArguments[3] -ieq '--ff-only' -and `$gitArguments[4] -ieq 'origin' -and `$gitArguments[5] -ieq 'main') {
+            `$global:LASTEXITCODE = $PullExitCode
+        } else {
+            `$global:LASTEXITCODE = 83
+        }
+        return
+    }
+    & $(ConvertTo-SingleQuotedLiteral $gitExecutable) @gitArguments
+    `$global:LASTEXITCODE = `$LASTEXITCODE
+}
 . $(ConvertTo-SingleQuotedLiteral $ScriptPath)
 Set-Variable -Scope Script -Name CanonicalRepo -Value $(ConvertTo-SingleQuotedLiteral $CanonicalRepo) -Force
 Set-Variable -Scope Script -Name CanonicalScript -Value $(ConvertTo-SingleQuotedLiteral (Join-Path $CanonicalRepo 'scripts\launch.ps1')) -Force
@@ -996,8 +1033,7 @@ Describe 'Invoke-AiPoweredEdit prompt transport' {
     }
 
     It 'keeps short input behavior and sends the complete oversized prompt through stdin' {
-        $system = 'You are an autonomous ML research agent. Reply with EXACTLY one short one-line description prefixed by "DESCRIPTION: ", then a single fenced code block ' +
-            [string]::new([char]96, 3) + 'python containing the COMPLETE new contents of train.py. No other text.'
+        $system = 'You are an autonomous ML research agent. Reply with exactly one short one-line description starting with DESCRIPTION:, then one fenced python code block containing the complete new contents of train.py. No other text.'
 
         $shortExpected = Get-AiPoweredEditExpectedPrompt -Fixture $script:AiPoweredEditFixture
         $shortResult = Invoke-AiPoweredEdit -RepoRootPath $script:AiPoweredEditFixture.RepoRoot
@@ -1382,6 +1418,7 @@ Describe 'Autoresearch experiment worktree transaction' {
 
         Mock Assert-AutoresearchGeneratedCodeReviewAvailable {}
         Mock Confirm-AutoresearchGeneratedCode { return $true }
+        Mock Invoke-CheckpointRetention { return 0 }
 
         Mock Start-Process {
             param(
@@ -1440,7 +1477,8 @@ Describe 'Autoresearch experiment worktree transaction' {
                 $RedirectStandardOutput,
                 "val_bpb: $script:FakeTrainingScore`npeak_vram_mb: 1024`n"
             )
-            $process = [pscustomobject]@{ Id = 9001; ExitCode = 0 }
+            $processExitCode = if ($script:FakeTrainingProcessMode -eq 'nonzero') { 23 } else { 0 }
+            $process = [pscustomobject]@{ Id = 9001; ExitCode = $processExitCode }
             $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
                 param([int]$Milliseconds = -1)
                 return $true
@@ -1542,6 +1580,24 @@ Describe 'Autoresearch experiment worktree transaction' {
                 try { $script:FakeTrainingProcess.Dispose() } catch { }
             }
         }
+    }
+
+    It 'records a nonzero training exit as a crash even when metrics were emitted' {
+        $fixture = New-AutoresearchGitFixture -Name 'nonzero-training-exit'
+        $script:FakeTrainingProcessMode = 'nonzero'
+
+        $result = Invoke-AutoresearchIteration -RepoRootPath $fixture.Root `
+            -ResultsPath $fixture.ResultsPath -PerRunTimeoutMin 1 -SkipAiEdit
+
+        $result.ExitCode | Should -Be 23
+        $result.ValBpb | Should -Be $script:FakeTrainingScore
+        $result.Status | Should -BeExactly 'crash'
+        $finished = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Iteration finished' })
+        $finished.Count | Should -Be 1
+        $finished[0].Extra.status | Should -BeExactly 'crash'
+        $resultRows = @(Get-Content -LiteralPath $fixture.ResultsPath | Where-Object { $_ -and $_ -notmatch '^commit\t' })
+        $resultRows.Count | Should -Be 1
+        ($resultRows[0] -split "`t")[3] | Should -BeExactly 'crash'
     }
 
     AfterEach {
@@ -1892,6 +1948,273 @@ Describe 'Autoresearch experiment worktree transaction' {
     }
 }
 
+function script:New-AutoresearchLoopTestOutcome {
+    param(
+        [string]$Status = 'crash',
+        [switch]$Throw,
+        [string]$Marker,
+        [switch]$AdvanceToDeadline
+    )
+
+    return [pscustomobject]@{
+        Status            = $Status
+        Throw             = [bool]$Throw
+        Marker            = $Marker
+        AdvanceToDeadline = [bool]$AdvanceToDeadline
+    }
+}
+
+Describe 'Invoke-AutoresearchLoopCore reliability' {
+    BeforeEach {
+        $script:LoopCorePreviousState = Get-LaunchFixtureState
+        $script:LoopCoreFixture = New-AutoresearchLoopProcessFixture -Name 'loop-core-reliability'
+        $script:RepoRoot = $script:LoopCoreFixture.Root
+        $script:LogDir = $script:LoopCoreFixture.LogDir
+        $script:RunLogPath = $null
+        $script:MaxLoopMinutes = 1
+        $script:MaxConsecutiveIterationFailures = 3
+        $script:PerRunTimeoutMinutes = 1
+        $script:NoAiEdit = $false
+        $script:SchedulerPolicy = 'Interactive'
+        $script:LoopFakeTime = [DateTime]::SpecifyKind([DateTime]::Parse('2026-11-06T12:00:00'), [DateTimeKind]::Utc)
+        $script:LoopFakeDeadline = $script:LoopFakeTime.AddMinutes($script:MaxLoopMinutes)
+        $script:LoopOutcomes = @()
+        $script:LoopIterationCalls = 0
+        $script:LoopBaselineFlags = @()
+        $script:LoopBackoffDelays = @()
+        $script:LoopLimitRunLogsCalls = 0
+        $script:AutoresearchLogRecords = @()
+        $script:PreviousLoopLogPath = Join-Path $script:LogDir 'previous-run.jsonl'
+        [System.IO.File]::WriteAllText($script:PreviousLoopLogPath, 'previous log must remain intact')
+
+        Mock Write-Json {
+            $script:AutoresearchLogRecords += [pscustomobject]@{
+                Level   = $Level
+                Message = $Message
+                Extra   = $Extra
+            }
+        }
+        Mock Assert-AutoresearchSourceCheckoutClean { }
+        Mock Invoke-IdlePolicyGate { return $true }
+        Mock Assert-AutoresearchGeneratedCodeReviewAvailable { }
+        Mock New-AutoresearchExperimentBranch {
+            return [pscustomobject]@{
+                Name       = 'autoresearch/experiment-loop-reliability'
+                BaseCommit = 'fixture-base'
+            }
+        }
+        Mock Set-WorkloadEnvironment { }
+        Mock Initialize-ResultsTsv { }
+        Mock Limit-RunLogs { $script:LoopLimitRunLogsCalls++ }
+        Mock Get-AutoresearchLoopTime { return $script:LoopFakeTime }
+        Mock Start-AutoresearchLoopSleep {
+            $script:LoopBackoffDelays += $Milliseconds
+            $script:LoopFakeTime = $script:LoopFakeTime.AddMilliseconds($Milliseconds)
+        }
+        Mock Invoke-AutoresearchIteration {
+            $script:LoopIterationCalls++
+            $script:LoopBaselineFlags += [bool]$BaselineRun
+            if ($script:LoopIterationCalls -gt $script:LoopOutcomes.Count) {
+                throw 'Fake iteration sequence exhausted.'
+            }
+            $outcome = $script:LoopOutcomes[$script:LoopIterationCalls - 1]
+            if ($outcome.AdvanceToDeadline) {
+                $script:LoopFakeTime = $script:LoopFakeDeadline
+            }
+            if ($outcome.Throw) {
+                $failure = [System.InvalidOperationException]::new('Mock iteration failure.')
+                if (-not [string]::IsNullOrWhiteSpace($outcome.Marker)) {
+                    $failure.Data[$outcome.Marker] = $true
+                }
+                throw $failure
+            }
+            return @{ Status = $outcome.Status; Commit = 'mocked' }
+        }
+    }
+
+    AfterEach {
+        if ($script:LoopCoreFixture -and (Test-Path -LiteralPath $script:LoopCoreFixture.Container -PathType Container)) {
+            Remove-Item -LiteralPath $script:LoopCoreFixture.Container -Recurse -Force
+        }
+        Set-LaunchFixtureState -State $script:LoopCorePreviousState
+    }
+
+    It 'finishes a finite all-success loop with keep and discard counted as completed experiments' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'keep'),
+            (New-AutoresearchLoopTestOutcome -Status 'discard' -AdvanceToDeadline)
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 2
+        $script:LoopBackoffDelays.Count | Should -Be 0
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'deadline-complete'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.attemptedIterations | Should -Be 2
+        $summary[0].Extra.successfulIterations | Should -Be 2
+        $summary[0].Extra.failedIterations | Should -Be 0
+        $summary[0].Extra.consecutiveFailures | Should -Be 0
+    }
+
+    It 'counts valid discards as success and resets consecutive failures after mixed outcomes' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'discard'),
+            (New-AutoresearchLoopTestOutcome -Throw),
+            (New-AutoresearchLoopTestOutcome -Status 'keep' -AdvanceToDeadline)
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 4
+        $script:LoopBackoffDelays | Should -Be @(5000, 5000)
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'deadline-complete'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.attemptedIterations | Should -Be 4
+        $summary[0].Extra.successfulIterations | Should -Be 2
+        $summary[0].Extra.failedIterations | Should -Be 2
+        $summary[0].Extra.consecutiveFailures | Should -Be 0
+    }
+
+    It 'stops an unbounded all-failure loop at the configured threshold and preserves prior results and logs' {
+        $script:MaxLoopMinutes = 0
+        $script:MaxConsecutiveIterationFailures = 3
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'crash')
+        )
+        $resultsHash = Get-AutoresearchFixtureHash -Path $script:LoopCoreFixture.ResultsPath
+        $priorLog = [System.IO.File]::ReadAllText($script:PreviousLoopLogPath)
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 4
+        $script:LoopIterationCalls | Should -Be 3
+        $script:LoopBackoffDelays | Should -Be @(5000, 10000)
+        (Get-AutoresearchFixtureHash -Path $script:LoopCoreFixture.ResultsPath) | Should -BeExactly $resultsHash
+        [System.IO.File]::ReadAllText($script:PreviousLoopLogPath) | Should -BeExactly $priorLog
+        Test-Path -LiteralPath $script:RunLogPath | Should -BeTrue
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'failure-threshold'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.attemptedIterations | Should -Be 3
+        $summary[0].Extra.successfulIterations | Should -Be 0
+        $summary[0].Extra.failedIterations | Should -Be 3
+        $summary[0].Extra.consecutiveFailures | Should -Be 3
+    }
+
+    It 'allows threshold minus one failures and resets the count on a valid discard' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'discard' -AdvanceToDeadline)
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 3
+        $script:LoopBackoffDelays | Should -Be @(5000, 10000)
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'deadline-complete'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.successfulIterations | Should -Be 1
+        $summary[0].Extra.failedIterations | Should -Be 2
+        $summary[0].Extra.consecutiveFailures | Should -Be 0
+    }
+
+    It 'returns degraded at a finite deadline when no iteration completed successfully' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'crash' -AdvanceToDeadline)
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 4
+        $script:LoopIterationCalls | Should -Be 1
+        $script:LoopBackoffDelays.Count | Should -Be 0
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'deadline-no-success'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.attemptedIterations | Should -Be 1
+        $summary[0].Extra.successfulIterations | Should -Be 0
+        $summary[0].Extra.failedIterations | Should -Be 1
+    }
+
+    It 'returns success at the deadline after a recoverable failure followed by a keep' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'crash'),
+            (New-AutoresearchLoopTestOutcome -Status 'keep' -AdvanceToDeadline)
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 2
+        $script:LoopBackoffDelays | Should -Be @(5000)
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'deadline-complete'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.successfulIterations | Should -Be 1
+        $summary[0].Extra.failedIterations | Should -Be 1
+        $summary[0].Extra.consecutiveFailures | Should -Be 0
+    }
+
+    It 'clips the exponential backoff to the deadline and caps it at sixty seconds' {
+        Get-AutoresearchLoopBackoffDelayMilliseconds -ConsecutiveFailureCount 10 | Should -Be 60000
+        $shortDeadline = $script:LoopFakeTime.AddMilliseconds(2000)
+
+        $delay = Wait-AutoresearchLoopBackoff -ConsecutiveFailureCount 5 -Deadline $shortDeadline
+
+        $delay | Should -Be 2000
+        $script:LoopBackoffDelays | Should -Be @(2000)
+        $script:LoopFakeTime | Should -Be $shortDeadline
+    }
+
+    It 'counts a failed baseline attempt toward the same failure threshold' {
+        Remove-Item -LiteralPath $script:LoopCoreFixture.ResultsPath -Force
+        $script:MaxConsecutiveIterationFailures = 1
+        $script:LoopOutcomes = @((New-AutoresearchLoopTestOutcome -Throw))
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 4
+        $script:LoopIterationCalls | Should -Be 1
+        $script:LoopBaselineFlags | Should -Be @($true)
+        @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'No baseline row in results.tsv; running baseline iteration' }).Count |
+            Should -Be 1
+        @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Autoresearch iteration #2 starting' }).Count |
+            Should -Be 0
+    }
+
+    It 'stops immediately on an uncontained process result without sleeping or retrying' {
+        $script:LoopOutcomes = @(
+            (New-AutoresearchLoopTestOutcome -Status 'uncontained-process'),
+            (New-AutoresearchLoopTestOutcome -Status 'keep')
+        )
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 3
+        $script:LoopIterationCalls | Should -Be 1
+        $script:LoopBackoffDelays.Count | Should -Be 0
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'uncontained-process'." })
+        $summary.Count | Should -Be 1
+    }
+
+    It 'records an idle-policy skip as a successful zero-attempt terminal outcome' {
+        Mock Invoke-IdlePolicyGate { return $false }
+
+        $result = Invoke-AutoresearchLoopCore
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 0
+        $summary = @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'idle-policy-skipped'." })
+        $summary.Count | Should -Be 1
+        $summary[0].Extra.attemptedIterations | Should -Be 0
+    }
+}
+
 Describe 'Invoke-AutoresearchLoop repository lock' {
     BeforeEach {
         $script:LoopLockPreviousState = Get-LaunchFixtureState
@@ -2217,6 +2540,25 @@ Describe 'Get-TaskXml' {
         $arguments | Should -Not -Match '-RunLoop'
     }
 
+    It 'uses the supplied interpreter plan for the task action' {
+        $script:SchedulerPolicy = 'Interactive'
+        $script:ScheduleFrequency = 'Daily'
+        $script:ScheduleTime = '18:00'
+        $plan = [pscustomobject]@{
+            PowerShellPath      = 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+            TaskActionArguments = '-NoProfile -File launch.ps1 -NoGui -TaskSupervisor'
+        }
+        Mock Get-TaskLauncherPlan { throw 'The supplied plan should be reused.' }
+
+        $xml = [xml](Get-TaskXml -Plan $plan)
+        $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+        $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+
+        ($xml.SelectSingleNode('//t:Actions/t:Exec/t:Command', $ns).InnerText) | Should -Be $plan.PowerShellPath
+        ($xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments', $ns).InnerText) | Should -Be $plan.TaskActionArguments
+        Should -Invoke Get-TaskLauncherPlan -Times 0 -Exactly -Scope It
+    }
+
     It 'emits interactive XML with zero idle window' {
         $script:SchedulerPolicy = 'Interactive'
         $script:ScheduleFrequency = 'Hourly'
@@ -2437,7 +2779,10 @@ Describe 'Register-LauncherTask' {
         $script:historyCount = 0
         $script:registeredTaskProbes = 0
         Mock Write-Json { }
-        Mock Get-TaskXml { return '<Task />' }
+        Mock Get-TaskXml {
+            param([psobject]$Plan)
+            return '<Task />'
+        }
         Mock Enable-TaskHistoryLog { $script:historyCount++ }
         Mock Register-ScheduledTask { $script:registerCount++ }
         Mock Unregister-ScheduledTask { $script:unregisterCount++ }
@@ -2461,6 +2806,18 @@ Describe 'Register-LauncherTask' {
         $script:unregisterCount | Should -Be 1
         $script:historyCount | Should -Be 2
     }
+
+    It 'refuses before changing an existing task when no compatible interpreter is available' {
+        Mock Get-PwshExePath {
+            throw 'No compatible PowerShell executable was found. Install PowerShell 7 (pwsh.exe) or use Windows PowerShell 5.1 (powershell.exe).'
+        }
+
+        { Register-LauncherTask } | Should -Throw -ExpectedMessage '*No compatible PowerShell executable was found*'
+        $script:unregisterCount | Should -Be 0
+        $script:registerCount | Should -Be 0
+        $script:historyCount | Should -Be 0
+        $script:registeredTaskProbes | Should -Be 0
+    }
 }
 
 Describe 'Launcher plan' {
@@ -2471,9 +2828,11 @@ Describe 'Launcher plan' {
         $script:Provider = 'ollama'
         $script:Model = 'qwen2.5-coder:latest'
         $script:MaxLoopMinutes = 0
+        $script:MaxConsecutiveIterationFailures = 3
         $script:PerRunTimeoutMinutes = 10
         Mock Get-PwshExePath { return 'C:\Program Files\PowerShell\7\pwsh.exe' }
         $plan = Get-TaskLauncherPlan
+        $plan.PowerShellPath | Should -Be 'C:\Program Files\PowerShell\7\pwsh.exe'
         $plan.InnerArgList | Should -Contain '-SchedulerPolicy'
         $plan.InnerArgList | Should -Contain 'Unattended'
         $plan.InnerArgList | Should -Contain '-RunLoop'
@@ -2484,6 +2843,99 @@ Describe 'Launcher plan' {
         $plan.WorkloadCommand | Should -Match "^'C:\\Program Files\\PowerShell\\7\\pwsh\.exe'"
         $plan.WorkloadCommand | Should -Match '-RunLoop'
         $plan.TaskLaunchStatePath | Should -Match 'autoresearch-task-launch\.json$'
+
+        $expectedCommonArgs = @(
+            '-Provider', 'ollama',
+            '-Model', 'qwen2.5-coder:latest',
+            '-SchedulerPolicy', 'Unattended',
+            '-MaxLoopMinutes', 0,
+            '-MaxConsecutiveIterationFailures', 3,
+            '-PerRunTimeoutMinutes', 10,
+            '-OllamaHost', 'http://127.0.0.1:11434'
+        )
+        $expectedInnerArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:CanonicalScript, '-NoGui', '-RunLoop') + $expectedCommonArgs
+        $expectedTaskArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:CanonicalScript, '-NoGui', '-TaskSupervisor') + $expectedCommonArgs
+        $plan.InnerArgList | Should -Be $expectedInnerArgs
+        $plan.TaskActionArgList | Should -Be $expectedTaskArgs
+    }
+
+    It 'uses the selected Windows PowerShell fallback for both task actions' {
+        $script:SchedulerPolicy = 'Interactive'
+        $script:ScheduleFrequency = 'Daily'
+        $script:ScheduleTime = '18:00'
+        $script:Provider = 'ollama'
+        $script:Model = 'qwen2.5-coder:latest'
+        $script:MaxLoopMinutes = 0
+        $script:PerRunTimeoutMinutes = 10
+        Mock Get-PwshExePath { return 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe' }
+
+        $plan = Get-TaskLauncherPlan
+
+        $plan.PowerShellPath | Should -Be 'C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe'
+        $plan.TaskActionCommand | Should -Match "^'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe'"
+        $plan.WorkloadCommand | Should -Match "^'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe'"
+    }
+}
+
+Describe 'PowerShell runtime compatibility' {
+    It 'uses the platform helper under StrictMode for command-line lookup' {
+        Mock Test-WindowsHost { return $false }
+
+        $commandLine = & {
+            Set-StrictMode -Version Latest
+            Get-CurrentProcessCommandLine
+        }
+
+        $commandLine | Should -BeNullOrEmpty
+        Should -Invoke Test-WindowsHost -Times 1 -Exactly -Scope It
+    }
+
+    It 'returns the current process command line under StrictMode on Windows' {
+        Mock Test-WindowsHost { return $true }
+        Mock Get-CimInstance {
+            return [pscustomobject]@{ CommandLine = 'powershell.exe -NoProfile -File launch.ps1' }
+        }
+
+        $commandLine = & {
+            Set-StrictMode -Version Latest
+            Get-CurrentProcessCommandLine
+        }
+
+        $commandLine | Should -Be 'powershell.exe -NoProfile -File launch.ps1'
+    }
+
+    It 'prefers an existing PowerShell 7 executable' {
+        $script:preferredInterpreterPath = Join-Path $TestDrive 'PowerShell 7\pwsh.exe'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $script:preferredInterpreterPath) -Force | Out-Null
+        New-Item -ItemType File -Path $script:preferredInterpreterPath | Out-Null
+        Mock Test-WindowsHost { return $true }
+        Mock Get-Command {
+            return [pscustomobject]@{ Source = $script:preferredInterpreterPath }
+        } -ParameterFilter { $Name -eq 'pwsh.exe' }
+
+        Get-PwshExePath | Should -Be $script:preferredInterpreterPath
+    }
+
+    It 'falls back to an existing Windows PowerShell executable when pwsh is absent' {
+        $script:fallbackInterpreterPath = Join-Path $TestDrive 'Windows PowerShell\powershell.exe'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $script:fallbackInterpreterPath) -Force | Out-Null
+        New-Item -ItemType File -Path $script:fallbackInterpreterPath | Out-Null
+        Mock Test-WindowsHost { return $true }
+        Mock Get-Command { return $null } -ParameterFilter { $Name -in @('pwsh.exe', 'pwsh') }
+        Mock Get-Command {
+            return [pscustomobject]@{ Source = $script:fallbackInterpreterPath }
+        } -ParameterFilter { $Name -eq 'powershell.exe' }
+
+        Get-PwshExePath | Should -Be $script:fallbackInterpreterPath
+    }
+
+    It 'reports an actionable error when no compatible executable exists' {
+        Mock Test-WindowsHost { return $true }
+        Mock Get-Command { return $null } -ParameterFilter {
+            $Name -in @('pwsh.exe', 'pwsh', 'powershell.exe', 'powershell')
+        }
+
+        { Get-PwshExePath } | Should -Throw -ExpectedMessage '*Install PowerShell 7 (pwsh.exe) or use Windows PowerShell 5.1 (powershell.exe)*'
     }
 }
 
@@ -2838,6 +3290,7 @@ Describe 'Task launch supervisor' {
         $script:OllamaHost = 'http://127.0.0.1:11434'
         $script:SchedulerPolicy = 'IdleOnly'
         $script:MaxLoopMinutes = 0
+        $script:MaxConsecutiveIterationFailures = 5
         $script:PerRunTimeoutMinutes = 10
         $script:NoAiEdit = $false
         Mock Write-Json { }
@@ -3225,15 +3678,101 @@ if (-not (Get-Command Invoke-Bootstrap -ErrorAction SilentlyContinue)) {
         $result.ExitCode | Should -Not -Be 0
         (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
         (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
-        ($result.Output -join "`n") | Should -Match '(?s)origin\s+could not be verified as the expected repository'
+        $originOutput = $result.Output -join "`n"
+        $originOutput | Should -Match 'origin could not be verified'
+        $originOutput | Should -Match 'observed\s+1:'
+        $originOutput | Should -Match 'https://wrong.invalid/other.git'
         $gitLog = Get-Content -LiteralPath $fakeGitLog -Raw
         $gitLog | Should -Match 'remote get-url --all origin'
-        $gitLog | Should -Not -Match '\b(pull|clone)\b'
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull\b' }).Count | Should -Be 0
         Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
     }
 
-    It 'updates a clean canonical checkout with the expected origin and forwards arguments once' {
+    It 'refuses a canonical path whose Git top-level is a different repository root' {
+        $root = New-TestRoot 'wrong-top-level-bootstrap-refusal'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $repositoryRoot = Join-Path $root 'repository'
+        $canonicalRepo = Join-Path $repositoryRoot 'nested'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        New-TemporaryGitRepository -Root $repositoryRoot -OriginUrl $repoUrl | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $canonicalRepo 'scripts') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $canonicalRepo 'scripts\launch.ps1') -Value '# nested launcher fixture' -Encoding ASCII
+        & git.exe -C $repositoryRoot add -- nested/scripts/launch.ps1
+        if ($LASTEXITCODE -ne 0) { throw 'Could not stage the nested canonical-path fixture.' }
+        & git.exe -C $repositoryRoot -c user.name=BootstrapTest -c user.email=bootstrap@example.invalid commit --quiet -m nested-launcher
+        if ($LASTEXITCODE -ne 0) { throw 'Could not commit the nested canonical-path fixture.' }
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+
+        $result.ExitCode | Should -Not -Be 0
+        $output = $result.Output -join "`n"
+        $output | Should -Match 'Git top-level'
+        $normalizedOutput = ($output -replace '\s+', '').Replace('\', '/')
+        $expectedPathText = ("Expected '$canonicalRepo'" -replace '\s+', '').Replace('\', '/')
+        $observedPathText = ("observed '$repositoryRoot'" -replace '\s+', '').Replace('\', '/')
+        $normalizedOutput | Should -Match ([regex]::Escape($expectedPathText))
+        $normalizedOutput | Should -Match ([regex]::Escape($observedPathText))
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull\b' }).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+    }
+
+    It 'refuses an unexpected current branch before pull and launch' {
+        $root = New-TestRoot 'wrong-branch-bootstrap-refusal'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $canonicalRepo = Join-Path $root 'canonical'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl | Out-Null
+        & git.exe -C $canonicalRepo branch -M feature/issue-10-test
+        if ($LASTEXITCODE -ne 0) { throw 'Could not set the unexpected-branch fixture.' }
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+
+        $result.ExitCode | Should -Not -Be 0
+        $output = $result.Output -join "`n"
+        $output | Should -Match 'current\s+branch\s+does\s+not\s+match'
+        $output | Should -Match "Expected 'main'"
+        $output | Should -Match 'feature/issue-10-test'
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull\b' }).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+    }
+
+    It 'refuses a detached canonical checkout before pull and launch' {
+        $root = New-TestRoot 'detached-bootstrap-refusal'
+        $fakeGitLog = Join-Path $root 'git-invocations.log'
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
+        $canonicalRepo = Join-Path $root 'canonical'
+        $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
+        New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl | Out-Null
+        & git.exe -C $canonicalRepo checkout --detach --quiet HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'Could not detach the canonical checkout fixture.' }
+        $checkout = Join-Path $root 'checkout'
+        New-Item -ItemType Directory -Path $checkout -Force | Out-Null
+        $scriptCopy = Join-Path $checkout 'launch.ps1'
+        Copy-Item -LiteralPath $scriptPath -Destination $scriptCopy
+
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+
+        $result.ExitCode | Should -Not -Be 0
+        $output = $result.Output -join "`n"
+        $output | Should -Match 'current\s+branch\s+does\s+not\s+match'
+        $output | Should -Match "Expected 'main'"
+        $output | Should -Match "'HEAD'"
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull\b' }).Count | Should -Be 0
+        Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
+    }
+
+    It 'updates a clean expected checkout and forwards arguments and the child exit code once' {
         $root = New-TestRoot 'clean-bootstrap-update'
         $fakeGitLog = Join-Path $root 'git-invocations.log'
         $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
@@ -3247,12 +3786,14 @@ if (-not (Get-Command Invoke-Bootstrap -ErrorAction SilentlyContinue)) {
 
         $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
         $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
-        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl -ForwardArgs @('-NoGui', '--custom', 'value with spaces')
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl -ChildExitCode 37 -ForwardArgs @('-NoGui', '--custom', 'value with spaces')
 
-        $result.ExitCode | Should -Be 0
+        $result.ExitCode | Should -Be 37
         (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
         (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
-        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only$' }) | Should -HaveCount 1
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only origin main$' }) | Should -HaveCount 1
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match 'rev-parse --show-toplevel$' }) | Should -HaveCount 1
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match 'rev-parse --abbrev-ref HEAD$' }) | Should -HaveCount 1
         @((Get-Content -LiteralPath (Join-Path $root 'start-process.log'))).Count | Should -Be 1
         (Get-Content -LiteralPath (Join-Path $root 'start-process.log') -Raw) | Should -Match '-NoGui\|--custom\|value with spaces'
         Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
@@ -3261,7 +3802,7 @@ if (-not (Get-Command Invoke-Bootstrap -ErrorAction SilentlyContinue)) {
     It 'keeps the clean canonical tree when the mocked fast-forward update fails' {
         $root = New-TestRoot 'failed-clean-bootstrap-update'
         $fakeGitLog = Join-Path $root 'git-invocations.log'
-        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog -PullExitCode 82
+        $fakeGitBin = New-FakeGitCommand -Root $root -LogPath $fakeGitLog
         $canonicalRepo = Join-Path $root 'canonical'
         $repoUrl = 'https://example.invalid/autoresearch-win-rtx-scheduled.git'
         $repoFiles = New-TemporaryGitRepository -Root $canonicalRepo -OriginUrl $repoUrl
@@ -3272,12 +3813,15 @@ if (-not (Get-Command Invoke-Bootstrap -ErrorAction SilentlyContinue)) {
 
         $trackedBefore = Get-Content -LiteralPath $repoFiles.TrackedPath -Raw
         $ignoredBefore = Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw
-        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl
+        $result = Invoke-BootstrapTestFixture -ScriptPath $scriptCopy -CanonicalRepo $canonicalRepo -GitBin $fakeGitBin -Root $root -RepoUrl $repoUrl -PullExitCode 82
 
         $result.ExitCode | Should -Not -Be 0
+        $output = $result.Output -join [Environment]::NewLine
+        $output | Should -Match 'git pull --ff-only failed'
+        $output | Should -Match 'exit 82'
         (Get-Content -LiteralPath $repoFiles.TrackedPath -Raw) | Should -BeExactly $trackedBefore
         (Get-Content -LiteralPath $repoFiles.IgnoredPath -Raw) | Should -BeExactly $ignoredBefore
-        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only$' }) | Should -HaveCount 1
+        @((Get-Content -LiteralPath $fakeGitLog) | Where-Object { $_ -match '\bpull --ff-only origin main$' }) | Should -HaveCount 1
         Test-Path -LiteralPath (Join-Path $root 'start-process.log') | Should -BeFalse
         Test-Path -LiteralPath (Join-Path $root 'remove-item.log') | Should -BeFalse
     }

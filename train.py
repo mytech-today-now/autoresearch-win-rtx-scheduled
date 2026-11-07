@@ -1226,6 +1226,23 @@ def _configure_step_kernels(runtime):
     USE_COMPILE = False
 
 
+def _checkpoint_resume_reason(resume_artifact):
+    if resume_artifact is None:
+        return "cold start; no --resume-from path was supplied."
+    return (
+        f"resumed from {resume_artifact['source_path']} because the checkpoint matched "
+        "the current dataset, model shape, and batch settings."
+    )
+
+
+def _checkpoint_save_reason(last_saved_at, now):
+    if last_saved_at is None:
+        return "initial"
+    if (now - last_saved_at) >= CHECKPOINT_SAVE_INTERVAL_SECONDS:
+        return "periodic"
+    return None
+
+
 def _run_training_once(
     runtime,
     tokenizer,
@@ -1330,13 +1347,10 @@ def _run_training_once(
         device_batch_size=device_batch_size,
         grad_accum_steps=grad_accum_steps,
     )
+    resume_reason = _checkpoint_resume_reason(resume_artifact)
     if resume_artifact is not None:
         resume_metadata = resume_artifact["metadata"]
         resume_signature = resume_metadata.get("compatibility_signature") or {}
-        resume_reason = (
-            f"resumed from {resume_artifact['source_path']} because the checkpoint matched "
-            "the current dataset, model shape, and batch settings."
-        )
         model_training_issues = _checkpoint_signature_issues(
             expected_model_training_signature,
             resume_signature.get("model_training", {}),
@@ -1363,8 +1377,6 @@ def _run_training_once(
             raise CheckpointCompatibilityError(
                 _checkpoint_compatibility_message(full_signature_issues)
             )
-    else:
-        resume_reason = "cold start; no --resume-from path was supplied."
 
     checkpoint_context["resume_reason"] = resume_reason
     checkpoint_context["run_id"] = None
@@ -1493,11 +1505,7 @@ def _run_training_once(
             step += 1
             minibatches_seen += grad_accum_steps
 
-            save_reason = None
-            if last_checkpoint_save_time is None:
-                save_reason = "initial"
-            elif (time.time() - last_checkpoint_save_time) >= CHECKPOINT_SAVE_INTERVAL_SECONDS:
-                save_reason = "periodic"
+            save_reason = _checkpoint_save_reason(last_checkpoint_save_time, time.time())
             if max_steps is not None and step >= max_steps:
                 save_reason = "final"
             if total_training_time >= target_training_seconds:

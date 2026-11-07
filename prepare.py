@@ -16,6 +16,7 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import time
 
 import pyarrow.parquet as pq
@@ -493,7 +494,17 @@ def _verify_tinystories_parquet(path, dataset_name):
 def _download_url_with_retries(url, temp_path, description):
     backoff_seconds = DATA_DOWNLOAD_INITIAL_BACKOFF_SECONDS
     for attempt in range(1, DATA_DOWNLOAD_MAX_ATTEMPTS + 1):
-        _remove_path(temp_path)
+        try:
+            # Each caller owns this exclusive temporary path. Truncate it for
+            # the next attempt without unlinking a path another caller could use.
+            with open(temp_path, "wb"):
+                pass
+        except OSError as exc:
+            _remove_path(temp_path)
+            raise DatasetPlacementError(
+                f"File placement error preparing {description} at {temp_path}: {exc}"
+            ) from exc
+
         try:
             with requests.get(
                 url,
@@ -530,6 +541,8 @@ def _download_url_with_retries(url, temp_path, description):
                         ):
                             if chunk:
                                 f.write(chunk)
+                except requests.RequestException:
+                    raise
                 except OSError as exc:
                     _remove_path(temp_path)
                     raise DatasetPlacementError(
@@ -537,7 +550,6 @@ def _download_url_with_retries(url, temp_path, description):
                     ) from exc
             return
         except requests.RequestException as exc:
-            _remove_path(temp_path)
             if attempt < DATA_DOWNLOAD_MAX_ATTEMPTS:
                 print(
                     f"Data: transport error while downloading {description} "
@@ -563,6 +575,31 @@ def _promote_verified_download(temp_path, filepath, description):
         raise DatasetPlacementError(
             f"File placement error moving verified {description} into {filepath}: {exc}"
         ) from exc
+
+
+def _create_tinystories_download_temp(data_dir, filename):
+    temp_fd = None
+    temp_path = None
+    try:
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=f".{filename}.",
+            suffix=".tmp",
+            dir=data_dir,
+        )
+        os.close(temp_fd)
+        temp_fd = None
+    except OSError as exc:
+        if temp_fd is not None:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            _remove_path(temp_path)
+        raise DatasetPlacementError(
+            f"File placement error creating temporary download for {filename} in {data_dir}: {exc}"
+        ) from exc
+    return temp_path
 
 
 def _resolve_tiny_parquet_for_read(dataset_name=None):
@@ -602,7 +639,6 @@ def _download_tinystories_file(dataset_name):
 
     filename = config["filename"]
     filepath = os.path.join(data_dir, filename)
-    temp_path = filepath + ".tmp"
 
     if os.path.exists(filepath):
         try:
@@ -643,13 +679,13 @@ def _download_tinystories_file(dataset_name):
 
     url = config["url"]
     print(f"Data: downloading {filename}...")
-    _download_url_with_retries(url, temp_path, filename)
+    temp_path = _create_tinystories_download_temp(data_dir, filename)
     try:
+        _download_url_with_retries(url, temp_path, filename)
         _verify_tinystories_parquet(temp_path, dataset_name)
-    except DatasetIntegrityError:
+        _promote_verified_download(temp_path, filepath, filename)
+    finally:
         _remove_path(temp_path)
-        raise
-    _promote_verified_download(temp_path, filepath, filename)
     print(f"Data: downloaded {filename} to {filepath}")
 
 

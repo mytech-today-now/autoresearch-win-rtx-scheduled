@@ -40,6 +40,9 @@ function script:Get-LaunchFixtureState {
         'LogRetentionDays',
         'TaskLaunchStatePath',
         'LauncherAclStatus',
+        'LauncherAclFailure',
+        'DefaultsPath',
+        'LegacyDefaultsPath',
         'RepoRoot',
         'CanonicalScript',
         'Provider',
@@ -98,6 +101,10 @@ function script:Initialize-LaunchFixtureState {
     $script:LogRetentionDays = 14
     $script:TaskLaunchStatePath = Join-Path $logDir 'autoresearch-task-launch.json'
     $script:LauncherAclStatus = @{}
+    $script:LauncherAclFailure = $null
+    $defaultsRoot = Join-Path $env:TEMP ('autoresearch-launch-config-' + [guid]::NewGuid().ToString('N'))
+    $script:DefaultsPath = Join-Path $defaultsRoot 'myTech.Today\autoresearch-win-rtx-scheduled\launch.json'
+    $script:LegacyDefaultsPath = Join-Path (Join-Path $defaultsRoot 'canonical\scripts') 'launch.json'
     $script:RepoRoot = Split-Path -Parent $PSScriptRoot
     $script:CanonicalScript = (Resolve-Path -LiteralPath $LaunchScriptPath).Path
     $script:Provider = 'ollama'
@@ -187,6 +194,7 @@ BeforeAll {
         'Get-RunLogRetentionPlan',
         'Limit-RunLogs',
         'Add-ResultsTsvRow',
+        'ConvertFrom-InvariantMetric',
         'Assert-AutoresearchSourceCheckoutClean',
         'Get-CurrentBestValBpb',
         'Initialize-ResultsTsv',
@@ -1349,6 +1357,150 @@ Describe 'Provider credential scope and generated-code review' {
     }
 }
 
+Describe 'Invariant autoresearch metric parsing and TSV output' -Tag 'Issue18' {
+    BeforeEach {
+        $script:Issue18TestRoot = Join-Path $TestDrive ('issue18-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:Issue18TestRoot -Force | Out-Null
+        $script:Issue18OriginalCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+        Mock Write-Json { }
+    }
+
+    AfterEach {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = $script:Issue18OriginalCulture
+    }
+
+    It 'parses the same dot-decimal logs and baseline rows, makes the same decisions, and writes invariant TSV fields' {
+        $runLogPath = Join-Path $script:Issue18TestRoot 'run.log'
+        $baselinePath = Join-Path $script:Issue18TestRoot 'baseline.tsv'
+        $baseline = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.200000`t2.0`tkeep`tbaseline`r`nfailed`t0`t0`tcrash`tno score`r`n"
+        [System.IO.File]::WriteAllText($baselinePath, $baseline, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText(
+            $runLogPath,
+            "val_bpb:          0.250000`r`npeak_vram_mb:     1536.0`r`n",
+            [System.Text.Encoding]::UTF8
+        )
+
+        $observations = @()
+        foreach ($cultureName in @('en-US', 'fr-FR')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+
+            $metrics = Read-RunLogMetrics -Path $runLogPath
+            $best = Get-CurrentBestValBpb -Path $baselinePath
+            $statusForWorseScore = if ($metrics.ValBpb -lt $best) { 'keep' } else { 'discard' }
+            $statusForImprovement = if (0.15 -lt $best) { 'keep' } else { 'discard' }
+            $outputPath = Join-Path $script:Issue18TestRoot ('{0}.tsv' -f $cultureName)
+            Add-ResultsTsvRow -Path $outputPath -Commit 'candidate' -ValBpb 0.15 `
+                -MemoryGb ($metrics.PeakVramMb / 1024.0) -Status $statusForImprovement `
+                -Description "candidate`trow`nfixture"
+
+            $outputLines = [System.IO.File]::ReadAllLines($outputPath, [System.Text.Encoding]::UTF8)
+            $columns = $outputLines[1].Split([char]9)
+            $observations += [pscustomobject]@{
+                Culture = $cultureName
+                ValBpb = $metrics.ValBpb
+                PeakVramMb = $metrics.PeakVramMb
+                Baseline = $best
+                WorseStatus = $statusForWorseScore
+                ImprovementStatus = $statusForImprovement
+                Header = $outputLines[0]
+                ValBpbField = $columns[1]
+                MemoryGbField = $columns[2]
+                StatusField = $columns[3]
+                DescriptionField = $columns[4]
+            }
+        }
+
+        $observations | Should -HaveCount 2
+        foreach ($observation in $observations) {
+            $observation.ValBpb | Should -Be 0.25
+            $observation.PeakVramMb | Should -Be 1536.0
+            $observation.Baseline | Should -Be 0.2
+            $observation.WorseStatus | Should -BeExactly 'discard'
+            $observation.ImprovementStatus | Should -BeExactly 'keep'
+            $observation.Header | Should -BeExactly "commit`tval_bpb`tmemory_gb`tstatus`tdescription"
+            $observation.ValBpbField | Should -BeExactly '0.150000'
+            $observation.MemoryGbField | Should -BeExactly '1.5'
+            $observation.StatusField | Should -BeExactly 'keep'
+            $observation.DescriptionField | Should -BeExactly 'candidate row fixture'
+        }
+        $observations[0].ValBpbField | Should -BeExactly $observations[1].ValBpbField
+        $observations[0].MemoryGbField | Should -BeExactly $observations[1].MemoryGbField
+        $observations[0].WorseStatus | Should -BeExactly $observations[1].WorseStatus
+        $observations[0].ImprovementStatus | Should -BeExactly $observations[1].ImprovementStatus
+    }
+
+    It 'rejects missing, malformed, locale-specific, duplicate, and non-finite run-log metrics' {
+        $runLogPath = Join-Path $script:Issue18TestRoot 'invalid-run.log'
+        $cases = @(
+            @{ Name = 'missing val_bpb'; Text = "peak_vram_mb: 1024.0`r`n"; Pattern = '*missing the val_bpb metric*' },
+            @{ Name = 'missing peak memory'; Text = "val_bpb: 0.25`r`n"; Pattern = '*missing the peak_vram_mb metric*' },
+            @{ Name = 'malformed score'; Text = "val_bpb: 0.25junk`r`npeak_vram_mb: 1024.0`r`n"; Pattern = '*run log val_bpb*' },
+            @{ Name = 'comma decimal score'; Text = "val_bpb: 0,25`r`npeak_vram_mb: 1024.0`r`n"; Pattern = '*run log val_bpb*' },
+            @{ Name = 'NaN score'; Text = "val_bpb: NaN`r`npeak_vram_mb: 1024.0`r`n"; Pattern = '*run log val_bpb*' },
+            @{ Name = 'infinite score'; Text = "val_bpb: Infinity`r`npeak_vram_mb: 1024.0`r`n"; Pattern = '*run log val_bpb*' },
+            @{ Name = 'negative infinite memory'; Text = "val_bpb: 0.25`r`npeak_vram_mb: -Infinity`r`n"; Pattern = '*run log peak_vram_mb*' },
+            @{ Name = 'duplicate score'; Text = "val_bpb: 0.25`r`nval_bpb: 0.20`r`npeak_vram_mb: 1024.0`r`n"; Pattern = '*more than one val_bpb metric*' }
+        )
+
+        foreach ($cultureName in @('en-US', 'fr-FR')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+            foreach ($case in $cases) {
+                [System.IO.File]::WriteAllText($runLogPath, $case.Text, [System.Text.Encoding]::UTF8)
+                { Read-RunLogMetrics -Path $runLogPath } | Should -Throw -ExpectedMessage $case.Pattern
+            }
+            { Read-RunLogMetrics -Path (Join-Path $script:Issue18TestRoot 'missing.log') } |
+                Should -Throw '*does not exist*'
+        }
+    }
+
+    It 'rejects invalid TSV headers, column counts, metrics, and scored baseline values' {
+        $resultsPath = Join-Path $script:Issue18TestRoot 'invalid.tsv'
+        $cases = @(
+            @{ Name = 'missing header'; Text = ""; Pattern = '*Invalid results.tsv header*' },
+            @{ Name = 'wrong header order'; Text = "commit`tmemory_gb`tval_bpb`tstatus`tdescription`r`n"; Pattern = '*Invalid results.tsv header*' },
+            @{ Name = 'missing column'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.2`t1.0`tkeep`r`n"; Pattern = '*expected 5 columns*' },
+            @{ Name = 'extra column'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.2`t1.0`tkeep`tbaseline`textra`r`n"; Pattern = '*expected 5 columns*' },
+            @{ Name = 'empty score'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t`t1.0`tkeep`tbaseline`r`n"; Pattern = '*results.tsv val_bpb*' },
+            @{ Name = 'malformed score'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`tbad`t1.0`tkeep`tbaseline`r`n"; Pattern = '*results.tsv val_bpb*' },
+            @{ Name = 'comma decimal score'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0,2`t1.0`tkeep`tbaseline`r`n"; Pattern = '*results.tsv val_bpb*' },
+            @{ Name = 'NaN baseline'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`tNaN`t1.0`tkeep`tbaseline`r`n"; Pattern = '*results.tsv val_bpb*' },
+            @{ Name = 'infinite memory'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.2`tInfinity`tkeep`tbaseline`r`n"; Pattern = '*results.tsv memory_gb*' },
+            @{ Name = 'negative crash metric'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t-0.1`t0`tcrash`tinvalid`r`n"; Pattern = '*value must not be negative*' },
+            @{ Name = 'zero score baseline'; Text = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0`t1.0`tkeep`tbaseline`r`n"; Pattern = '*scored rows must have a positive value*' }
+        )
+
+        foreach ($cultureName in @('en-US', 'fr-FR')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+            foreach ($case in $cases) {
+                [System.IO.File]::WriteAllText($resultsPath, $case.Text, [System.Text.Encoding]::UTF8)
+                { Get-CurrentBestValBpb -Path $resultsPath } | Should -Throw -ExpectedMessage $case.Pattern
+            }
+        }
+    }
+
+    It 'rejects non-finite values before writing any TSV row' {
+        $resultsPath = Join-Path $script:Issue18TestRoot 'finite.tsv'
+        $header = "commit`tval_bpb`tmemory_gb`tstatus`tdescription"
+        [System.IO.File]::WriteAllText($resultsPath, $header, [System.Text.Encoding]::UTF8)
+        $before = [System.IO.File]::ReadAllText($resultsPath, [System.Text.Encoding]::UTF8)
+
+        foreach ($cultureName in @('en-US', 'fr-FR')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+            foreach ($value in @([double]::NaN, [double]::PositiveInfinity, [double]::NegativeInfinity)) {
+                { Add-ResultsTsvRow -Path $resultsPath -Commit 'candidate' -ValBpb $value `
+                    -MemoryGb 1.0 -Status 'crash' -Description 'invalid score' } |
+                    Should -Throw '*non-finite val_bpb*'
+                [System.IO.File]::ReadAllText($resultsPath, [System.Text.Encoding]::UTF8) | Should -BeExactly $before
+            }
+
+            { Add-ResultsTsvRow -Path $resultsPath -Commit 'candidate' -ValBpb 0.25 `
+                -MemoryGb ([double]::PositiveInfinity) -Status 'keep' -Description 'invalid memory' } |
+                Should -Throw '*invalid memory_gb*'
+            [System.IO.File]::ReadAllText($resultsPath, [System.Text.Encoding]::UTF8) | Should -BeExactly $before
+        }
+    }
+}
+
 Describe 'Autoresearch experiment worktree transaction' {
     BeforeEach {
         $script:IterationSavedProviderEnvironment = @{}
@@ -1603,6 +1755,42 @@ Describe 'Autoresearch experiment worktree transaction' {
     AfterEach {
         foreach ($name in $script:IterationSavedProviderEnvironment.Keys) {
             [Environment]::SetEnvironmentVariable($name, $script:IterationSavedProviderEnvironment[$name], 'Process')
+        }
+    }
+
+    It 'makes invariant keep and discard decisions from dot-decimal metrics under en-US and fr-FR' -Tag 'Issue18' {
+        $thread = [System.Threading.Thread]::CurrentThread
+        $originalCulture = $thread.CurrentCulture
+        $scenarios = @(
+            @{ Name = 'improvement'; ScoreText = '0.15'; Score = 0.15; Status = 'keep'; Best = 0.15; TsvScore = '0.150000' },
+            @{ Name = 'worse-score'; ScoreText = '0.25'; Score = 0.25; Status = 'discard'; Best = 0.2; TsvScore = '0.250000' }
+        )
+
+        try {
+            foreach ($cultureName in @('en-US', 'fr-FR')) {
+                $thread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo($cultureName)
+                foreach ($scenario in $scenarios) {
+                    $script:FakeTrainingScore = $scenario.ScoreText
+                    $fixture = New-AutoresearchGitFixture -Name ('issue18-{0}-{1}' -f $cultureName, $scenario.Name)
+                    $baseline = "commit`tval_bpb`tmemory_gb`tstatus`tdescription`r`nbase`t0.200000`t2.0`tkeep`tbaseline`r`n"
+                    [System.IO.File]::WriteAllText($fixture.ResultsPath, $baseline, [System.Text.Encoding]::ASCII)
+
+                    $result = Invoke-AutoresearchIteration -RepoRootPath $fixture.Root `
+                        -ResultsPath $fixture.ResultsPath -PerRunTimeoutMin 1 -SkipAiEdit
+
+                    $result.ValBpb | Should -Be $scenario.Score
+                    $result.Status | Should -BeExactly $scenario.Status
+                    $resultRows = [System.IO.File]::ReadAllLines($fixture.ResultsPath, [System.Text.Encoding]::UTF8)
+                    $resultRows[0] | Should -BeExactly "commit`tval_bpb`tmemory_gb`tstatus`tdescription"
+                    $columns = $resultRows[-1].Split([char]9)
+                    $columns[1] | Should -BeExactly $scenario.TsvScore
+                    $columns[2] | Should -BeExactly '1.0'
+                    $columns[3] | Should -BeExactly $scenario.Status
+                    (Get-CurrentBestValBpb -Path $fixture.ResultsPath) | Should -Be $scenario.Best
+                }
+            }
+        } finally {
+            $thread.CurrentCulture = $originalCulture
         }
     }
 
@@ -2942,9 +3130,15 @@ Describe 'PowerShell runtime compatibility' {
 Describe 'Launcher ACL hardening' {
     BeforeEach {
         $script:LauncherAclStatus = @{}
+        $script:LauncherAclFailure = $null
     }
 
-    It 'creates log and task-state directories with explicit readable ACLs' {
+    AfterEach {
+        $script:LauncherAclFailure = $null
+        $script:LauncherAclStatus = @{}
+    }
+
+    It 'creates log, task-state, and per-user configuration directories with explicit readable ACLs' {
         if (-not (Test-WindowsHost)) {
             Set-ItResult -Skipped -Because 'The launcher ACL policy is Windows-specific.'
             return
@@ -2955,12 +3149,36 @@ Describe 'Launcher ACL hardening' {
         $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
         $stateDirectory = Join-Path $root 'task-state'
         $script:TaskLaunchStatePath = Join-Path $stateDirectory 'autoresearch-task-launch.json'
+        $configDirectory = Join-Path $root 'per-user-config'
+        $script:DefaultsPath = Join-Path $configDirectory 'launch.json'
+        $script:LegacyDefaultsPath = Join-Path $root 'scripts\launch.json'
+
+        Mock Test-WindowsHost { return $true }
+        $script:hardenedAclFixture = [System.Security.AccessControl.DirectorySecurity]::new()
+        $fixturePrincipals = @(Get-LauncherAclPrincipals)
+        $script:hardenedAclFixture.SetOwner($fixturePrincipals[0])
+        $script:hardenedAclFixture.SetAccessRuleProtection($true, $false)
+        $fixtureInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        foreach ($principal in $fixturePrincipals) {
+            $fixtureRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                $principal,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                $fixtureInheritance,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+            $script:hardenedAclFixture.AddAccessRule($fixtureRule)
+        }
+        Mock Get-Acl { return $script:hardenedAclFixture }
+        Mock Set-Acl { throw 'The hardened ACL fixture must not write to the file system.' }
 
         Initialize-LauncherStorage
 
-        foreach ($directory in @($script:LogDir, $stateDirectory)) {
+        foreach ($directory in @($script:LogDir, $stateDirectory, $configDirectory)) {
             $verification = Test-LauncherDirectoryAcl -Path $directory
             $verification.IsHardened | Should -BeTrue
+            $verification.Status | Should -Be 'Verified'
             $verification.InheritanceLocked | Should -BeTrue
             $verification.MissingPrincipals | Should -HaveCount 0
             $verification.UnexpectedRules | Should -HaveCount 0
@@ -2976,9 +3194,10 @@ Describe 'Launcher ACL hardening' {
                 $readRules.Count | Should -BeGreaterThan 0
             }
         }
+        Should -Invoke Set-Acl -Times 0 -Exactly -Scope It
     }
 
-    It 'emits a visible warning and preserves fallback behavior when hardening fails' {
+    It 'reports a refusal with an actionable repair step when Windows ACLs are unavailable' {
         $root = New-TestRoot 'launcher-acl-warning'
         $script:aclWarnings = @()
         Mock Test-WindowsHost { return $false }
@@ -2990,9 +3209,252 @@ Describe 'Launcher ACL hardening' {
         $result = Set-LauncherDirectoryAcl -Path (Join-Path $root 'logs') -Purpose 'launcher log root'
 
         $result.IsHardened | Should -BeFalse
+        $result.Status | Should -Be 'Refused'
+        $result.FailureOperation | Should -Be 'Windows ACL verification'
         $script:aclWarnings | Should -HaveCount 1
-        $script:aclWarnings[0] | Should -Match 'ACL hardening failed'
-        $script:aclWarnings[0] | Should -Match 'may be readable by other accounts'
+        $script:aclWarnings[0] | Should -Match 'Refusing launcher storage'
+        $script:aclWarnings[0] | Should -Match ([regex]::Escape($result.Path))
+        $script:aclWarnings[0] | Should -Match 'Repair step:'
+        $script:aclWarnings[0] | Should -Not -Match 'will continue'
+    }
+
+    It 'classifies inherited broad access as degraded' {
+        Mock Test-WindowsHost { return $true }
+        $script:aclTestPrincipals = @(
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-5-21-111-222-333-1001'),
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+            [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        )
+        $everyone = [System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+        $broadRule = [pscustomobject]@{
+            IdentityReference  = $everyone
+            FileSystemRights   = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType  = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited        = $true
+        }
+        $script:aclFixture = [pscustomobject]@{
+            Access = @($broadRule)
+            AreAccessRulesProtected = $false
+            Owner = $script:aclTestPrincipals[0]
+        }
+        $script:aclFixture | Add-Member -MemberType ScriptMethod -Name GetOwner -Value {
+            param($TargetType)
+            return $this.Owner
+        }
+        Mock Get-LauncherAclPrincipals { return $script:aclTestPrincipals }
+        Mock Get-Acl { return $script:aclFixture }
+
+        $result = Test-LauncherDirectoryAcl -Path (New-TestRoot 'launcher-acl-inherited')
+
+        $result.IsHardened | Should -BeFalse
+        $result.Status | Should -Be 'Degraded'
+        $result.InheritanceLocked | Should -BeFalse
+        $result.UnexpectedRules | Should -Contain 'S-1-1-0:Allow:FullControl'
+    }
+
+    It 'refuses initialization, state writes, and task registration after Set-Acl denial' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'The Set-Acl denial path uses Windows ACL types on temporary fixture directories.'
+            return
+        }
+
+        $root = New-TestRoot 'launcher-acl-denied'
+        $script:LogDir = Join-Path $root 'logs'
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $stateDirectory = Join-Path $root 'task-state'
+        $script:TaskLaunchStatePath = Join-Path $stateDirectory 'autoresearch-task-launch.json'
+        $script:DefaultsPath = Join-Path $root 'config\launch.json'
+        $script:LegacyDefaultsPath = Join-Path $root 'scripts\launch.json'
+        New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+        $sentinelPath = Join-Path $stateDirectory 'existing.json'
+        Set-Content -LiteralPath $sentinelPath -Value 'preserve this state' -Encoding UTF8
+        $sentinelBefore = Get-Content -LiteralPath $sentinelPath -Raw
+        $script:taskStateDirectoryFixture = $stateDirectory
+        $script:protectedWriteCount = 0
+        $script:taskRegistrationCount = 0
+
+        Mock Test-WindowsHost { return $true }
+        Mock Test-LauncherDirectoryAcl {
+            if ($Path -eq $script:taskStateDirectoryFixture) {
+                return [pscustomobject]@{
+                    Path = $Path; IsHardened = $false; Status = 'Degraded'
+                    FailureOperation = 'ACL policy verification'; Reason = 'Inherited broad access remains.'
+                }
+            }
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $true; Status = 'Verified'
+                FailureOperation = $null; Reason = $null
+            }
+        }
+        Mock Set-Acl { throw [System.UnauthorizedAccessException]::new('Access denied by fixture.') }
+        Mock Write-Json { $script:protectedWriteCount++ }
+        Mock Add-Content { $script:protectedWriteCount++ }
+        Mock Set-Content { $script:protectedWriteCount++ }
+        Mock Register-ScheduledTask { $script:taskRegistrationCount++ }
+
+        { Initialize-LauncherStorage } | Should -Throw -ExpectedMessage "*'$stateDirectory'*Set-Acl*Repair step:*"
+        $script:LauncherAclFailure.Data['LauncherAclStatus'] | Should -Be 'Refused'
+        { Write-TaskLaunchState -State @{ status = 'starting'; parentPid = 1234 } } |
+            Should -Throw -ExpectedMessage "*'$stateDirectory'*Set-Acl*Repair step:*"
+        { Register-LauncherTask } | Should -Throw -ExpectedMessage "*'$stateDirectory'*Set-Acl*Repair step:*"
+
+        $script:protectedWriteCount | Should -Be 0
+        $script:taskRegistrationCount | Should -Be 0
+        Get-Content -LiteralPath $sentinelPath -Raw | Should -Be $sentinelBefore
+        Should -Invoke Register-ScheduledTask -Times 0 -Exactly -Scope It
+        Should -Invoke Write-Json -Times 0 -Exactly -Scope It
+        Should -Invoke Add-Content -Times 0 -Exactly -Scope It
+        Should -Invoke Set-Content -Times 0 -Exactly -Scope It
+    }
+
+    It 'reports a mocked Set-Acl denial as refused without changing the fixture ACL' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'Set-Acl denial coverage uses Windows ACL types on a temporary fixture directory.'
+            return
+        }
+
+        $path = New-TestRoot 'launcher-acl-set-denied'
+        Mock Test-WindowsHost { return $true }
+        Mock Set-Acl { throw [System.UnauthorizedAccessException]::new('Access denied by fixture.') }
+
+        $result = Set-LauncherDirectoryAcl -Path $path -Purpose 'launcher log directory'
+
+        $result.Status | Should -Be 'Refused'
+        $result.FailureOperation | Should -Be 'Set-Acl'
+        $result.Warning | Should -Match ([regex]::Escape($path))
+        $result.Warning | Should -Match 'Set-Acl'
+        $result.Warning | Should -Match 'Repair step:'
+        Should -Invoke Set-Acl -Times 1 -Exactly -Scope It
+    }
+
+    It 'refuses an ACL readback mismatch after the repair write' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'ACL readback coverage uses Windows ACL types on a temporary fixture directory.'
+            return
+        }
+
+        $path = New-TestRoot 'launcher-acl-readback-mismatch'
+        Mock Test-WindowsHost { return $true }
+        Mock Set-Acl { }
+        Mock Test-LauncherDirectoryAcl {
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $false; Status = 'Degraded'
+                FailureOperation = 'ACL policy verification'; Reason = 'An unexpected principal remains.'
+            }
+        }
+
+        $result = Set-LauncherDirectoryAcl -Path $path -Purpose 'task launch state directory'
+
+        $result.Status | Should -Be 'Refused'
+        $result.FailureOperation | Should -Be 'ACL readback verification'
+        $result.Warning | Should -Match 'readback'
+        $result.Warning | Should -Match 'Inspect'
+        Should -Invoke Set-Acl -Times 1 -Exactly -Scope It
+        Should -Invoke Test-LauncherDirectoryAcl -Times 1 -Exactly -Scope It
+    }
+
+    It 'refuses to write per-user configuration when its required ACL cannot be set' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'The config ACL denial path uses Windows ACL types on a temporary fixture directory.'
+            return
+        }
+
+        $root = New-TestRoot 'launcher-acl-config-denied'
+        $script:configDirectoryFixture = Join-Path $root 'per-user-config'
+        $script:DefaultsPath = Join-Path $script:configDirectoryFixture 'launch.json'
+        $script:LegacyDefaultsPath = Join-Path $root 'scripts\launch.json'
+        $script:protectedConfigWriteCount = 0
+        Mock Test-WindowsHost { return $true }
+        Mock Test-LauncherDirectoryAcl {
+            if ($Path -eq $script:configDirectoryFixture) {
+                return [pscustomobject]@{
+                    Path = $Path; IsHardened = $false; Status = 'Degraded'
+                    FailureOperation = 'ACL policy verification'; Reason = 'Inherited broad access remains.'
+                }
+            }
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $true; Status = 'Verified'
+                FailureOperation = $null; Reason = $null
+            }
+        }
+        Mock Set-Acl { throw [System.UnauthorizedAccessException]::new('Access denied by fixture.') }
+        Mock Set-Content { $script:protectedConfigWriteCount++ }
+
+        { Save-LaunchDefaults -Values @{ Provider = 'ollama'; Model = 'fixture-model' } } |
+            Should -Throw -ExpectedMessage "*'$script:configDirectoryFixture'*Set-Acl*Repair step:*"
+
+        $script:protectedConfigWriteCount | Should -Be 0
+        Should -Invoke Set-Content -Times 0 -Exactly -Scope It
+    }
+
+    It 'refuses JSON log writes after any required ACL failure' {
+        $script:LauncherAclFailure = [System.InvalidOperationException]::new(
+            'Refusing launcher storage because a required ACL was not verified.'
+        )
+        $script:protectedLogWriteCount = 0
+        Mock Add-Content { $script:protectedLogWriteCount++ }
+
+        { Write-Json -Level error -Message 'ACL failure diagnostic' } |
+            Should -Throw '*required ACL was not verified*'
+
+        $script:protectedLogWriteCount | Should -Be 0
+        Should -Invoke Add-Content -Times 0 -Exactly -Scope It
+    }
+
+    It 'repairs a degraded ACL and returns a readback-verified status' {
+        if (-not (Test-WindowsHost)) {
+            Set-ItResult -Skipped -Because 'ACL repair coverage uses Windows ACL types on a temporary fixture directory.'
+            return
+        }
+
+        $path = New-TestRoot 'launcher-acl-repair'
+        $script:aclVerificationCount = 0
+        Mock Test-WindowsHost { return $true }
+        Mock Set-Acl { }
+        Mock Test-LauncherDirectoryAcl {
+            $script:aclVerificationCount++
+            if ($script:aclVerificationCount -eq 1) {
+                return [pscustomobject]@{
+                    Path = $Path; IsHardened = $false; Status = 'Degraded'
+                    FailureOperation = 'ACL policy verification'; Reason = 'Inherited broad access remains.'
+                }
+            }
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $true; Status = 'Verified'
+                FailureOperation = $null; Reason = $null
+            }
+        }
+
+        $result = Ensure-LauncherDirectoryAcl -Path $path -Purpose 'launcher log directory'
+
+        $result.IsHardened | Should -BeTrue
+        $result.Status | Should -Be 'Repaired'
+        $script:aclVerificationCount | Should -Be 2
+        Should -Invoke Set-Acl -Times 1 -Exactly -Scope It
+    }
+
+    It 'rechecks ACLs on repeated initialization without rewriting hardened directories' {
+        $root = New-TestRoot 'launcher-acl-repeat'
+        $script:LogDir = Join-Path $root 'logs'
+        $script:AggregateLog = Join-Path $script:LogDir 'autoresearch.jsonl'
+        $script:TaskLaunchStatePath = Join-Path (Join-Path $root 'task-state') 'autoresearch-task-launch.json'
+        $script:DefaultsPath = Join-Path $root 'config\launch.json'
+        $script:LegacyDefaultsPath = Join-Path $root 'scripts\launch.json'
+        $script:aclVerificationCount = 0
+        Mock Test-LauncherDirectoryAcl {
+            $script:aclVerificationCount++
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $true; Status = 'Verified'
+                FailureOperation = $null; Reason = $null
+            }
+        }
+        Mock Set-LauncherDirectoryAcl { throw 'A hardened directory should not be rewritten.' }
+
+        Initialize-LauncherStorage
+        Initialize-LauncherStorage
+
+        $script:aclVerificationCount | Should -Be 6
+        Should -Invoke Set-LauncherDirectoryAcl -Times 0 -Exactly -Scope It
     }
 }
 
@@ -3204,6 +3666,24 @@ Describe 'Launcher defaults persistence' {
         $root = New-TestRoot 'launch-defaults'
         $script:DefaultsPath = Join-Path $root 'local-app-data\myTech.Today\autoresearch-win-rtx-scheduled\launch.json'
         $script:LegacyDefaultsPath = Join-Path $root 'canonical\scripts\launch.json'
+        $script:legacyAclStatus = 'Verified'
+        $script:aclWarnings = @()
+        Mock Ensure-LauncherDirectoryAcl {
+            return [pscustomobject]@{ Path = $Path; IsHardened = $true; Status = 'Verified' }
+        }
+        Mock Test-LauncherDirectoryAcl {
+            if ($Path -eq $script:LegacyDefaultsPath -and $script:legacyAclStatus -eq 'Degraded') {
+                return [pscustomobject]@{
+                    Path = $Path; IsHardened = $false; Status = 'Degraded'
+                    FailureOperation = 'ACL policy verification'; Reason = 'Inherited broad access remains.'
+                }
+            }
+            return [pscustomobject]@{
+                Path = $Path; IsHardened = $true; Status = 'Verified'
+                FailureOperation = $null; Reason = $null
+            }
+        }
+        Mock Write-Warning { param([string]$Message) $script:aclWarnings += $Message }
     }
 
     AfterEach {
@@ -3273,6 +3753,31 @@ Describe 'Launcher defaults persistence' {
         $loaded.Model | Should -Be 'gpt-4o-mini'
         Test-Path -LiteralPath $script:DefaultsPath | Should -BeFalse
     }
+
+    It 'does not load a legacy file whose ACL is degraded' {
+        $legacyValues = [ordered]@{
+            Provider          = 'openai'
+            Model             = 'gpt-4o-mini'
+            AzureEndpoint     = 'https://example.invalid/'
+            AzureDeployment   = 'fixture'
+            LogDir            = 'C:\logs\autoresearch'
+            ScheduleFrequency = 'Daily'
+            ScheduleTime      = '18:00'
+            SchedulerPolicy   = 'IdleOnly'
+        }
+        New-Dir -Path (Split-Path -Parent $script:LegacyDefaultsPath)
+        ($legacyValues | ConvertTo-Json) | Set-Content -LiteralPath $script:LegacyDefaultsPath -Encoding UTF8
+        $legacyContents = Get-Content -LiteralPath $script:LegacyDefaultsPath -Raw
+        $script:legacyAclStatus = 'Degraded'
+
+        $loaded = Read-LaunchDefaults
+
+        $loaded | Should -BeNullOrEmpty
+        $script:aclWarnings | Should -HaveCount 1
+        $script:aclWarnings[0] | Should -Match 'Degraded: ignoring legacy launcher configuration'
+        $script:aclWarnings[0] | Should -Match ([regex]::Escape($script:LegacyDefaultsPath))
+        Get-Content -LiteralPath $script:LegacyDefaultsPath -Raw | Should -Be $legacyContents
+    }
 }
 
 Describe 'Task launch supervisor' {
@@ -3293,6 +3798,9 @@ Describe 'Task launch supervisor' {
         $script:MaxConsecutiveIterationFailures = 5
         $script:PerRunTimeoutMinutes = 10
         $script:NoAiEdit = $false
+        Mock Ensure-LauncherDirectoryAcl {
+            return [pscustomobject]@{ Path = $Path; IsHardened = $true; Status = 'Verified' }
+        }
         Mock Write-Json { }
         Mock Get-PwshExePath { return 'C:\Program Files\PowerShell\7\pwsh.exe' }
         Mock Get-CurrentProcessCommandLine {

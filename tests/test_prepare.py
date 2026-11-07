@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -332,6 +333,14 @@ class PrepareValidationTests(PrepareTestCase):
 
 
 class PrepareDownloadTests(PrepareTestCase):
+    def _download_temp_files(self, current_path):
+        data_dir = os.path.dirname(current_path)
+        return [
+            os.path.join(data_dir, name)
+            for name in os.listdir(data_dir)
+            if name.endswith(".tmp")
+        ]
+
     def test_download_accepts_valid_file_with_expected_hash(self):
         payload = b"valid tiny stories payload"
         digest = hashlib.sha256(payload).hexdigest()
@@ -349,7 +358,7 @@ class PrepareDownloadTests(PrepareTestCase):
         self.assertTrue(os.path.exists(current_path))
         with open(current_path, "rb") as f:
             self.assertEqual(f.read(), payload)
-        self.assertFalse(os.path.exists(current_path + ".tmp"))
+        self.assertEqual(self._download_temp_files(current_path), [])
 
     def test_download_retries_transient_503_before_succeeding(self):
         payload = b"retryable payload"
@@ -373,6 +382,7 @@ class PrepareDownloadTests(PrepareTestCase):
         self.assertTrue(os.path.exists(current_path))
         with open(current_path, "rb") as f:
             self.assertEqual(f.read(), payload)
+        self.assertEqual(self._download_temp_files(current_path), [])
 
     def test_download_gives_up_after_bounded_transient_failures(self):
         current_path = prepare._tiny_parquet_path("tinystories")
@@ -390,7 +400,7 @@ class PrepareDownloadTests(PrepareTestCase):
         self.assertEqual(mock_get.call_count, prepare.DATA_DOWNLOAD_MAX_ATTEMPTS)
         self.assertEqual(mock_sleep.call_count, prepare.DATA_DOWNLOAD_MAX_ATTEMPTS - 1)
         self.assertFalse(os.path.exists(current_path))
-        self.assertFalse(os.path.exists(current_path + ".tmp"))
+        self.assertEqual(self._download_temp_files(current_path), [])
 
     def test_download_rejects_corrupt_download(self):
         expected_payload = b"expected payload"
@@ -411,7 +421,7 @@ class PrepareDownloadTests(PrepareTestCase):
 
         self.assertIn("Integrity error", str(cm.exception))
         self.assertFalse(os.path.exists(current_path))
-        self.assertFalse(os.path.exists(current_path + ".tmp"))
+        self.assertEqual(self._download_temp_files(current_path), [])
 
     def test_download_reuses_existing_valid_file_without_redownloading(self):
         payload = b"already verified"
@@ -428,6 +438,7 @@ class PrepareDownloadTests(PrepareTestCase):
         mock_get.assert_not_called()
         with open(current_path, "rb") as f:
             self.assertEqual(f.read(), payload)
+        self.assertEqual(self._download_temp_files(current_path), [])
 
     def test_download_reports_file_placement_error(self):
         payload = b"placement payload"
@@ -446,7 +457,127 @@ class PrepareDownloadTests(PrepareTestCase):
 
         self.assertIn("File placement error", str(cm.exception))
         self.assertFalse(os.path.exists(current_path))
-        self.assertFalse(os.path.exists(current_path + ".tmp"))
+        self.assertEqual(self._download_temp_files(current_path), [])
+
+    def test_concurrent_downloads_use_isolated_temporary_files(self):
+        payload = b"concurrent TinyStories payload"
+        digest = hashlib.sha256(payload).hexdigest()
+        current_path = prepare._tiny_parquet_path("tinystories")
+        partial_prefix = payload[:12]
+        a_partial_written = threading.Event()
+        b_partial_written = threading.Event()
+        allow_a_failure = threading.Event()
+        allow_b_finish = threading.Event()
+        a_retry_started = threading.Event()
+        temp_paths = {}
+        request_counts = {"download-a": 0, "download-b": 0}
+        state_lock = threading.Lock()
+        errors = []
+
+        class InterruptedFirstResponse(FakeResponse):
+            def iter_content(self, chunk_size=1024 * 1024):
+                yield b"caller-a-partial"
+                a_partial_written.set()
+                if not allow_a_failure.wait(timeout=10):
+                    raise RuntimeError("timed out waiting to interrupt download A")
+                raise requests.ConnectionError("synthetic interrupted stream")
+
+        class PausedSecondResponse(FakeResponse):
+            def iter_content(self, chunk_size=1024 * 1024):
+                yield partial_prefix
+                b_partial_written.set()
+                if not allow_b_finish.wait(timeout=10):
+                    raise RuntimeError("timed out waiting to finish download B")
+                yield payload[len(partial_prefix):]
+
+        def fake_get(*args, **kwargs):
+            thread_name = threading.current_thread().name
+            with state_lock:
+                request_counts[thread_name] += 1
+                attempt = request_counts[thread_name]
+
+            if thread_name == "download-a":
+                if attempt == 1:
+                    return InterruptedFirstResponse()
+                if attempt == 2:
+                    a_retry_started.set()
+                    raise requests.ConnectionError("synthetic retry interruption")
+                return FakeResponse(body=payload, status_code=200)
+            if thread_name == "download-b" and attempt == 1:
+                return PausedSecondResponse()
+            raise AssertionError(f"unexpected download request: {thread_name}, attempt {attempt}")
+
+        original_download = prepare._download_url_with_retries
+
+        def record_and_download(url, temp_path, description):
+            with state_lock:
+                temp_paths[threading.current_thread().name] = temp_path
+            return original_download(url, temp_path, description)
+
+        def run_download():
+            try:
+                prepare._download_tinystories_file("tinystories")
+            except Exception as exc:
+                with state_lock:
+                    errors.append(exc)
+
+        threads = [
+            threading.Thread(target=run_download, name="download-a"),
+            threading.Thread(target=run_download, name="download-b"),
+        ]
+        b_temp_survived_a_retry = False
+
+        with mock.patch.dict(prepare.DATASET_CONFIGS["tinystories"], {"sha256": digest}):
+            with mock.patch.object(prepare.requests, "get", side_effect=fake_get):
+                with mock.patch.object(prepare.time, "sleep", return_value=None):
+                    with mock.patch.object(
+                        prepare,
+                        "_download_url_with_retries",
+                        side_effect=record_and_download,
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            for thread in threads:
+                                thread.start()
+                            try:
+                                self.assertTrue(a_partial_written.wait(timeout=10))
+                                self.assertTrue(b_partial_written.wait(timeout=10))
+                                with state_lock:
+                                    paths = dict(temp_paths)
+                                self.assertEqual(set(paths), {"download-a", "download-b"})
+                                self.assertNotEqual(paths["download-a"], paths["download-b"])
+                                self.assertEqual(
+                                    os.path.dirname(paths["download-a"]),
+                                    os.path.dirname(current_path),
+                                )
+                                self.assertEqual(
+                                    os.path.dirname(paths["download-b"]),
+                                    os.path.dirname(current_path),
+                                )
+                                self.assertTrue(os.path.exists(paths["download-a"]))
+                                self.assertTrue(os.path.exists(paths["download-b"]))
+
+                                allow_a_failure.set()
+                                self.assertTrue(
+                                    a_retry_started.wait(timeout=10),
+                                    f"request_counts={request_counts}, errors={errors}",
+                                )
+                                b_temp_survived_a_retry = os.path.exists(paths["download-b"])
+                            finally:
+                                allow_a_failure.set()
+                                allow_b_finish.set()
+                                for thread in threads:
+                                    thread.join(timeout=10)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertTrue(b_temp_survived_a_retry)
+        self.assertEqual(request_counts, {"download-a": 3, "download-b": 1})
+        with mock.patch.dict(prepare.DATASET_CONFIGS["tinystories"], {"sha256": digest}):
+            self.assertEqual(
+                prepare._verify_tinystories_parquet(current_path, "tinystories"),
+                digest,
+            )
+        self.assertEqual(self._download_temp_files(current_path), [])
 
 
 if __name__ == "__main__":

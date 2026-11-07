@@ -414,6 +414,7 @@ $Script:RunLogPath = $null
 $Script:AutoresearchLoopLock = $null
 $Script:TaskLaunchStatePath = Join-Path $LogDir 'autoresearch-task-launch.json'
 $Script:LauncherAclStatus = @{}
+$Script:LauncherAclFailure = $null
 $Script:LogRetentionCount = $LogRetentionCount
 $Script:LogRetentionDays = $LogRetentionDays
 $Script:DebugEnabled = [bool]$Debug
@@ -639,21 +640,26 @@ function Test-LauncherDirectoryAcl {
     $result = [ordered]@{
         Path              = $Path
         IsHardened        = $false
+        Status            = 'Degraded'
         Owner             = $null
         ExpectedOwner    = $null
         MissingPrincipals = @()
         UnexpectedRules   = @()
         InheritanceLocked = $false
+        FailureOperation  = $null
         Reason            = $null
     }
 
     if (-not (Test-WindowsHost)) {
+        $result.FailureOperation = 'Windows ACL verification'
         $result.Reason = 'Windows ACL verification is unavailable on this host.'
         return [pscustomobject]$result
     }
 
+    $operation = 'read directory ACL'
     try {
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $operation = 'compare directory ACL with launcher policy'
         $principals = @(Get-LauncherAclPrincipals)
         $allowedSids = @($principals | ForEach-Object { $_.Value })
         $result.ExpectedOwner = $principals[0].Value
@@ -695,10 +701,14 @@ function Test-LauncherDirectoryAcl {
             $result.MissingPrincipals.Count -eq 0 -and
             $result.UnexpectedRules.Count -eq 0
 
-        if (-not $result.IsHardened) {
+        if ($result.IsHardened) {
+            $result.Status = 'Verified'
+        } else {
+            $result.FailureOperation = 'ACL policy verification'
             $result.Reason = 'The owner, protected inheritance, or explicit allow rules did not match the launcher ACL policy.'
         }
     } catch {
+        $result.FailureOperation = $operation
         $result.Reason = $_.Exception.Message
     }
 
@@ -711,16 +721,20 @@ function Set-LauncherDirectoryAcl {
         [Parameter(Mandatory)][string]$Purpose
     )
 
+    $operation = 'Windows ACL verification'
     try {
         if (-not (Test-WindowsHost)) {
             throw 'Windows ACL hardening is unavailable on this host.'
         }
+        $operation = 'create required storage directory'
         if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
             New-Dir -Path $Path
         }
 
+        $operation = 'read directory ACL before repair'
         $principals = @(Get-LauncherAclPrincipals)
         $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        $operation = 'prepare restrictive directory ACL'
         $acl.SetOwner($principals[0])
         $acl.SetAccessRuleProtection($true, $false)
         foreach ($existingRule in @($acl.Access)) {
@@ -740,20 +754,43 @@ function Set-LauncherDirectoryAcl {
             $acl.AddAccessRule($rule)
         }
 
+        $operation = 'Set-Acl'
         Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        $operation = 'ACL readback verification'
         $verification = Test-LauncherDirectoryAcl -Path $Path
         if (-not $verification.IsHardened) {
-            throw "ACL verification failed: $($verification.Reason)"
+            $readbackOperation = if ($verification.FailureOperation) {
+                $verification.FailureOperation
+            } else {
+                'ACL policy verification'
+            }
+            throw "ACL readback failed during $readbackOperation`: $($verification.Reason)"
         }
+        $verification.Status = 'Repaired'
+        $verification.FailureOperation = $null
         return $verification
     } catch {
-        $warning = "ACL hardening failed for $Purpose '$Path': $($_.Exception.Message). The launcher will continue with the existing permissions; logs and task state may be readable by other accounts."
+        $reason = $_.Exception.Message
+        $failureOperation = $operation
+        $repairStep = if ($failureOperation -eq 'Windows ACL verification') {
+            'Run the launcher on Windows so the required ACL can be verified.'
+        } elseif ($failureOperation -eq 'Set-Acl') {
+            "Run the launcher as the account that owns '$Path' with permission to change that directory ACL, then rerun so the launcher can apply and verify its restrictive ACL."
+        } elseif ($failureOperation -eq 'ACL readback verification') {
+            "Inspect '$Path', set its owner to the current user, disable inheritance, and remove access for principals outside the current user, Administrators, and SYSTEM; then rerun so the launcher can verify the repaired ACL."
+        } else {
+            "Restore the owning account's ability to read and change the ACL on '$Path', then rerun so the launcher can apply and verify its restrictive ACL."
+        }
+        $warning = "Refusing launcher storage for $Purpose '$Path': operation '$failureOperation' failed: $reason Repair step: $repairStep Existing files are preserved."
         Write-Warning $warning
         return [pscustomobject]@{
-            Path       = $Path
-            IsHardened = $false
-            Reason     = $_.Exception.Message
-            Warning    = $warning
+            Path             = $Path
+            IsHardened       = $false
+            Status           = 'Refused'
+            FailureOperation = $failureOperation
+            Reason           = $reason
+            RepairStep       = $repairStep
+            Warning          = $warning
         }
     }
 }
@@ -767,26 +804,43 @@ function Ensure-LauncherDirectoryAcl {
     if ($null -eq (Get-Variable -Scope Script -Name LauncherAclStatus -ErrorAction SilentlyContinue)) {
         $Script:LauncherAclStatus = @{}
     }
+    $priorFailure = Get-Variable -Scope Script -Name LauncherAclFailure -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $priorFailure) {
+        throw $priorFailure
+    }
     try {
         $key = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
     } catch {
         $key = $Path
     }
-    if ($Script:LauncherAclStatus.ContainsKey($key)) {
-        return $Script:LauncherAclStatus[$key]
+    $verification = Test-LauncherDirectoryAcl -Path $Path
+    if ($verification.IsHardened) {
+        if ($Script:LauncherAclStatus.ContainsKey($key) -and
+            $Script:LauncherAclStatus[$key].Status -eq 'Repaired') {
+            $verification.Status = 'Repaired'
+        }
+        $Script:LauncherAclStatus[$key] = $verification
+        return $verification
     }
 
-    $verification = Test-LauncherDirectoryAcl -Path $Path
-    $result = if ($verification.IsHardened) {
-        $verification
-    } else {
-        Set-LauncherDirectoryAcl -Path $Path -Purpose $Purpose
+    $result = Set-LauncherDirectoryAcl -Path $Path -Purpose $Purpose
+    if (-not $result.IsHardened) {
+        $message = $result.Warning
+        $failure = [System.InvalidOperationException]::new($message)
+        $failure.Data['LauncherAclStatus'] = 'Refused'
+        $failure.Data['Path'] = $Path
+        $failure.Data['Purpose'] = $Purpose
+        $failure.Data['FailureOperation'] = $result.FailureOperation
+        $Script:LauncherAclFailure = $failure
+        throw $failure
     }
+
     $Script:LauncherAclStatus[$key] = $result
     return $result
 }
 
 function Initialize-LauncherStorage {
+    $Script:LauncherAclFailure = $null
     New-Dir -Path $LogDir
     $statePath = Get-TaskLaunchStatePath
     $stateDirectory = Split-Path -Parent $statePath
@@ -795,11 +849,40 @@ function Initialize-LauncherStorage {
     }
     New-Dir -Path $stateDirectory
 
-    Ensure-LauncherDirectoryAcl -Path $LogDir -Purpose 'launcher log root' | Out-Null
-    $logFullPath = [System.IO.Path]::GetFullPath($LogDir).TrimEnd('\', '/')
-    $stateFullPath = [System.IO.Path]::GetFullPath($stateDirectory).TrimEnd('\', '/')
-    if ($stateFullPath -ne $logFullPath) {
-        Ensure-LauncherDirectoryAcl -Path $stateDirectory -Purpose 'task launch state directory' | Out-Null
+    # Logs include host-local paths and run metadata; task state includes process
+    # details and redacted command lines; per-user defaults include provider
+    # endpoints, deployment names, log paths, and schedule choices. Require a
+    # restrictive readback for each storage directory before allowing writes.
+    # The legacy beside-launcher launch.json is import-only: verify its file
+    # ACL before reading it, and never change ACLs on its application directory.
+    $requiredDirectories = @(
+        [pscustomobject]@{ Path = $LogDir; Purpose = 'launcher log directory' },
+        [pscustomobject]@{ Path = $stateDirectory; Purpose = 'task launch state directory' }
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Script:DefaultsPath) -and
+        -not [string]::IsNullOrWhiteSpace($Script:LegacyDefaultsPath) -and
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath($Script:DefaultsPath),
+            [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        $defaultsDirectory = Split-Path -Parent $Script:DefaultsPath
+        if (-not [string]::IsNullOrWhiteSpace($defaultsDirectory)) {
+            New-Dir -Path $defaultsDirectory
+            $requiredDirectories += [pscustomobject]@{
+                Path = $defaultsDirectory
+                Purpose = 'per-user launcher configuration directory'
+            }
+        }
+    }
+
+    $checkedDirectories = @{}
+    foreach ($directory in $requiredDirectories) {
+        $directoryKey = [System.IO.Path]::GetFullPath($directory.Path).TrimEnd('\', '/')
+        if ($checkedDirectories.ContainsKey($directoryKey)) {
+            continue
+        }
+        $checkedDirectories[$directoryKey] = $true
+        Ensure-LauncherDirectoryAcl -Path $directory.Path -Purpose $directory.Purpose | Out-Null
     }
 }
 
@@ -809,6 +892,10 @@ function Write-Json {
         [string]$Message,
         [hashtable]$Extra = $null
     )
+    $aclFailure = Get-Variable -Scope Script -Name LauncherAclFailure -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $aclFailure) {
+        throw $aclFailure.Message
+    }
     $record = [ordered]@{
         ts    = (Get-Date).ToUniversalTime().ToString('o')
         level = $Level
@@ -821,6 +908,17 @@ function Write-Json {
     $aggregateDirectory = Split-Path -Parent $Script:AggregateLog
     New-Dir -Path $aggregateDirectory
     Ensure-LauncherDirectoryAcl -Path $aggregateDirectory -Purpose 'launcher log root' | Out-Null
+    if ($Script:RunLogPath) {
+        $runLogDirectory = Split-Path -Parent $Script:RunLogPath
+        if (-not [string]::IsNullOrWhiteSpace($runLogDirectory)) {
+            New-Dir -Path $runLogDirectory
+            $aggregateFullPath = [System.IO.Path]::GetFullPath($aggregateDirectory).TrimEnd('\', '/')
+            $runLogFullPath = [System.IO.Path]::GetFullPath($runLogDirectory).TrimEnd('\', '/')
+            if (-not [string]::Equals($aggregateFullPath, $runLogFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Ensure-LauncherDirectoryAcl -Path $runLogDirectory -Purpose 'per-run launcher log directory' | Out-Null
+            }
+        }
+    }
     Add-Content -LiteralPath $Script:AggregateLog -Value $line -Encoding UTF8
     if ($Script:RunLogPath) {
         Add-Content -LiteralPath $Script:RunLogPath -Value $line -Encoding UTF8
@@ -905,12 +1003,17 @@ function Write-TaskLaunchState {
     } catch {
         $stateWriteError = $_
         $message = "Task launch state write failed at '$(Get-TaskLaunchStatePath)': $($stateWriteError.Exception.Message)"
-        try {
-            Write-Json -Level warn -Message $message -Extra @{
-                statePath = (Get-TaskLaunchStatePath)
-            }
-        } catch {
+        $aclFailure = Get-Variable -Scope Script -Name LauncherAclFailure -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -ne $aclFailure -or $stateWriteError.Exception.Data['LauncherAclStatus'] -eq 'Refused') {
             Write-Warning $message
+        } else {
+            try {
+                Write-Json -Level warn -Message $message -Extra @{
+                    statePath = (Get-TaskLaunchStatePath)
+                }
+            } catch {
+                Write-Warning $message
+            }
         }
         throw $stateWriteError.Exception
     }
@@ -1856,17 +1959,57 @@ function Initialize-ResultsTsv {
     }
 }
 
+function ConvertFrom-InvariantMetric {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Value,
+        [Parameter(Mandatory)][string]$MetricName
+    )
+
+    $parsedValue = 0.0
+    $numberStyle = [System.Globalization.NumberStyles]::Float
+    $invariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
+    if (-not [double]::TryParse($Value, $numberStyle, $invariantCulture, [ref]$parsedValue) -or
+        [double]::IsNaN($parsedValue) -or [double]::IsInfinity($parsedValue)) {
+        throw "Invalid $MetricName metric '$Value'. Expected a finite dot-decimal number."
+    }
+    return $parsedValue
+}
+
 function Get-CurrentBestValBpb {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
+
+    $lines = @(Get-Content -LiteralPath $Path -Encoding UTF8)
+    $expectedHeader = "commit`tval_bpb`tmemory_gb`tstatus`tdescription"
+    if ($lines.Count -eq 0 -or $lines[0] -cne $expectedHeader) {
+        throw "Invalid results.tsv header in '$Path'. Expected the five-column commit, val_bpb, memory_gb, status, description header."
+    }
+
     $best = $null
-    Get-Content -LiteralPath $Path -Encoding UTF8 | Select-Object -Skip 1 | ForEach-Object {
-        $cols = $_ -split "`t"
-        if ($cols.Count -ge 4 -and $cols[3] -eq 'keep') {
-            $v = 0.0
-            if ([double]::TryParse($cols[1], [ref]$v) -and $v -gt 0) {
-                if ($null -eq $best -or $v -lt $best) { $best = $v }
-            }
+    for ($index = 1; $index -lt $lines.Count; $index++) {
+        $lineNumber = $index + 1
+        $columns = $lines[$index].Split([char]9)
+        if ($columns.Count -ne 5) {
+            throw "Invalid results.tsv row $lineNumber in '$Path': expected 5 columns, found $($columns.Count)."
+        }
+        if ($columns[3] -cnotin @('keep', 'discard', 'crash')) {
+            throw "Invalid results.tsv status on row $lineNumber in '$Path': '$($columns[3])'."
+        }
+
+        $valBpb = ConvertFrom-InvariantMetric -Value $columns[1] -MetricName "results.tsv val_bpb on row $lineNumber"
+        $memoryGb = ConvertFrom-InvariantMetric -Value $columns[2] -MetricName "results.tsv memory_gb on row $lineNumber"
+        if ($memoryGb -lt 0) {
+            throw "Invalid results.tsv memory_gb on row $lineNumber in '$Path': memory must not be negative."
+        }
+        if ($valBpb -lt 0) {
+            throw "Invalid results.tsv val_bpb on row $lineNumber in '$Path': the value must not be negative."
+        }
+        if ($columns[3] -in @('keep', 'discard') -and $valBpb -le 0) {
+            throw "Invalid results.tsv val_bpb on row $lineNumber in '$Path': scored rows must have a positive value."
+        }
+
+        if ($columns[3] -ceq 'keep') {
+            if ($null -eq $best -or $valBpb -lt $best) { $best = $valBpb }
         }
     }
     return $best
@@ -1876,26 +2019,71 @@ function Add-ResultsTsvRow {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Commit,
-        [double]$ValBpb,
-        [double]$MemoryGb,
+        [Parameter(Mandatory)][double]$ValBpb,
+        [Parameter(Mandatory)][double]$MemoryGb,
         [Parameter(Mandatory)][ValidateSet('keep','discard','crash')][string]$Status,
         [Parameter(Mandatory)][string]$Description
     )
+
+    if ([double]::IsNaN($ValBpb) -or [double]::IsInfinity($ValBpb)) {
+        throw "Cannot write a non-finite val_bpb metric for results.tsv status '$Status'."
+    }
+    if ([double]::IsNaN($MemoryGb) -or [double]::IsInfinity($MemoryGb) -or $MemoryGb -lt 0) {
+        throw 'Cannot write an invalid memory_gb metric to results.tsv.'
+    }
+    if ($ValBpb -lt 0) {
+        throw 'Cannot write a negative val_bpb metric to results.tsv.'
+    }
+    if ($Status -in @('keep', 'discard') -and $ValBpb -le 0) {
+        throw "Cannot write a non-positive val_bpb metric for results.tsv status '$Status'."
+    }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Initialize-ResultsTsv -Path $Path
+    }
+    [void](Get-CurrentBestValBpb -Path $Path)
+
     $desc = ($Description -replace "[`t`r`n]", ' ').Trim()
+    $invariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
+    $valBpbText = $ValBpb.ToString('F6', $invariantCulture)
+    $memoryGbText = $MemoryGb.ToString('F1', $invariantCulture)
     $row  = "{0}`t{1}`t{2}`t{3}`t{4}" -f `
-        $Commit, $ValBpb.ToString('F6'), $MemoryGb.ToString('F1'), $Status, $desc
+        $Commit, $valBpbText, $memoryGbText, $Status, $desc
     Add-Content -LiteralPath $Path -Value $row -Encoding UTF8
 }
 
 function Read-RunLogMetrics {
     param([Parameter(Mandatory)][string]$Path)
-    $valBpb   = 0.0
-    $vramMb   = 0.0
-    if (-not (Test-Path -LiteralPath $Path)) { return @{ ValBpb = 0.0; PeakVramMb = 0.0 } }
-    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
-        if ($line -match '^val_bpb:\s*([0-9.]+)')        { [void][double]::TryParse($Matches[1], [ref]$valBpb) }
-        elseif ($line -match '^peak_vram_mb:\s*([0-9.]+)') { [void][double]::TryParse($Matches[1], [ref]$vramMb) }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Run log '$Path' does not exist; metrics cannot be read."
     }
+
+    $valBpb = $null
+    $vramMb = $null
+    $hasValBpb = $false
+    $hasVramMb = $false
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        if ($line.StartsWith('val_bpb')) {
+            if ($hasValBpb) { throw "Run log '$Path' contains more than one val_bpb metric." }
+            if ($line -notmatch '^val_bpb:\s*(.*?)\s*$') {
+                throw "Run log '$Path' contains a malformed val_bpb metric line: '$line'."
+            }
+            $valBpb = ConvertFrom-InvariantMetric -Value $Matches[1] -MetricName 'run log val_bpb'
+            if ($valBpb -le 0) { throw "Run log '$Path' contains a non-positive val_bpb metric." }
+            $hasValBpb = $true
+        } elseif ($line.StartsWith('peak_vram_mb')) {
+            if ($hasVramMb) { throw "Run log '$Path' contains more than one peak_vram_mb metric." }
+            if ($line -notmatch '^peak_vram_mb:\s*(.*?)\s*$') {
+                throw "Run log '$Path' contains a malformed peak_vram_mb metric line: '$line'."
+            }
+            $vramMb = ConvertFrom-InvariantMetric -Value $Matches[1] -MetricName 'run log peak_vram_mb'
+            if ($vramMb -lt 0) { throw "Run log '$Path' contains a negative peak_vram_mb metric." }
+            $hasVramMb = $true
+        }
+    }
+
+    if (-not $hasValBpb) { throw "Run log '$Path' is missing the val_bpb metric." }
+    if (-not $hasVramMb) { throw "Run log '$Path' is missing the peak_vram_mb metric." }
     return @{ ValBpb = $valBpb; PeakVramMb = $vramMb }
 }
 
@@ -3676,6 +3864,7 @@ function Get-RegisteredLauncherTask {
 }
 
 function Register-LauncherTask {
+    Initialize-LauncherStorage
     $plan = Get-TaskLauncherPlan
     $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
     $existing = Get-RegisteredLauncherTask
@@ -3732,12 +3921,47 @@ $Script:ProviderModels = @{
 }
 
 function Read-LaunchDefaults {
+    if (-not [string]::IsNullOrWhiteSpace($Script:DefaultsPath) -and
+        -not [string]::IsNullOrWhiteSpace($Script:LegacyDefaultsPath) -and
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath($Script:DefaultsPath),
+            [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        $defaultsDirectory = Split-Path -Parent $Script:DefaultsPath
+        New-Dir -Path $defaultsDirectory
+        Ensure-LauncherDirectoryAcl -Path $defaultsDirectory -Purpose 'per-user launcher configuration directory' | Out-Null
+    }
     $paths = @($Script:DefaultsPath)
     if ($Script:LegacyDefaultsPath -and $Script:LegacyDefaultsPath -ne $Script:DefaultsPath) {
         $paths += $Script:LegacyDefaultsPath
     }
     foreach ($path in $paths) {
         if (-not (Test-Path -LiteralPath $path)) { continue }
+        $isLegacyPath = $Script:LegacyDefaultsPath -and [string]::Equals(
+            [System.IO.Path]::GetFullPath($path),
+            [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+        if ($isLegacyPath) {
+            $legacyAcl = Test-LauncherDirectoryAcl -Path $path
+            if (-not $legacyAcl.IsHardened) {
+                $repairStep = if ([string]::Equals(
+                    [System.IO.Path]::GetFullPath($Script:DefaultsPath),
+                    [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                    'Set LOCALAPPDATA for this account and re-enter preferences through the launcher; leave the legacy file unchanged.'
+                } else {
+                    "Save preferences through the launcher to the protected per-user path '$Script:DefaultsPath'; leave the legacy file unchanged."
+                }
+                $failureOperation = if ($legacyAcl.FailureOperation) {
+                    $legacyAcl.FailureOperation
+                } else {
+                    'ACL policy verification'
+                }
+                Write-Warning "Degraded: ignoring legacy launcher configuration '$path' because operation '$failureOperation' did not verify its restrictive ACL: $($legacyAcl.Reason) Repair step: $repairStep"
+                continue
+            }
+        }
         try { return Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { continue }
     }
     return $null
@@ -3755,12 +3979,34 @@ function Save-LaunchDefaults {
             $persisted[$key] = $Values[$key]
         }
     }
-    New-Dir (Split-Path -Parent $Script:DefaultsPath)
+    if ([string]::IsNullOrWhiteSpace($Script:DefaultsPath)) {
+        throw 'Per-user launcher configuration cannot be saved because its path is unavailable.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Script:LegacyDefaultsPath) -and
+        [string]::Equals(
+            [System.IO.Path]::GetFullPath($Script:DefaultsPath),
+            [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to write per-user launcher configuration beside the launcher at '$($Script:DefaultsPath)'. Set LOCALAPPDATA for this account, then rerun so the per-user configuration directory can be restricted."
+    }
+    $defaultsDirectory = Split-Path -Parent $Script:DefaultsPath
+    New-Dir -Path $defaultsDirectory
+    Ensure-LauncherDirectoryAcl -Path $defaultsDirectory -Purpose 'per-user launcher configuration directory' | Out-Null
     ($persisted | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $Script:DefaultsPath -Encoding UTF8
 }
 
 function Initialize-LaunchConfig {
     param([System.Collections.IDictionary]$Bound)
+    if (-not [string]::IsNullOrWhiteSpace($Script:DefaultsPath) -and
+        -not [string]::IsNullOrWhiteSpace($Script:LegacyDefaultsPath) -and
+        -not [string]::Equals(
+            [System.IO.Path]::GetFullPath($Script:DefaultsPath),
+            [System.IO.Path]::GetFullPath($Script:LegacyDefaultsPath),
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        $defaultsDirectory = Split-Path -Parent $Script:DefaultsPath
+        New-Dir -Path $defaultsDirectory
+        Ensure-LauncherDirectoryAcl -Path $defaultsDirectory -Purpose 'per-user launcher configuration directory' | Out-Null
+    }
     $hasDefaults = Test-Path -LiteralPath $Script:DefaultsPath
     if (-not $hasDefaults -and $Script:LegacyDefaultsPath -and $Script:LegacyDefaultsPath -ne $Script:DefaultsPath) {
         $hasDefaults = Test-Path -LiteralPath $Script:LegacyDefaultsPath

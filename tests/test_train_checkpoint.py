@@ -395,6 +395,10 @@ class CheckpointRoundTripTests(CheckpointTestCase):
 
     def test_missing_resume_path_keeps_cold_start_available(self):
         self.assertIsNone(train._resolve_checkpoint_artifact_path(None))
+        self.assertEqual(
+            train._checkpoint_resume_reason(None),
+            "cold start; no --resume-from path was supplied.",
+        )
 
     def test_concurrent_runs_write_distinct_checkpoint_paths(self):
         runtime = self._make_runtime()
@@ -450,6 +454,102 @@ class CheckpointRoundTripTests(CheckpointTestCase):
         self.assertTrue(path_b.exists())
         self.assertTrue((run_dir_a / train.CHECKPOINT_METADATA_FILE_NAME).exists())
         self.assertTrue((run_dir_b / train.CHECKPOINT_METADATA_FILE_NAME).exists())
+
+
+class CheckpointRecoveryPolicyTests(CheckpointTestCase):
+    def test_periodic_save_boundary_keeps_last_checkpoint_until_60_seconds(self):
+        class FakeClock:
+            def __init__(self, now):
+                self.now = now
+
+            def time(self):
+                return self.now
+
+            def advance(self, seconds):
+                self.now += seconds
+
+        self.assertEqual(train.CHECKPOINT_SAVE_INTERVAL_SECONDS, 60.0)
+        runtime = self._make_runtime()
+        config, model, optimizer = self._make_stateful_model()
+        checkpoint_root = self.root / "checkpoint-root"
+        run_dir = train._create_run_checkpoint_dir(checkpoint_root, run_id="interrupted-run")
+        context = self._make_checkpoint_context(
+            run_id=run_dir.name,
+            runtime=runtime,
+            config=config,
+            device_batch_size=2,
+            grad_accum_steps=2,
+            model=model,
+        )
+        clock = FakeClock(1_000.0)
+
+        self.assertEqual(train._checkpoint_save_reason(None, clock.time()), "initial")
+        first_save_time = clock.time()
+        self._quiet_call(
+            train._save_run_checkpoint,
+            checkpoint_dir=run_dir,
+            context=context,
+            model=model,
+            optimizer=optimizer,
+            train_state={
+                "step": 1,
+                "epoch": 1,
+                "total_training_time": 1.0,
+                "smooth_train_loss": 1.0,
+                "minibatches_seen": 2,
+            },
+            snapshot_reason="initial",
+        )
+
+        clock.advance(train.CHECKPOINT_SAVE_INTERVAL_SECONDS - 0.001)
+        self.assertIsNone(train._checkpoint_save_reason(first_save_time, clock.time()))
+        before_boundary = self._quiet_call(train._load_checkpoint_artifact, run_dir)
+        self.assertEqual(before_boundary["train_state"]["step"], 1)
+
+        clock.advance(0.001)
+        self.assertEqual(
+            train._checkpoint_save_reason(first_save_time, clock.time()),
+            "periodic",
+        )
+        self._quiet_call(
+            train._save_run_checkpoint,
+            checkpoint_dir=run_dir,
+            context=context,
+            model=model,
+            optimizer=optimizer,
+            train_state={
+                "step": 2,
+                "epoch": 1,
+                "total_training_time": 2.0,
+                "smooth_train_loss": 0.9,
+                "minibatches_seen": 4,
+            },
+            snapshot_reason="periodic",
+        )
+        after_boundary = self._quiet_call(train._load_checkpoint_artifact, run_dir)
+        self.assertEqual(after_boundary["train_state"]["step"], 2)
+        last_save_time = clock.time()
+        self.assertIsNone(train._checkpoint_save_reason(last_save_time, clock.time()))
+
+        # Even with a compatible artifact present, omitted --resume-from keeps
+        # this recovery contract cold and leaves artifact selection to the operator.
+        self.assertIsNone(train._resolve_checkpoint_artifact_path(None))
+        self.assertEqual(
+            train._checkpoint_resume_reason(None),
+            "cold start; no --resume-from path was supplied.",
+        )
+        next_run = train._create_run_checkpoint_dir(checkpoint_root, run_id="next-cold-run")
+        self.assertNotEqual(next_run, run_dir)
+
+    def test_readme_documents_manual_scheduled_recovery_contract(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("scheduled runs and `-RunLoop` iterations", readme)
+        self.assertIn("starts cold and creates a new run directory", readme)
+        self.assertIn("the launcher does not select a checkpoint automatically", readme)
+        self.assertIn("pass it explicitly with `--resume-from`", readme)
+        self.assertIn("once 60 seconds have elapsed", readme)
+        self.assertIn("one interval plus the next training-step duration", readme)
 
 
 class CheckpointIdentityCompatibilityTests(CheckpointTestCase):

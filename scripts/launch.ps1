@@ -149,8 +149,9 @@
     Allowed values:
       * Interactive - Current user, interactive logon, no idle wait.
       * IdleOnly    - Current user, interactive logon, launcher waits up to
-                      1 hour for 5 minutes of idle time and logs the reason
-                      if the wait window expires.
+                      1 hour for 5 minutes of idle time before starting. It
+                      rechecks before each iteration and during training;
+                      activity or unavailable idle state stops the loop.
       * Unattended  - Current user, S4U logon, no active desktop session
                       required.
     Default: 'IdleOnly'.
@@ -335,8 +336,9 @@
       Policy:      Interactive, IdleOnly, or Unattended
                    - Interactive = current user, logged-on session only.
                    - IdleOnly = current user, launcher waits up to 1 hour for
-                     5 minutes of idle time and logs the skip reason if the
-                     window expires.
+                     5 minutes of idle time before starting, then rechecks
+                     before each iteration and during training. Activity or
+                     unavailable idle state stops the loop.
                    - Unattended = current user, S4U logon, no active desktop
                      session required.
       Principal:   current user, highest run level, with the selected
@@ -344,9 +346,10 @@
       Settings:    StartWhenAvailable, AllowStartIfOnBatteries,
                    DontStopIfGoingOnBatteries, RestartCount=3,
                    RestartInterval=5m, MultipleInstances=IgnoreNew
-      Idle policy: The launcher logs explicit skip reasons when IdleOnly is
-                   selected and the computer never reaches the configured
-                   idle window.
+      Idle policy: IdleOnly logs why the initial wait window expires. If
+                   activity resumes or idle detection becomes unavailable
+                   during a run, the launcher stops that iteration and starts
+                   no further iterations.
 
     Requirements:
       Windows PowerShell 5.1 or PowerShell 7+, internet access for the
@@ -2536,6 +2539,132 @@ function Stop-AutoresearchProcessTree {
     }
 }
 
+function Wait-AutoresearchProcess {
+    param(
+        [Parameter(Mandatory)][object]$Process,
+        [Parameter(Mandatory)][ValidateRange(1, 2147483647)][int]$TimeoutMilliseconds,
+        [switch]$MonitorIdlePolicy,
+        [Parameter(DontShow)][scriptblock]$IdleStateProvider,
+        [Parameter(DontShow)][scriptblock]$ProcessWaitProvider,
+        [Parameter(DontShow)][scriptblock]$ProcessTreeStopper,
+        [ValidateRange(1, 120)][int]$CleanupGraceSeconds = 15,
+        [ValidateRange(1, 60000)][int]$IdleCheckIntervalMilliseconds = 1000
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($stopwatch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+        $remainingMilliseconds = [math]::Max(1, $TimeoutMilliseconds - [int]$stopwatch.ElapsedMilliseconds)
+        $waitMilliseconds = if ($MonitorIdlePolicy) {
+            [math]::Min($IdleCheckIntervalMilliseconds, $remainingMilliseconds)
+        } else {
+            $remainingMilliseconds
+        }
+
+        $completed = if ($null -ne $ProcessWaitProvider) {
+            [bool](& $ProcessWaitProvider $Process ([int]$waitMilliseconds))
+        } else {
+            [bool]$Process.WaitForExit([int]$waitMilliseconds)
+        }
+        if ($completed) {
+            return [pscustomobject]@{
+                Outcome            = 'completed'
+                ExitCode           = $Process.ExitCode
+                IdlePolicyStatus   = $null
+                IdlePolicyReason   = $null
+                IdleMinutes        = $null
+                RemainingProcessIds = @()
+            }
+        }
+
+        if ($MonitorIdlePolicy) {
+            $eligibility = Get-IdlePolicyEligibility -Policy 'IdleOnly' -IdleMinutes 5 `
+                -IdleStateProvider $IdleStateProvider
+            if (-not $eligibility.Eligible) {
+                try {
+                    if ($Process.HasExited) {
+                        return [pscustomobject]@{
+                            Outcome             = 'completed'
+                            ExitCode            = $Process.ExitCode
+                            IdlePolicyStatus    = $null
+                            IdlePolicyReason    = $null
+                            IdleMinutes         = $null
+                            RemainingProcessIds = @()
+                        }
+                    }
+                } catch {
+                    # Continue to fail-closed cleanup if exit state is unknown.
+                }
+
+                $termination = $null
+                try {
+                    if ($null -ne $ProcessTreeStopper) {
+                        $termination = & $ProcessTreeStopper $Process $CleanupGraceSeconds
+                    } else {
+                        $termination = Stop-AutoresearchProcessTree -Process $Process `
+                            -WaitTimeoutSeconds $CleanupGraceSeconds
+                    }
+                } catch {
+                    $termination = [pscustomobject]@{
+                        Succeeded = $false
+                        RemainingProcessIds = @($Process.Id)
+                    }
+                }
+
+                $remainingProcessIds = @()
+                if ($null -ne $termination -and $termination.PSObject.Properties['RemainingProcessIds']) {
+                    $remainingProcessIds = @($termination.RemainingProcessIds)
+                }
+                if ($null -eq $termination -or -not $termination.Succeeded) {
+                    if ($remainingProcessIds.Count -eq 0) {
+                        try { $remainingProcessIds = @($Process.Id) } catch { $remainingProcessIds = @() }
+                    }
+                    return [pscustomobject]@{
+                        Outcome             = 'uncontained-process'
+                        ExitCode            = $null
+                        IdlePolicyStatus    = $eligibility.Status
+                        IdlePolicyReason    = $eligibility.Reason
+                        IdleMinutes         = $eligibility.IdleMinutes
+                        RemainingProcessIds = $remainingProcessIds
+                    }
+                }
+
+                return [pscustomobject]@{
+                    Outcome             = if ($eligibility.Status -eq 'unavailable') { 'idle-state-unavailable' } else { 'idle-policy-activity' }
+                    ExitCode            = $null
+                    IdlePolicyStatus    = $eligibility.Status
+                    IdlePolicyReason    = $eligibility.Reason
+                    IdleMinutes         = $eligibility.IdleMinutes
+                    RemainingProcessIds = @()
+                }
+            }
+        }
+    }
+
+    try {
+        if ($Process.HasExited) {
+            return [pscustomobject]@{
+                Outcome             = 'completed'
+                ExitCode            = $Process.ExitCode
+                IdlePolicyStatus    = $null
+                IdlePolicyReason    = $null
+                IdleMinutes         = $null
+                RemainingProcessIds = @()
+            }
+        }
+    } catch {
+        # A timeout remains the safe outcome when process exit cannot be read.
+    }
+
+    return [pscustomobject]@{
+        Outcome             = 'timeout'
+        ExitCode            = $null
+        IdlePolicyStatus    = $null
+        IdlePolicyReason    = $null
+        IdleMinutes         = $null
+        RemainingProcessIds = @()
+    }
+}
+
 function Invoke-AutoresearchIteration {
     param(
         [Parameter(Mandatory)][string]$RepoRootPath,
@@ -2543,7 +2672,12 @@ function Invoke-AutoresearchIteration {
         [int]$PerRunTimeoutMin = 10,
         [switch]$SkipAiEdit,
         [switch]$BaselineRun,
-        [string]$ExperimentBranch
+        [string]$ExperimentBranch,
+        [switch]$MonitorIdlePolicy,
+        [Parameter(DontShow)][scriptblock]$IdleStateProvider,
+        [Parameter(DontShow)][scriptblock]$ProcessWaitProvider,
+        [Parameter(DontShow)][scriptblock]$ProcessTreeStopper,
+        [ValidateRange(1, 60000)][int]$IdleCheckIntervalMilliseconds = 1000
     )
 
     $usesAiEdit = -not $SkipAiEdit -and -not $BaselineRun
@@ -2677,22 +2811,54 @@ function Invoke-AutoresearchIteration {
         $proc = Start-Process -FilePath 'uv' -ArgumentList $trainingArguments `
             -WorkingDirectory $worktreePath -NoNewWindow -PassThru `
             -RedirectStandardOutput $runLog -RedirectStandardError $errFile
+        $waitResult = Wait-AutoresearchProcess -Process $proc `
+            -TimeoutMilliseconds ([int]($PerRunTimeoutMin * 60 * 1000)) `
+            -MonitorIdlePolicy:$MonitorIdlePolicy -IdleStateProvider $IdleStateProvider `
+            -ProcessWaitProvider $ProcessWaitProvider -ProcessTreeStopper $ProcessTreeStopper `
+            -CleanupGraceSeconds 15 -IdleCheckIntervalMilliseconds $IdleCheckIntervalMilliseconds
+
+        if ($waitResult.Outcome -in @('idle-policy-activity', 'idle-state-unavailable')) {
+            $status = $waitResult.Outcome
+            Write-Json -Level warn -Message "Idle-only policy stopped the iteration because $($waitResult.IdlePolicyReason)" -Extra @{
+                status                 = $status
+                idleMinutes            = $waitResult.IdleMinutes
+                idlePolicyStatus       = $waitResult.IdlePolicyStatus
+                cleanupGraceSeconds    = 15
+                experimentBranch       = $ExperimentBranch
+                checkpointRecovery     = 'preserved'
+            }
+            return @{
+                Commit = $shortSha; ValBpb = 0.0; MemoryGb = 0.0; Status = $status
+                Description = $description; ExperimentBranch = $ExperimentBranch
+                WorktreePath = $worktreePath; ExitCode = $null
+                IdlePolicyReason = $waitResult.IdlePolicyReason
+            }
+        }
+
         $killed = $false
         $exitCode = $null
-        if (-not $proc.WaitForExit([int]($PerRunTimeoutMin * 60 * 1000))) {
-            try {
-                $termination = Stop-AutoresearchProcessTree -Process $proc
-            } catch {
+        if ($waitResult.Outcome -in @('timeout', 'uncontained-process')) {
+            if ($waitResult.Outcome -eq 'uncontained-process') {
                 $termination = [pscustomobject]@{
                     Succeeded = $false
-                    RemainingProcessIds = @($proc.Id)
+                    RemainingProcessIds = @($waitResult.RemainingProcessIds)
+                }
+            } else {
+                try {
+                    $termination = Stop-AutoresearchProcessTree -Process $proc
+                } catch {
+                    $termination = [pscustomobject]@{
+                        Succeeded = $false
+                        RemainingProcessIds = @($proc.Id)
+                    }
                 }
             }
             if (-not $termination.Succeeded) {
                 $remainingProcessIds = @($termination.RemainingProcessIds)
                 if ($remainingProcessIds.Count -eq 0) { $remainingProcessIds = @($proc.Id) }
                 $pidList = ($remainingProcessIds -join ', ')
-                $diagnostic = "Timeout cleanup could not verify or terminate the training process tree. Remaining or unverified PID(s): $pidList. The worktree is retained and the autoresearch loop will stop."
+                $cleanupContext = if ($waitResult.Outcome -eq 'timeout') { 'Timeout' } else { 'Idle-policy' }
+                $diagnostic = "$cleanupContext cleanup could not verify or terminate the training process tree. Remaining or unverified PID(s): $pidList. The worktree is retained and the autoresearch loop will stop."
                 $preserveWorktreeForUncontainedProcess = $true
                 $status = 'uncontained-process'
                 try {
@@ -2713,11 +2879,13 @@ function Invoke-AutoresearchIteration {
                     RemainingProcessIds = $remainingProcessIds
                 }
             }
-            $killed = $true
-            $exitCode = $proc.ExitCode
-            Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha; experimentBranch = $ExperimentBranch }
+            if ($waitResult.Outcome -eq 'timeout') {
+                $killed = $true
+                $exitCode = $proc.ExitCode
+                Write-Json -Level warn -Message 'Iteration exceeded per-run timeout; killed' -Extra @{ commit = $shortSha; experimentBranch = $ExperimentBranch }
+            }
         } else {
-            $exitCode = $proc.ExitCode
+            $exitCode = $waitResult.ExitCode
         }
         [void](Invoke-CheckpointRetention -RepositoryRootPath $sourceRoot)
         # Merge stderr file into run.log so downstream parsing is unified.
@@ -3042,6 +3210,8 @@ function Write-AutoresearchLoopTerminalSummary {
 }
 
 function Invoke-AutoresearchLoopCore {
+    param([Parameter(DontShow)][scriptblock]$IdleStateProvider)
+
     Assert-AutoresearchSourceCheckoutClean -RepoRootPath $RepoRoot
     $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
     $Script:RunLogPath = Join-Path $LogDir "autoresearch-loop-$stamp.jsonl"
@@ -3051,8 +3221,32 @@ function Invoke-AutoresearchLoopCore {
         Assert-AutoresearchGeneratedCodeReviewAvailable
     }
 
-    if (-not (Invoke-IdlePolicyGate -Policy $SchedulerPolicy -IdleMinutes 5 -WaitTimeoutMinutes 60)) {
+    $idleGateParameters = @{
+        Policy             = $SchedulerPolicy
+        IdleMinutes        = 5
+        WaitTimeoutMinutes = 60
+    }
+    if ($null -ne $IdleStateProvider) {
+        $idleGateParameters.IdleStateProvider = $IdleStateProvider
+    }
+    if (-not (Invoke-IdlePolicyGate @idleGateParameters)) {
         Write-AutoresearchLoopTerminalSummary -TerminalStatus 'idle-policy-skipped' -ExitCode 0 `
+            -AttemptedIterations 0 -SuccessfulIterations 0 -FailedIterations 0 -ConsecutiveFailureCount 0 `
+            -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch ''
+        Limit-RunLogs
+        return 0
+    }
+
+    $startEligibility = Get-IdlePolicyEligibility -Policy $SchedulerPolicy -IdleMinutes 5 `
+        -IdleStateProvider $IdleStateProvider
+    if (-not $startEligibility.Eligible) {
+        $terminalStatus = if ($startEligibility.Status -eq 'unavailable') { 'idle-state-unavailable' } else { 'idle-policy-activity' }
+        Write-Json -Level warn -Message "Idle-only policy stopped before loop setup because $($startEligibility.Reason)" -Extra @{
+            policy       = $SchedulerPolicy
+            status       = $terminalStatus
+            idleMinutes  = $startEligibility.IdleMinutes
+        }
+        Write-AutoresearchLoopTerminalSummary -TerminalStatus $terminalStatus -ExitCode 0 `
             -AttemptedIterations 0 -SuccessfulIterations 0 -FailedIterations 0 -ConsecutiveFailureCount 0 `
             -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch ''
         Limit-RunLogs
@@ -3103,6 +3297,25 @@ function Invoke-AutoresearchLoopCore {
     $consecutiveFailures = 0
 
     while ($baselinePending -or ((Get-AutoresearchLoopTime) -lt $deadline)) {
+        $iterationEligibility = Get-IdlePolicyEligibility -Policy $SchedulerPolicy -IdleMinutes 5 `
+            -IdleStateProvider $IdleStateProvider
+        if (-not $iterationEligibility.Eligible) {
+            $terminalStatus = if ($iterationEligibility.Status -eq 'unavailable') { 'idle-state-unavailable' } else { 'idle-policy-activity' }
+            Write-Json -Level warn -Message "Idle-only policy stopped before iteration $($attemptedIterations + 1) because $($iterationEligibility.Reason)" -Extra @{
+                policy       = $SchedulerPolicy
+                status       = $terminalStatus
+                idleMinutes  = $iterationEligibility.IdleMinutes
+                attemptedIterations  = $attemptedIterations
+                experimentBranch     = $experimentBranch
+            }
+            Write-AutoresearchLoopTerminalSummary -TerminalStatus $terminalStatus -ExitCode 0 `
+                -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+                -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+                -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
+            Limit-RunLogs
+            return 0
+        }
+
         $isBaselineRun = $baselinePending
         $baselinePending = $false
         $attemptedIterations++
@@ -3121,13 +3334,23 @@ function Invoke-AutoresearchLoopCore {
         }
 
         try {
-            if ($isBaselineRun) {
-                $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                    -PerRunTimeoutMin $PerRunTimeoutMinutes -BaselineRun -ExperimentBranch $experimentBranch
-            } else {
-                $iterationResult = Invoke-AutoresearchIteration -RepoRootPath $RepoRoot -ResultsPath $resultsPath `
-                    -PerRunTimeoutMin $PerRunTimeoutMinutes -SkipAiEdit:$NoAiEdit -ExperimentBranch $experimentBranch
+            $iterationParameters = @{
+                RepoRootPath      = $RepoRoot
+                ResultsPath       = $resultsPath
+                PerRunTimeoutMin  = $PerRunTimeoutMinutes
+                BaselineRun       = [bool]$isBaselineRun
+                ExperimentBranch  = $experimentBranch
             }
+            if (-not $isBaselineRun) {
+                $iterationParameters.SkipAiEdit = [bool]$NoAiEdit
+            }
+            if ($SchedulerPolicy -eq 'IdleOnly') {
+                $iterationParameters.MonitorIdlePolicy = $true
+                if ($null -ne $IdleStateProvider) {
+                    $iterationParameters.IdleStateProvider = $IdleStateProvider
+                }
+            }
+            $iterationResult = Invoke-AutoresearchIteration @iterationParameters
         } catch {
             $iterationErrorRecord = $_
             $iterationException = $_.Exception
@@ -3157,6 +3380,21 @@ function Invoke-AutoresearchLoopCore {
         }
         if ($iterationStatus -ceq 'uncontained-process') {
             $fatalExitCode = 3
+        }
+
+        if ($iterationStatus -in @('idle-policy-activity', 'idle-state-unavailable')) {
+            Write-Json -Level warn -Message "Idle-only policy stopped the loop with status '$iterationStatus'." -Extra @{
+                attemptedIterations = $attemptedIterations
+                successfulIterations = $successfulIterations
+                failedIterations = $failedIterations
+                experimentBranch = $experimentBranch
+            }
+            Write-AutoresearchLoopTerminalSummary -TerminalStatus $iterationStatus -ExitCode 0 `
+                -AttemptedIterations $attemptedIterations -SuccessfulIterations $successfulIterations `
+                -FailedIterations $failedIterations -ConsecutiveFailureCount $consecutiveFailures `
+                -FailureThreshold $MaxConsecutiveIterationFailures -ExperimentBranch $experimentBranch
+            Limit-RunLogs
+            return 0
         }
 
         if ($null -eq $iterationErrorRecord -and $iterationStatus -in @('keep', 'discard')) {
@@ -3357,19 +3595,21 @@ function Get-SchedulerPolicyInfo {
                 UsesIdleGate          = $false
                 IdleDuration          = $null
                 IdleWaitTimeout       = $null
+                StopOnIdleEnd         = $true
             }
         }
         'IdleOnly' {
             return [pscustomobject]@{
                 Name                  = 'IdleOnly'
                 DisplayName           = 'Idle-only interactive'
-                Summary               = 'Runs while the current user is logged on and the launcher waits for 5 minutes of idle time before starting. If the wait window expires, the launcher logs why the run was skipped.'
+                Summary               = 'Requires 5 minutes of idle time before start. Task Scheduler idle-end stopping is enabled, and the launcher rechecks before each iteration and during training; activity or unavailable idle state stops the loop and triggers bounded process-tree cleanup. An unverified cleanup stops with exit code 3 and retains the worktree.'
                 LogonType             = 3
                 LogonTypeName         = 'InteractiveToken'
                 RequiresDesktopSession = $true
                 UsesIdleGate          = $true
                 IdleDuration          = 'PT5M'
                 IdleWaitTimeout       = 'PT1H'
+                StopOnIdleEnd         = $true
             }
         }
         'Unattended' {
@@ -3383,6 +3623,7 @@ function Get-SchedulerPolicyInfo {
                 UsesIdleGate          = $false
                 IdleDuration          = $null
                 IdleWaitTimeout       = $null
+                StopOnIdleEnd         = $true
             }
         }
     }
@@ -3785,8 +4026,97 @@ function Invoke-IdlePolicyGate {
     return $false
 }
 
+function Get-IdlePolicyEligibility {
+    param(
+        [Parameter(Mandatory)][string]$Policy,
+        [int]$IdleMinutes = 5,
+        [Parameter(DontShow)][scriptblock]$IdleStateProvider
+    )
+
+    if ($Policy -ne 'IdleOnly') {
+        return [pscustomobject]@{
+            Status      = 'not-required'
+            Available   = $true
+            Eligible    = $true
+            IdleMinutes = $null
+            Reason      = $null
+        }
+    }
+
+    try {
+        $state = if ($null -ne $IdleStateProvider) { & $IdleStateProvider } else { Get-ComputerIdleState }
+    } catch {
+        $state = $null
+    }
+
+    if ($null -eq $state -or -not $state.Available) {
+        $reason = if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.Reason)) {
+            [string]$state.Reason
+        } else {
+            'Windows idle detection failed.'
+        }
+        return [pscustomobject]@{
+            Status      = 'unavailable'
+            Available   = $false
+            Eligible    = $false
+            IdleMinutes = $null
+            Reason      = $reason
+        }
+    }
+
+    $idleMinutesObserved = $null
+    $idleMillisecondsProperty = $state.PSObject.Properties['IdleMs']
+    if ($null -ne $idleMillisecondsProperty -and $null -ne $idleMillisecondsProperty.Value) {
+        try {
+            $idleMinutesObserved = [double]$idleMillisecondsProperty.Value / 60000.0
+            $eligible = ([int64]$idleMillisecondsProperty.Value -ge ([int64]$IdleMinutes * 60000))
+        } catch {
+            $eligible = $false
+        }
+    } else {
+        try {
+            $idleMinutesObserved = [double]$state.IdleMinutes
+            $eligible = ($idleMinutesObserved -ge $IdleMinutes)
+        } catch {
+            $eligible = $false
+        }
+    }
+
+    if ($null -eq $idleMinutesObserved -or [double]::IsNaN($idleMinutesObserved) -or
+        [double]::IsInfinity($idleMinutesObserved) -or $idleMinutesObserved -lt 0) {
+        return [pscustomobject]@{
+            Status      = 'unavailable'
+            Available   = $false
+            Eligible    = $false
+            IdleMinutes = $null
+            Reason      = 'Windows idle detection returned invalid idle data.'
+        }
+    }
+
+    if (-not $eligible) {
+        return [pscustomobject]@{
+            Status      = 'active'
+            Available   = $true
+            Eligible    = $false
+            IdleMinutes = [math]::Round($idleMinutesObserved, 2)
+            Reason      = 'The idle threshold is no longer satisfied.'
+        }
+    }
+
+    return [pscustomobject]@{
+        Status      = 'eligible'
+        Available   = $true
+        Eligible    = $true
+        IdleMinutes = [math]::Round($idleMinutesObserved, 2)
+        Reason      = $null
+    }
+}
+
 function Get-TaskXml {
-    param([AllowNull()][psobject]$Plan)
+    param(
+        [AllowNull()][psobject]$Plan,
+        [Parameter(DontShow)][scriptblock]$TaskServiceProvider
+    )
 
     $policy = Get-SchedulerPolicyInfo -Policy $SchedulerPolicy
     $schedule = Get-ScheduleTriggerSpec -Frequency $ScheduleFrequency -Value $ScheduleTime
@@ -3794,7 +4124,11 @@ function Get-TaskXml {
         $Plan = Get-TaskLauncherPlan
     }
 
-    $service = New-Object -ComObject Schedule.Service
+    $service = if ($null -ne $TaskServiceProvider) {
+        & $TaskServiceProvider
+    } else {
+        New-Object -ComObject Schedule.Service
+    }
     $service.Connect()
     $task = $service.NewTask(0)
 
@@ -3810,6 +4144,9 @@ function Get-TaskXml {
     $task.Settings.RestartCount = 3
     $task.Settings.RestartInterval = 'PT5M'
     $task.Settings.RunOnlyIfIdle = [bool]$policy.UsesIdleGate
+    # Set idle-end behavior explicitly. The disposable-VM check verifies how
+    # Task Scheduler handles the supervisor and its descendants on activity.
+    $task.Settings.IdleSettings.StopOnIdleEnd = [bool]$policy.StopOnIdleEnd
     if ($policy.UsesIdleGate) {
         $task.Settings.IdleSettings.IdleDuration = $policy.IdleDuration
         $task.Settings.IdleSettings.WaitTimeout = $policy.IdleWaitTimeout
@@ -4104,7 +4441,7 @@ function Show-LaunchGui {
         <GroupBox Header="Scheduler policy" Padding="6" Margin="0,0,0,6">
           <StackPanel>
             <RadioButton x:Name="PolInteractive" GroupName="policy" TabIndex="15" Margin="0,0,0,2"><TextBlock Text="Interactive - logged-on session only, no idle wait" TextWrapping="Wrap"/></RadioButton>
-            <RadioButton x:Name="PolIdleOnly" GroupName="policy" TabIndex="16" IsChecked="True" Margin="0,0,0,2"><TextBlock Text="Idle-only - waits for 5 minutes of idle time, then logs a skip after 1 hour if needed" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="PolIdleOnly" GroupName="policy" TabIndex="16" IsChecked="True" Margin="0,0,0,2"><TextBlock Text="Idle-only - waits for 5 minutes idle before starting; activity or unavailable idle state stops the loop" TextWrapping="Wrap"/></RadioButton>
             <RadioButton x:Name="PolUnattended" GroupName="policy" TabIndex="17" Margin="0,0,0,2"><TextBlock Text="Unattended - S4U logon, no active desktop required" TextWrapping="Wrap"/></RadioButton>
             <TextBlock x:Name="TxtPolicySummary" TextWrapping="Wrap" Margin="0,6,0,0" Foreground="DarkSlateGray"/>
           </StackPanel>

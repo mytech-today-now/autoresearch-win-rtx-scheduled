@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-07
+
+- Training metrics now use invariant decimal parsing, failed iterations use capped exponential backoff, and the loop stops after the configured consecutive-failure limit. Concurrent TinyStories downloads use isolated temporary files.
+- `IdleOnly` rechecks idle state before each iteration and during training, stops when activity resumes or idle detection becomes unavailable, and requests Task Scheduler idle-end stopping. Training process-tree cleanup has a 15-second grace period; if cleanup cannot be verified, the loop stops with exit code 3 and retains the worktree. Real Task Scheduler handling of supervisor descendants remains unverified; see the disposable VM procedure in `docs/idle-policy-disposable-vm.md`.
+
+## 2026-11-06
+
+- The launcher verifies the canonical checkout root, `main` branch, and single matching `origin` before update or launch. Scheduled-task runtime selection prefers PowerShell 7 and falls back to Windows PowerShell 5.1, refusing task changes if neither is available.
+- Scheduled runs start cold; recovery requires an operator-selected compatible checkpoint and explicit `--resume-from`. Checkpoint cleanup applies 5-run and 30-day limits to completed compatible runs while preserving active, interrupted, malformed, unsupported, incompatible, and `recovery-needed` runs.
+- Windows CI now runs locked, CPU-safe Python unittest discovery.
+
 ## 2026-11-03
 
 - Timed-out training now uses process-tree cleanup and verification. If cleanup cannot be verified, the loop stops with a distinct exit code and retains the iteration worktree; idle-only scheduling also skips when Windows idle data cannot be validated.

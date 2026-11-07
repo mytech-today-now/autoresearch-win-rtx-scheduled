@@ -154,6 +154,7 @@ BeforeAll {
         'Format-CommandLineArgumentList',
         'ConvertTo-WeekdayMask',
         'Get-ComputerIdleState',
+        'Get-IdlePolicyEligibility',
         'Get-CurrentProcessCommandLine',
         'Get-RedactedTaskLaunchCommandLine',
         'Get-RedactedTaskLaunchState',
@@ -169,6 +170,7 @@ BeforeAll {
         'Test-ScheduleTime',
         'Get-TaskTrigger',
         'Invoke-IdlePolicyGate',
+        'Wait-AutoresearchProcess',
         'Get-ProviderApiKeyEnvironmentName',
         'Clear-ProviderApiKeyEnvironment',
         'Set-WorkloadEnvironment',
@@ -2390,6 +2392,89 @@ Describe 'Invoke-AutoresearchLoopCore reliability' {
         $summary.Count | Should -Be 1
     }
 
+    It 'does not start another iteration when activity resumes during the previous run' {
+        $script:SchedulerPolicy = 'IdleOnly'
+        $script:LoopIdleState = [pscustomobject]@{
+            Available = $true
+            IdleMs = [int64]300000
+            IdleMinutes = 5
+            Reason = $null
+        }
+        $script:LoopIdleProviderCalls = 0
+        $script:LoopMonitorFlags = @()
+        $script:LoopTreeStopCalls = @()
+        $idleStateProvider = {
+            $script:LoopIdleProviderCalls++
+            return $script:LoopIdleState
+        }
+        $resultsHash = Get-AutoresearchFixtureHash -Path $script:LoopCoreFixture.ResultsPath
+
+        Mock Invoke-IdlePolicyGate {
+            param($Policy, $IdleMinutes, $WaitTimeoutMinutes, $IdleStateProvider)
+            return $true
+        }
+        Mock Invoke-AutoresearchIteration {
+            param(
+                $RepoRootPath,
+                $ResultsPath,
+                $PerRunTimeoutMin,
+                $SkipAiEdit,
+                $BaselineRun,
+                $ExperimentBranch,
+                $MonitorIdlePolicy,
+                $IdleStateProvider
+            )
+            $script:LoopIterationCalls++
+            $script:LoopBaselineFlags += [bool]$BaselineRun
+            $script:LoopMonitorFlags += [bool]$MonitorIdlePolicy
+            if ($script:LoopIterationCalls -eq 1) {
+                $fakeProcess = [pscustomobject]@{ Id = 4321; HasExited = $false; ExitCode = $null }
+                $processWaitProvider = {
+                    param($Process, $WaitMilliseconds)
+                    $script:LoopIdleState = [pscustomobject]@{
+                        Available = $true
+                        IdleMs = [int64]1000
+                        IdleMinutes = 0.02
+                        Reason = $null
+                    }
+                    return $false
+                }
+                $processTreeStopper = {
+                    param($Process, $GraceSeconds)
+                    $script:LoopTreeStopCalls += [pscustomobject]@{
+                        ProcessId = $Process.Id
+                        GraceSeconds = $GraceSeconds
+                    }
+                    return [pscustomobject]@{ Succeeded = $true; RemainingProcessIds = @() }
+                }
+                $waitResult = Wait-AutoresearchProcess -Process $fakeProcess -TimeoutMilliseconds 10000 `
+                    -MonitorIdlePolicy:$MonitorIdlePolicy -IdleStateProvider $IdleStateProvider `
+                    -ProcessWaitProvider $processWaitProvider -ProcessTreeStopper $processTreeStopper `
+                    -IdleCheckIntervalMilliseconds 1
+                return @{ Status = $waitResult.Outcome; Commit = 'mocked' }
+            }
+
+            $script:LoopFakeTime = $script:LoopFakeDeadline
+            return @{ Status = 'discard'; Commit = 'mocked' }
+        }
+
+        $result = Invoke-AutoresearchLoopCore -IdleStateProvider $idleStateProvider
+
+        $result | Should -Be 0
+        $script:LoopIterationCalls | Should -Be 1
+        $script:LoopBaselineFlags | Should -Be @($false)
+        $script:LoopMonitorFlags | Should -Be @($true)
+        $script:LoopIdleProviderCalls | Should -Be 3
+        $script:LoopTreeStopCalls.Count | Should -Be 1
+        $script:LoopTreeStopCalls[0].ProcessId | Should -Be 4321
+        $script:LoopTreeStopCalls[0].GraceSeconds | Should -Be 15
+        (Get-AutoresearchFixtureHash -Path $script:LoopCoreFixture.ResultsPath) | Should -BeExactly $resultsHash
+        @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq 'Autoresearch iteration #2 starting' }).Count |
+            Should -Be 0
+        @($script:AutoresearchLogRecords | Where-Object { $_.Message -ceq "Autoresearch loop finished with status 'idle-policy-activity'." }).Count |
+            Should -Be 1
+    }
+
     It 'records an idle-policy skip as a successful zero-attempt terminal outcome' {
         Mock Invoke-IdlePolicyGate { return $false }
 
@@ -2685,7 +2770,9 @@ Describe 'Scheduler policy' {
         $p.UsesIdleGate | Should -BeTrue
         $p.IdleDuration | Should -Be 'PT5M'
         $p.IdleWaitTimeout | Should -Be 'PT1H'
-        $p.Summary | Should -Match 'skip'
+        $p.StopOnIdleEnd | Should -BeTrue
+        $p.Summary | Should -Match 'rechecks before each iteration and during training'
+        $p.Summary | Should -Match 'activity or unavailable idle state stops the loop'
     }
 
     It 'describes the unattended policy as S4U based' {
@@ -2697,6 +2784,79 @@ Describe 'Scheduler policy' {
     }
 }
 
+function script:New-FakeTaskService {
+    $task = [pscustomobject]@{
+        RegistrationInfo = [pscustomobject]@{ Author = $null; Description = $null }
+        Principal = [pscustomobject]@{ UserId = $null; LogonType = $null; RunLevel = $null }
+        Settings = [pscustomobject]@{
+            StartWhenAvailable = $false
+            AllowDemandStart = $false
+            DisallowStartIfOnBatteries = $true
+            StopIfGoingOnBatteries = $true
+            RestartCount = 0
+            RestartInterval = $null
+            RunOnlyIfIdle = $false
+            IdleSettings = [pscustomobject]@{ IdleDuration = $null; WaitTimeout = $null; StopOnIdleEnd = $true }
+        }
+        Triggers = $null
+        Actions = $null
+    }
+    $triggerCollection = [pscustomobject]@{}
+    $triggerCollection | Add-Member -MemberType ScriptMethod -Name Create -Value {
+        param($TriggerType)
+        return [pscustomobject]@{
+            StartBoundary = $null
+            Repetition = [pscustomobject]@{ Interval = $null }
+            DaysInterval = $null
+            WeeksInterval = $null
+            DaysOfWeek = $null
+        }
+    }
+    $actionCollection = [pscustomobject]@{ Action = $null }
+    $actionCollection | Add-Member -MemberType ScriptMethod -Name Create -Value {
+        param($ActionType)
+        $this.Action = [pscustomobject]@{ Path = $null; Arguments = $null; WorkingDirectory = $null }
+        return $this.Action
+    }
+    $task.Triggers = $triggerCollection
+    $task.Actions = $actionCollection
+    $task | Add-Member -MemberType ScriptProperty -Name XmlText -Value {
+        $logonType = switch ([int]$this.Principal.LogonType) {
+            2 { 'S4U' }
+            3 { 'InteractiveToken' }
+            default { 'None' }
+        }
+        $runLevel = if ([int]$this.Principal.RunLevel -eq 1) { 'HighestAvailable' } else { 'LeastPrivilege' }
+        $author = [System.Security.SecurityElement]::Escape([string]$this.RegistrationInfo.Author)
+        $description = [System.Security.SecurityElement]::Escape([string]$this.RegistrationInfo.Description)
+        $userId = [System.Security.SecurityElement]::Escape([string]$this.Principal.UserId)
+        $command = [System.Security.SecurityElement]::Escape([string]$this.Actions.Action.Path)
+        $arguments = [System.Security.SecurityElement]::Escape([string]$this.Actions.Action.Arguments)
+        $workingDirectory = [System.Security.SecurityElement]::Escape([string]$this.Actions.Action.WorkingDirectory)
+        $runOnlyIfIdle = ([bool]$this.Settings.RunOnlyIfIdle).ToString().ToLowerInvariant()
+        $stopOnIdleEnd = ([bool]$this.Settings.IdleSettings.StopOnIdleEnd).ToString().ToLowerInvariant()
+        $duration = [System.Security.SecurityElement]::Escape([string]$this.Settings.IdleSettings.IdleDuration)
+        $waitTimeout = [System.Security.SecurityElement]::Escape([string]$this.Settings.IdleSettings.WaitTimeout)
+        return @"
+<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Author>$author</Author><Description>$description</Description></RegistrationInfo>
+  <Triggers />
+  <Principals><Principal><UserId>$userId</UserId><LogonType>$logonType</LogonType><RunLevel>$runLevel</RunLevel></Principal></Principals>
+  <Settings><RunOnlyIfIdle>$runOnlyIfIdle</RunOnlyIfIdle><IdleSettings><Duration>$duration</Duration><WaitTimeout>$waitTimeout</WaitTimeout><StopOnIdleEnd>$stopOnIdleEnd</StopOnIdleEnd></IdleSettings></Settings>
+  <Actions><Exec><Command>$command</Command><Arguments>$arguments</Arguments><WorkingDirectory>$workingDirectory</WorkingDirectory></Exec></Actions>
+</Task>
+"@
+    }
+
+    $service = [pscustomobject]@{ FakeTask = $task }
+    $service | Add-Member -MemberType ScriptMethod -Name Connect -Value { }
+    $service | Add-Member -MemberType ScriptMethod -Name NewTask -Value {
+        param($Flags)
+        return $this.FakeTask
+    }
+    return $service
+}
+
 Describe 'Get-TaskXml' {
     BeforeEach {
         $script:Provider = 'openai'
@@ -2705,20 +2865,25 @@ Describe 'Get-TaskXml' {
         $script:MaxLoopMinutes = 0
         $script:PerRunTimeoutMinutes = 10
         $script:NoAiEdit = $false
+        $script:FakeTaskService = New-FakeTaskService
+        Mock Register-ScheduledTask { throw 'Get-TaskXml tests must not register a real Scheduled Task.' }
+        Mock Unregister-ScheduledTask { throw 'Get-TaskXml tests must not unregister a real Scheduled Task.' }
     }
 
-    It 'emits idle-only XML with interactive logon and a 5 minute idle window' {
+    It 'emits idle-only XML with explicit cleanup behavior without registering a task' {
         $script:SchedulerPolicy = 'IdleOnly'
         $script:ScheduleFrequency = 'Daily'
         $script:ScheduleTime = '18:00'
-        $xml = [xml](Get-TaskXml)
+        $xml = [xml](Get-TaskXml -TaskServiceProvider { $script:FakeTaskService })
         $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
         $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
         ($xml.SelectSingleNode('//t:Principals/t:Principal/t:LogonType', $ns).InnerText) | Should -Be 'InteractiveToken'
         ($xml.SelectSingleNode('//t:Settings/t:RunOnlyIfIdle', $ns).InnerText) | Should -Be 'true'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:Duration', $ns).InnerText) | Should -Be 'PT5M'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:WaitTimeout', $ns).InnerText) | Should -Be 'PT1H'
-        ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'Idle-only'
+        ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:StopOnIdleEnd', $ns).InnerText) | Should -Be 'true'
+        ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'activity or unavailable idle state stops the loop'
+        ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'bounded process-tree cleanup'
         $arguments = $xml.SelectSingleNode('//t:Actions/t:Exec/t:Arguments', $ns).InnerText
         $arguments | Should -Match '-NoGui'
         $arguments | Should -Match '-TaskSupervisor'
@@ -2726,6 +2891,8 @@ Describe 'Get-TaskXml' {
         $arguments | Should -Match 'IdleOnly'
         $arguments | Should -Not -Match '-EncodedCommand'
         $arguments | Should -Not -Match '-RunLoop'
+        Should -Invoke Register-ScheduledTask -Times 0 -Exactly -Scope It
+        Should -Invoke Unregister-ScheduledTask -Times 0 -Exactly -Scope It
     }
 
     It 'uses the supplied interpreter plan for the task action' {
@@ -2738,7 +2905,7 @@ Describe 'Get-TaskXml' {
         }
         Mock Get-TaskLauncherPlan { throw 'The supplied plan should be reused.' }
 
-        $xml = [xml](Get-TaskXml -Plan $plan)
+        $xml = [xml](Get-TaskXml -Plan $plan -TaskServiceProvider { $script:FakeTaskService })
         $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
         $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
 
@@ -2751,13 +2918,14 @@ Describe 'Get-TaskXml' {
         $script:SchedulerPolicy = 'Interactive'
         $script:ScheduleFrequency = 'Hourly'
         $script:ScheduleTime = ':30'
-        $xml = [xml](Get-TaskXml)
+        $xml = [xml](Get-TaskXml -TaskServiceProvider { $script:FakeTaskService })
         $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
         $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
         ($xml.SelectSingleNode('//t:Principals/t:Principal/t:LogonType', $ns).InnerText) | Should -Be 'InteractiveToken'
         ($xml.SelectSingleNode('//t:Settings/t:RunOnlyIfIdle', $ns).InnerText) | Should -Be 'false'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:Duration', $ns).InnerText) | Should -Be 'PT0M'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:WaitTimeout', $ns).InnerText) | Should -Be 'PT0M'
+        ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:StopOnIdleEnd', $ns).InnerText) | Should -Be 'true'
         ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'Interactive'
     }
 
@@ -2765,13 +2933,14 @@ Describe 'Get-TaskXml' {
         $script:SchedulerPolicy = 'Unattended'
         $script:ScheduleFrequency = 'Weekly'
         $script:ScheduleTime = 'Wednesday'
-        $xml = [xml](Get-TaskXml)
+        $xml = [xml](Get-TaskXml -TaskServiceProvider { $script:FakeTaskService })
         $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
         $ns.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
         ($xml.SelectSingleNode('//t:Principals/t:Principal/t:LogonType', $ns).InnerText) | Should -Be 'S4U'
         ($xml.SelectSingleNode('//t:Settings/t:RunOnlyIfIdle', $ns).InnerText) | Should -Be 'false'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:Duration', $ns).InnerText) | Should -Be 'PT0M'
         ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:WaitTimeout', $ns).InnerText) | Should -Be 'PT0M'
+        ($xml.SelectSingleNode('//t:Settings/t:IdleSettings/t:StopOnIdleEnd', $ns).InnerText) | Should -Be 'true'
         ($xml.SelectSingleNode('//t:RegistrationInfo/t:Description', $ns).InnerText) | Should -Match 'Unattended'
     }
 }
@@ -2957,6 +3126,89 @@ Describe 'Invoke-IdlePolicyGate' {
         $interactive | Should -BeTrue
         $unattended | Should -BeTrue
         $script:idleNativeProbeCount | Should -Be 0
+    }
+}
+
+Describe 'Continuous IdleOnly process supervision' {
+    It 'stops a fake active process tree within the cleanup grace period' {
+        $script:idleProcessWaitCount = 0
+        $script:idleProcessStopCalls = @()
+        $process = [pscustomobject]@{ Id = 4312; HasExited = $false; ExitCode = $null }
+        $idleProvider = {
+            return [pscustomobject]@{
+                Available = $true
+                IdleMs = [int64]1000
+                IdleMinutes = 0.02
+                Reason = $null
+            }
+        }
+        $processWaitProvider = {
+            param($Process, $WaitMilliseconds)
+            $script:idleProcessWaitCount++
+            return $false
+        }
+        $processTreeStopper = {
+            param($Process, $GraceSeconds)
+            $script:idleProcessStopCalls += [pscustomobject]@{
+                ProcessId = $Process.Id
+                GraceSeconds = $GraceSeconds
+            }
+            return [pscustomobject]@{ Succeeded = $true; RemainingProcessIds = @() }
+        }
+
+        $result = Wait-AutoresearchProcess -Process $process -TimeoutMilliseconds 10000 `
+            -MonitorIdlePolicy -IdleStateProvider $idleProvider -ProcessWaitProvider $processWaitProvider `
+            -ProcessTreeStopper $processTreeStopper -IdleCheckIntervalMilliseconds 1
+
+        $result.Outcome | Should -Be 'idle-policy-activity'
+        $script:idleProcessWaitCount | Should -Be 1
+        $script:idleProcessStopCalls.Count | Should -Be 1
+        $script:idleProcessStopCalls[0].ProcessId | Should -Be 4312
+        $script:idleProcessStopCalls[0].GraceSeconds | Should -Be 15
+        $result.RemainingProcessIds | Should -BeNullOrEmpty
+    }
+
+    It 'fails closed and reports uncontained descendants when idle state is unavailable' {
+        $process = [pscustomobject]@{ Id = 4313; HasExited = $false; ExitCode = $null }
+        $idleProvider = {
+            return [pscustomobject]@{
+                Available = $false
+                IdleMs = $null
+                IdleMinutes = $null
+                Reason = 'Windows idle detection failed.'
+            }
+        }
+        $processWaitProvider = { param($Process, $WaitMilliseconds) return $false }
+        $processTreeStopper = {
+            param($Process, $GraceSeconds)
+            return [pscustomobject]@{
+                Succeeded = $false
+                RemainingProcessIds = @($Process.Id, 4314)
+            }
+        }
+
+        $result = Wait-AutoresearchProcess -Process $process -TimeoutMilliseconds 10000 `
+            -MonitorIdlePolicy -IdleStateProvider $idleProvider -ProcessWaitProvider $processWaitProvider `
+            -ProcessTreeStopper $processTreeStopper -IdleCheckIntervalMilliseconds 1
+
+        $result.Outcome | Should -Be 'uncontained-process'
+        $result.IdlePolicyStatus | Should -Be 'unavailable'
+        $result.RemainingProcessIds | Should -Be @(4313, 4314)
+    }
+
+    It 'preserves Interactive and Unattended bypass behavior without probing idle state' {
+        $script:idleEligibilityProbeCount = 0
+        $provider = {
+            $script:idleEligibilityProbeCount++
+            throw 'Non-idle policy must not sample activity.'
+        }
+
+        $interactive = Get-IdlePolicyEligibility -Policy Interactive -IdleStateProvider $provider
+        $unattended = Get-IdlePolicyEligibility -Policy Unattended -IdleStateProvider $provider
+
+        $interactive.Status | Should -Be 'not-required'
+        $unattended.Status | Should -Be 'not-required'
+        $script:idleEligibilityProbeCount | Should -Be 0
     }
 }
 
@@ -4106,7 +4358,7 @@ Describe 'GUI policy surface' {
         $xaml | Should -Match 'PolUnattended'
         $xaml | Should -Match 'TxtPolicySummary'
         $xaml | Should -Match 'Interactive - logged-on session only, no idle wait'
-        $xaml | Should -Match 'Idle-only - waits for 5 minutes of idle time'
+        $xaml | Should -Match 'Idle-only - waits for 5 minutes idle before starting; activity or unavailable idle state stops the loop'
         $xaml | Should -Match 'Unattended - S4U logon, no active desktop required'
     }
 }

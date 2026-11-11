@@ -8,7 +8,7 @@
     "test": "npm run verify:clean-archive && npm run verify:ai-provider && npm run test:wrapper && npm run test:acceptance && npm run test:powershell"
   },
   "dependencies": {
-    "@mytechtoday/augment-extensions": "^3.1.2",
+    "@mytechtoday/augment-extensions": "^3.2.0",
     "ai-powered": "^0.3.2"
   }
 }

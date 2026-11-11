@@ -260,6 +260,61 @@ I think these would be the reasonable hyperparameters to play with. Ask your fav
 - [jsegov/autoresearch-win-rtx](https://github.com/jsegov/autoresearch-win-rtx) (Windows)
 - [andyluo7/autoresearch](https://github.com/andyluo7/autoresearch) (AMD)
 
+## About myTech.Today
+
+<!-- ── Info Cards ── -->
+<table>
+<tr>
+<!-- Left Column -->
+<td width="50%" valign="top">
+<h4>🛠️ Our Services</h4>
+<ul>
+<li>IT Consulting and Support</li>
+<li>Custom PowerShell Automation and Scripting</li>
+<li>Infrastructure Optimization and System Administration</li>
+<li>Cloud Integration (Azure, AWS, GCS, Microsoft 365)</li>
+<li>Network Design and Management</li>
+<li>Cybersecurity and Compliance Solutions</li>
+<li>Database Management and Custom Development</li>
+<li>System Setup, Upgrades, and Troubleshooting</li>
+<li>Virus and Spyware Removal</li>
+<li>Hardware Procurement, Installation, and Configuration</li>
+</ul>
+<h4>📍 Service Area</h4>
+<ul>
+<li>Omaha, NE</li>
+<li>Lincoln, NE</li>
+</ul>
+</td>
+<!-- Right Column -->
+<td width="50%" valign="top">
+<h4>⭐ Why Choose myTech.Today?</h4>
+<ul>
+<li>20+ years of IT consulting and software development experience</li>
+<li>Personalized service to 190+ satisfied clients</li>
+<li>5-star review rating with consistent 24-hour solution delivery</li>
+<li>Payment-upon-success terms available</li>
+<li>Expertise in Windows automation, PowerShell scripting, and system optimization</li>
+</ul>
+<h4>📬 Contact Information</h4>
+<table>
+<tr><td>📧 <strong>Email</strong></td><td><a href="mailto:sales@mytech.today">sales@mytech.today</a></td></tr>
+<tr><td>🌐 <strong>Website</strong></td><td><a href="https://mytech.today">mytech.today</a></td></tr>
+<tr><td>💻 <strong>GitHub</strong></td><td><a href="https://github.com/mytech-today-now">@mytech-today-now</a></td></tr>
+<tr><td>🔗 <strong>LinkedIn</strong></td><td><a href="https://linkedin.com/in/kylerode">linkedin.com/in/kylerode</a></td></tr>
+</table>
+</td>
+</tr>
+</table>
+<!-- ── Footer ── -->
+<table>
+<tr>
+<td colspan="2" align="center">
+<sub><strong>myTech.Today</strong> · Professional IT Services · Serving Omaha and Lincoln · <a href="https://mytech.today">mytech.today</a></sub>
+</td>
+</tr>
+</table>
+
 ## License
 
 MIT
